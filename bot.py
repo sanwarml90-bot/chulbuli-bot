@@ -44,7 +44,7 @@ try:
 except Exception:  # noqa: BLE001
     _chess = None
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -2971,6 +2971,34 @@ CHAT_REAL = [
 ]
 
 
+def _greet(user_name: str = "") -> str:
+    """Short greeting, Baka/Mimi style — a bare name call gets a 'Hiee', not a long chat reply."""
+    if user_name:
+        return random.choice([
+            f"Hiee {user_name} 💕",
+            f"hlooo {user_name}, kya haal hai? 😄",
+            f"Hiee {user_name}! bolo kya chahiye? 🙂",
+            f"haan {user_name}, bolo main sun rahi hun 💕",
+        ])
+    return random.choice(CHAT_GREET)
+
+
+def is_name_call(text: str) -> bool:
+    """True when the message is basically just Chulbuli's name (optionally with a greeting word).
+
+    The original bots work like this: typing just the name gets a short greeting —
+    Baka always greets and never answers questions, Mimi replies 'Hiee' to 'mimi'.
+    A real question or sentence ('chulbuli kaise ho?', 'chulbuli joke sunao') is NOT a name call.
+    """
+    t = (text or "").lower()
+    if "chulbuli" not in t:
+        return False
+    t = re.sub(r"chulbuli", " ", t)
+    t = re.sub(r"[^a-z ]", " ", t)
+    words = [w for w in t.split() if w not in ("hi", "hlo", "hello", "hey", "hie", "hiee", "hii", "hiii", "namaste", "yo", "oye", "ji")]
+    return not words
+
+
 def chat_reply_text(text: str, user_name: str = "", facts: list | None = None) -> str:
     t = text.lower()
     if any(w in t for w in ("ai ho", "bot ho", "robot ho", "real ho", "tum kaun ho",
@@ -2982,14 +3010,7 @@ def chat_reply_text(text: str, user_name: str = "", facts: list | None = None) -
     if any(w in t for w in ("i love you", "love you", "pyaar", "i luv u")):
         return random.choice(CHAT_LOVE)
     if any(w in t for w in ("hi", "hello", "hlo", "hey", "namaste", "good morning", "good night")):
-        if user_name:
-            return random.choice([
-                f"Hiee {user_name} 💕",
-                f"hlooo {user_name}, kya haal hai? 😄",
-                f"Hiee {user_name}! bolo kya chahiye? 🙂",
-                f"haan {user_name}, bolo main sun rahi hun 💕",
-            ])
-        return random.choice(CHAT_GREET)
+        return _greet(user_name)
     if any(w in t for w in ("gussa", "bakwas", "chup", "stupid", "idiot")):
         return random.choice(CHAT_ANGRY)
     if facts and random.random() < 0.3:
@@ -3138,13 +3159,17 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
         mem_name = memory_name(user_id)
         if mem_name:
             user_name = mem_name
-    try:
-        ai = await ai_chat_reply(text, user_name, chat_id, user_id)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[chulbuli] AI reply error: {exc!r}")
-        ai = None
-    facts = memory_facts(user_id) if user_id is not None else []
-    reply = ai if ai else chat_reply_text(text, user_name, facts)
+    if is_name_call(text):
+        # Bare name call — Baka/Mimi style: short greeting, NO long AI reply.
+        reply = _greet(user_name)
+    else:
+        try:
+            ai = await ai_chat_reply(text, user_name, chat_id, user_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] AI reply error: {exc!r}")
+            ai = None
+        facts = memory_facts(user_id) if user_id is not None else []
+        reply = ai if ai else chat_reply_text(text, user_name, facts)
     if chat_id is not None and user_id is not None:
         record_exchange(chat_id, user_id, user_name, text, reply)
     elif user_id is not None:
