@@ -1,0 +1,1470 @@
+"""Chulbuli test suite — pure functions + simulated handler end-to-end tests.
+Run: ../venv/bin/python /tmp/test_chulbuli.py
+No network, no real Telegram calls. Token never used here.
+"""
+import asyncio
+import contextlib
+from datetime import datetime, timezone
+import io
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
+os.chdir(os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
+
+import bot as B
+
+PASS = []
+FAIL = []
+
+
+def check(name, cond, extra=""):
+    (PASS if cond else FAIL).append(name)
+    print(("PASS " if cond else "FAIL ") + name + (f" — {extra}" if extra and not cond else ""))
+
+
+# ---------- pure functions ----------
+check("wg fear", B.score_word_guess("fire", "fear") == ["green", "blue", "white", "blue"],
+      str(B.score_word_guess("fire", "fear")))
+check("wg dup letters", B.score_word_guess("ball", "lala") == ["blue", "green", "green", "white"],
+      str(B.score_word_guess("ball", "lala")))
+check("wg all green", B.score_word_guess("fire", "fire") == ["green"] * 4)
+check("wg all white", B.score_word_guess("fire", "junk") == ["white"] * 4)
+board = B.word_guess_board("fire", "fear", 1)
+check("wg board", "🟩 🟦 ⬜ 🟦" in board and "F E A R" in board and "round 1/6" in board, board)
+check("rps rock>scissors", B.rps_winner("rock", "scissors") == 1)
+check("rps paper>rock", B.rps_winner("paper", "rock") == 1)
+check("rps draw", B.rps_winner("rock", "rock") == 0)
+check("rps lose", B.rps_winner("rock", "paper") == 2)
+for _ in range(20):
+    q, a = B.math_question("easy")
+    assert eval(q.replace("×", "*").replace(" = ?", "")) == a, q
+check("math 20 ok", True)
+grid, placed = B.place_grid_words(["ship", "candy", "fire"])
+check("grid 8x8", len(grid) == 8 and all(len(r) == 8 for r in grid))
+check("grid placed>=2", len(placed) >= 2, str(list(placed)))
+u = {"coins": 5000}
+check("amount num", B.parse_amount("100", u) == 100)
+check("amount all", B.parse_amount("all", u) == 5000)
+check("amount half", B.parse_amount("half", u) == 2500)
+check("amount k", B.parse_amount("2k", u) == 2000)
+check("amount bad", B.parse_amount("abc", u) is None)
+check("level", B.level_for(0) == 1 and B.level_for(100) == 2 and B.level_for(400) == 3)
+check("wg wordlist", len(B.WORD_GUESS_WORDS) == 210 and "fire" in B.WORD_GUESS_WORDS
+      and all(len(w) == 4 for w in B.WORD_GUESS_WORDS))
+
+
+# ---------- Phase 2 pure-function checks ----------
+check("uno deck 108", len(B.uno_new_deck()) == 108)
+check("uno can play color", B.uno_can_play(("r", "5"), ("g", "5"), "g"))
+check("uno can play value", B.uno_can_play(("r", "5"), ("g", "9"), "g") is False)
+check("uno can play same value", B.uno_can_play(("r", "5"), ("g", "5"), "b"))
+check("uno wild", B.uno_can_play(("W", "W"), ("g", "5"), "g"))
+check("uno parse r5", B.uno_parse_card("r5") == (("r", "5"), None))
+check("uno parse skip", B.uno_parse_card("g skip") == (("g", "S"), None))
+check("uno parse wild", B.uno_parse_card("wild red") == (("W", "W"), "r"))
+check("uno parse +4", B.uno_parse_card("+4 blue") == (("W", "+4"), "b"))
+check("uno parse bad", B.uno_parse_card("xyz") == (None, None))
+check("elo update", B.elo_update(1200, 1200) == (1216, 1184))
+check("elo update upset", B.elo_update(1000, 1400)[0] > 1016)
+check("mines mult 0", B.mines_mult(0) == 1.0)
+check("mines mult 10", B.mines_mult(10) == 6.0)
+check("crash point range", all(1.0 <= B.crash_point() <= 5.0 for _ in range(50)))
+check("roulette color 0", B.roulette_color(0) == "green")
+check("roulette color 1", B.roulette_color(1) == "red")
+check("roulette color 2", B.roulette_color(2) == "black")
+check("roulette color 36", B.roulette_color(36) == "red")
+check("hack score partial", B.hack_score("1234", "1243") == (2, 2))
+check("hack score exact", B.hack_score("1234", "1234") == (4, 0))
+check("hack score none", B.hack_score("1234", "5678") == (0, 0))
+check("xoxo win row", B.xoxo_winner(["X", "X", "X", "", "", "", "", "", ""]) == "X")
+check("xoxo win col", B.xoxo_winner(["O", "", "", "O", "", "", "O", "", ""]) == "O")
+check("xoxo draw", B.xoxo_winner(["X", "O", "X", "X", "O", "O", "O", "X", "X"]) == "draw")
+check("xoxo none", B.xoxo_winner(["X", "", "", "", "", "", "", "", ""]) is None)
+_bboard = B.bingo_board()
+check("bingo board 25", len(_bboard) == 25 and _bboard[12] == 0 and len(set(x for x in _bboard if x)) == 24)
+check("bingo lines 1", B.bingo_lines([1, 2, 3, 4, 5] + list(range(6, 26)), {1, 2, 3, 4, 5}) == 1)
+check("bingo lines 0", B.bingo_lines([1, 2, 3, 4, 5] + list(range(6, 26)), {1, 2}) == 0)
+check("jumble scramble", (lambda w: (lambda s: s != w and sorted(s) == sorted(w))(B.jumble_scramble(w)))("banana"))
+check("charades normalize", B.charades_normalize("3 Idiots!") == "3 idiots")
+check("bluff deck 52", len(B.bluff_deck()) == 52 and len(set(B.bluff_deck())) == 52)
+check("bluff rank", B.bluff_rank_of("10S") == "10" and B.bluff_rank_of("AH") == "A")
+check("subway obstacle", B.subway_obstacle()[1] in ("jump", "slide", "dodge"))
+check("mafia roles 5", sorted(B.mafia_assign_roles([1, 2, 3, 4, 5]).values()) == ["detective", "doctor", "mafia", "townie", "townie"])
+check("mafia roles 8", sorted(B.mafia_assign_roles([1, 2, 3, 4, 5, 6, 7, 8]).values()).count("mafia") == 2)
+check("ai models list", len(B.AI_MODELS) >= 1 and B.AI_MODELS[0].endswith(":free"))
+_b = B._chess.Board()
+_b.push_uci("f2f3"); _b.push_uci("e7e5"); _b.push_uci("g2g4"); _b.push_uci("d8h4")
+check("chess fools mate", B._chess is not None and _b.is_checkmate())
+
+
+# ---------- fake Telegram objects ----------
+class FakeUser:
+    def __init__(self, uid, name="Tester", username=None):
+        self.id = uid
+        self.first_name = name
+        self.username = username
+        self.is_bot = False
+
+
+class FakeChat:
+    def __init__(self, cid, ctype, title="Test Group"):
+        self.id = cid
+        self.type = ctype
+        self.title = title
+
+
+class FakeMessage:
+    _id = 1000
+    outbox = []  # (chat_id, text) of everything the bot "sent"
+    outbox_full = []  # (chat_id, text, kwargs) — same sends, with reply_markup etc.
+    edits = []  # (chat_id, text, kwargs) of every edit_text call
+
+    def __init__(self, text, uid=111, name="Tester", chat_id=-100123, ctype="group",
+                 reply_to=None, username=None):
+        FakeMessage._id += 1
+        self.id = FakeMessage._id
+        self.text = text
+        self.from_user = FakeUser(uid, name, username)
+        from pyrogram.enums import ChatType
+        self.chat = FakeChat(chat_id, ChatType.GROUP if ctype == "group" else ChatType.PRIVATE,
+                             "Test Group" if ctype == "group" else "")
+        self.reply_to_message = reply_to
+        self.entities = None
+        self.date = datetime.now(timezone.utc)
+        parts = text.split()
+        self.command = [p.lstrip("/").split("@")[0] for p in parts] if parts and parts[0].startswith("/") else []
+
+    async def reply_text(self, text, **kwargs):
+        FakeMessage.outbox.append((self.chat.id, text))
+        FakeMessage.outbox_full.append((self.chat.id, text, kwargs))
+        m = FakeMessage.__new__(FakeMessage)
+        FakeMessage._id += 1
+        m.id = FakeMessage._id
+        m.text = text
+        m.from_user = FakeUser(999, "Chulbuli")
+        m.from_user.is_bot = True
+        m.chat = self.chat
+        m.reply_to_message = None
+        m.entities = None
+        m.command = []
+        return m
+
+    async def edit_text(self, text, **kwargs):
+        FakeMessage.edits.append((self.chat.id, text, kwargs))
+        self.text = text
+        return self
+
+    async def delete(self):
+        return True
+
+
+class FakeCallbackQuery:
+    """Stand-in for a Pyrogram CallbackQuery (menu / join buttons)."""
+
+    def __init__(self, data, uid=111, name="Tester", message=None):
+        self.data = data
+        self.from_user = FakeUser(uid, name)
+        self.message = message
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+
+
+class FakeChatMember:
+    def __init__(self, user, status="administrator"):
+        self.user = user
+        self.status = status
+
+
+class FakeApp:
+    """Stand-in for the module-global Pyrogram client (DM sends in games)."""
+    calls = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        FakeMessage.outbox.append((chat_id, text))
+        FakeMessage.outbox_full.append((chat_id, text, kwargs))
+        m = FakeMessage.__new__(FakeMessage)
+        FakeMessage._id += 1
+        m.id = FakeMessage._id
+        m.text = text
+        return m
+
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        FakeMessage.edits.append((chat_id, text, kwargs))
+        return None
+
+    async def get_chat_members(self, chat_id, filter=None):
+        yield FakeChatMember(FakeUser(7966027018, "Sanji"), "owner")
+        yield FakeChatMember(FakeUser(222, "Admin2"), "administrator")
+
+    async def get_chat_member(self, chat_id, user_id):
+        return FakeChatMember(FakeUser(user_id, "Tester"), "administrator")
+
+    async def promote_chat_member(self, chat_id, user_id, **kwargs):
+        FakeApp.calls.append(("promote", chat_id, user_id, kwargs))
+        return True
+
+    async def set_chat_admin_custom_title(self, chat_id, user_id, title):
+        FakeApp.calls.append(("title", chat_id, user_id, title))
+        return True
+
+    async def restrict_chat_member(self, chat_id, user_id, permissions=None, **kwargs):
+        FakeApp.calls.append(("restrict", chat_id, user_id))
+        return True
+
+    async def ban_chat_member(self, chat_id, user_id, **kwargs):
+        FakeApp.calls.append(("ban", chat_id, user_id))
+        return True
+
+    async def unban_chat_member(self, chat_id, user_id, **kwargs):
+        FakeApp.calls.append(("unban", chat_id, user_id))
+        return True
+
+    async def pin_chat_message(self, chat_id, message_id, **kwargs):
+        FakeApp.calls.append(("pin", chat_id, message_id))
+        return True
+
+    async def unpin_chat_message(self, chat_id, **kwargs):
+        FakeApp.calls.append(("unpin", chat_id))
+        return True
+
+    async def delete_messages(self, chat_id, message_ids, **kwargs):
+        FakeApp.calls.append(("delete_messages", chat_id, list(message_ids)))
+        return True
+
+    async def export_chat_invite_link(self, chat_id):
+        return "https://t.me/+fakeinvite"
+
+    async def get_chat(self, chat_id):
+        class _C:
+            username = None
+            invite_link = None
+        return _C()
+
+
+class DummyClient:
+    pass
+
+
+async def main():
+    client = DummyClient()
+    B.app = FakeApp()  # DM sends (UNO hands, mafia roles, ...) go to the outbox
+    # Hermetic run: fresh data, and keep saves out of the repo's data.json
+    B.DATA = B._blank_data()
+    B.DATA_FILE = "/tmp/test_chulbuli_data.json"
+    if os.path.exists(B.DATA_FILE):
+        os.remove(B.DATA_FILE)
+    FakeMessage.outbox.clear()
+
+    # /start in DM
+    m = FakeMessage("/start", uid=111, chat_id=111, ctype="private")
+    await B.cmd_start_help(client, m)
+    check("/start replies", any("Chulbuli" in t for _, t in FakeMessage.outbox))
+
+    # /bal — new user starts with 1000 coins
+    FakeMessage.outbox.clear()
+    m = FakeMessage("/bal", uid=111, chat_id=111, ctype="private")
+    await B.cmd_bal(client, m)
+    check("/bal 1000", any("$1,000" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox[-1][1] if FakeMessage.outbox else ""))
+
+    # /daily — first claim +1400, second claim cooldown
+    FakeMessage.outbox.clear()
+    m = FakeMessage("/daily", uid=111, chat_id=111, ctype="private")
+    await B.cmd_daily(client, m)
+    check("/daily +1400", any("1,400" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_daily(client, m)
+    check("/daily cooldown", any("baad aana" in t for _, t in FakeMessage.outbox))
+
+    # /deposit + /withdraw
+    FakeMessage.outbox.clear()
+    await B.cmd_deposit(client, FakeMessage("/deposit 500", uid=111, chat_id=111, ctype="private"))
+    check("/deposit", any("500" in t and "Bank" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_withdraw(client, FakeMessage("/withdraw 200", uid=111, chat_id=111, ctype="private"))
+    check("/withdraw", any("200" in t for _, t in FakeMessage.outbox))
+
+    # /give via reply
+    FakeMessage.outbox.clear()
+    target_msg = FakeMessage("hello", uid=222, name="Friend", chat_id=-100123)
+    give = FakeMessage("/give 100", uid=111, chat_id=-100123, reply_to=target_msg)
+    await B.cmd_give(client, give)
+    check("/give", any("100" in t for _, t in FakeMessage.outbox))
+    check("/give balances", B.DATA["users"]["111"]["coins"] == 1000 + 1400 - 500 + 200 - 100
+          and B.DATA["users"]["222"]["coins"] == 1000 + 100,
+          f"111={B.DATA['users']['111']['coins']} 222={B.DATA['users']['222']['coins']}")
+
+    # /owner from non-owner is refused
+    FakeMessage.outbox.clear()
+    await B.cmd_owner(client, FakeMessage("/owner", uid=111, chat_id=111, ctype="private"))
+    check("/owner refused", any("sirf owner" in t for _, t in FakeMessage.outbox))
+
+    # Word Guess end-to-end in group
+    FakeMessage.outbox.clear()
+    start = FakeMessage("/wordguess", uid=111, chat_id=-100123)
+    await B.cmd_wordguess(client, start)
+    check("/wordguess starts", any("WORD GUESS" in t for _, t in FakeMessage.outbox))
+    state = B.game_state(-100123)
+    check("wg state secret 4-letter", state and len(state["secret"]) == 4)
+    board_id = state["board_msg_id"]
+    # wrong guess (reply to board)
+    board_msg = FakeMessage("board", uid=999, chat_id=-100123)
+    board_msg.id = board_id
+    board_msg.from_user.is_bot = True
+    FakeMessage.outbox.clear()
+    wrong = "zzzz" if state["secret"] != "zzzz" else "qqqq"
+    guess = FakeMessage(wrong, uid=111, chat_id=-100123, reply_to=board_msg)
+    consumed = await B.handle_wordguess_reply(guess)
+    check("wg wrong guess consumed", consumed)
+    check("wg new board message (spam ok)", any("round 1/6" in t for _, t in FakeMessage.outbox),
+          str([t[:60] for _, t in FakeMessage.outbox]))
+    # correct guess (reply to the NEW board message)
+    state = B.game_state(-100123)
+    board_msg2 = FakeMessage("board2", uid=999, chat_id=-100123)
+    board_msg2.id = state["board_msg_id"]
+    board_msg2.from_user.is_bot = True
+    before = B.DATA["users"]["111"]["coins"]
+    FakeMessage.outbox.clear()
+    guess2 = FakeMessage(state["secret"], uid=111, chat_id=-100123, reply_to=board_msg2)
+    consumed = await B.handle_wordguess_reply(guess2)
+    check("wg win consumed", consumed)
+    check("wg win +500", B.DATA["users"]["111"]["coins"] == before + 500,
+          f"before={before} after={B.DATA['users']['111']['coins']}")
+    check("wg win message", any("guess kar liya" in t for _, t in FakeMessage.outbox))
+    check("wg round cleared", B.game_state(-100123) is None)
+
+    # /rob via reply (force success path by seeding random? just check it replies sanely)
+    FakeMessage.outbox.clear()
+    victim_msg = FakeMessage("hi", uid=222, name="Friend", chat_id=-100123)
+    await B.cmd_rob(client, FakeMessage("/rob", uid=111, chat_id=-100123, reply_to=victim_msg))
+    check("/rob replies", len(FakeMessage.outbox) == 1)
+
+    # /protect + /shield
+    FakeMessage.outbox.clear()
+    await B.cmd_protect(client, FakeMessage("/protect", uid=111, chat_id=111, ctype="private"))
+    check("/protect", any("Shield lag gaya" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_shield(client, FakeMessage("/shield", uid=111, chat_id=111, ctype="private"))
+    check("/shield on", any("Shield ON" in t for _, t in FakeMessage.outbox))
+
+    # chat persona in group (mentions chulbuli)
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli kaisi ho?", uid=111, chat_id=-100123))
+    check("chat persona", len(FakeMessage.outbox) == 1)
+
+    # banned user ignored
+    B.DATA["banned_users"].append(999)
+    FakeMessage.outbox.clear()
+    await B.cmd_bal(client, FakeMessage("/bal", uid=999, chat_id=111, ctype="private"))
+    check("banned ignored", len(FakeMessage.outbox) == 0)
+    B.DATA["banned_users"].remove(999)
+
+    # ================= Phase 2 simulated end-to-end tests =================
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(d):
+        return None
+
+    # /start + /help list every Phase 2 game as live
+    _games = ("/uno", "/chess", "/mines", "/tap", "/crash", "/jumble", "/charades",
+              "/bingo", "/xoxo", "/mafia", "/hack", "/bomb", "/roulette", "/bluff",
+              "/subway", "/scribble")
+    check("/start lists phase2", all(x in B.START_TEXT for x in _games))
+    check("/help lists phase2", all(x in B.HELP_TEXT for x in _games))
+    check("/help no coming soon", "phase 2 me aa rahe hain" not in B.HELP_TEXT)
+    FakeMessage.outbox.clear()
+    await B.cmd_start_help(client, FakeMessage("/help", uid=111, chat_id=111, ctype="private"))
+    check("/help handler", any("/uno" in t and "/mafia" in t for _, t in FakeMessage.outbox))
+
+    # ---- UNO: lobby -> join -> forcestart -> play -> draw -> pass -> win ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_uno(client, FakeMessage("/uno", uid=111, name="Uno1", chat_id=-100201))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Uno2", chat_id=-100201))
+    FakeMessage.outbox.clear()
+    await B.cmd_forcestart(client, FakeMessage("/forcestart", uid=111, name="Uno1", chat_id=-100201))
+    st = B.game_state(-100201)
+    check("uno started", st is not None and st.get("started") and len(st["hands"][111]) == 7 and len(st["hands"][222]) == 7)
+    playable = next((c for c in st["hands"][111] if B.uno_can_play(c, st["top"], st["color"])), None)
+    if playable is None:
+        # unlucky random deal: force a playable card into the hand so the test is deterministic
+        st["hands"][111][0] = (st["color"], "5")
+        playable = st["hands"][111][0]
+    check("uno playable exists", playable is not None)
+    if playable[0] == "W":
+        _arg = "wild red" if playable[1] == "W" else "+4 red"
+    else:
+        _arg = f"{playable[0]}{playable[1]}"
+    FakeMessage.outbox.clear()
+    await B.cmd_uno_play(client, FakeMessage(f"/play {_arg}", uid=111, name="Uno1", chat_id=-100201))
+    check("uno play reduces hand", len(st["hands"][111]) == 6)
+    _cur = st["players"][st["turn"] % len(st["players"])]
+    _hand_before = len(st["hands"][_cur])
+    await B.cmd_uno_draw(client, FakeMessage("/draw", uid=_cur, name="UnoX", chat_id=-100201))
+    check("uno draw", len(st["hands"][_cur]) == _hand_before + 1 and st.get("drew"))
+    await B.cmd_pass(client, FakeMessage("/pass", uid=_cur, name="UnoX", chat_id=-100201))
+    check("uno pass clears drew", st.get("drew") is False)
+    # win path: one playable card left
+    st["hands"][111] = [("r", "3")]
+    st["top"] = ("r", "7"); st["color"] = "r"; st["turn"] = 0; st["discard"] = []
+    _before = B.get_user(111)["coins"]
+    FakeMessage.outbox.clear()
+    await B.cmd_uno_play(client, FakeMessage("/play r3", uid=111, name="Uno1", chat_id=-100201))
+    check("uno win", B.game_state(-100201) is None and any("UNO jeet liya" in t for _, t in FakeMessage.outbox))
+    check("uno win coins", B.get_user(111)["coins"] == _before + 5000)
+
+    # ---- Chess: fool's mate, illegal move, elo ----
+    await B.cmd_chess(client, FakeMessage("/chess", uid=111, name="Chess1", chat_id=-100202))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Chess2", chat_id=-100202))
+    st = B.game_state(-100202)
+    check("chess started", st is not None and st.get("started"))
+    await B.cmd_chess_move(client, FakeMessage("/move f2f3", uid=111, name="Chess1", chat_id=-100202))
+    await B.cmd_chess_move(client, FakeMessage("/move e7e5", uid=222, name="Chess2", chat_id=-100202))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e2e5", uid=111, name="Chess1", chat_id=-100202))
+    check("chess illegal", any("legal nahi" in t for _, t in FakeMessage.outbox))
+    await B.cmd_chess_move(client, FakeMessage("/move g2g4", uid=111, name="Chess1", chat_id=-100202))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move d8h4", uid=222, name="Chess2", chat_id=-100202))
+    check("chess checkmate", B.game_state(-100202) is None and any("CHECKMATE" in t for _, t in FakeMessage.outbox))
+    check("chess elo changed", B.get_user(222)["elo"] > 1200 and B.get_user(111)["elo"] < 1200)
+    FakeMessage.outbox.clear()
+    await B.cmd_elo(client, FakeMessage("/elo", uid=111, name="Chess1", chat_id=111, ctype="private"))
+    check("/elo", any("Elo" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_chesstop(client, FakeMessage("/chesstop", uid=111, name="Chess1", chat_id=111, ctype="private"))
+    check("/chesstop", any("Chess" in t for _, t in FakeMessage.outbox))
+
+    # ---- Mines: safe pick + cashout, and boom ----
+    B.get_user(111)["coins"] = 5000
+    await B.cmd_mines(client, FakeMessage("/mines 100", uid=111, name="Miner", chat_id=-100203))
+    st = B.game_state(-100203)
+    check("mines lobby", st is not None and st["kind"] == "mines" and len(st["mines"]) == 3)
+    _safe = next(i for i in range(25) if i not in st["mines"])
+    _before = B.get_user(111)["coins"]
+    await B.cmd_mines_pick(client, FakeMessage(f"/pick {_safe // 5 + 1} {_safe % 5 + 1}", uid=111, name="Miner", chat_id=-100203))
+    check("mines safe pick", _safe in B.game_state(-100203)["revealed"])
+    FakeMessage.outbox.clear()
+    await B.cmd_cashout(client, FakeMessage("/cashout", uid=111, name="Miner", chat_id=-100203))
+    check("mines cashout", B.game_state(-100203) is None and B.get_user(111)["coins"] == _before + 123 and any("Cashout" in t for _, t in FakeMessage.outbox))
+    B.get_user(111)["coins"] = 5000
+    await B.cmd_mines(client, FakeMessage("/mines 100", uid=111, name="Miner", chat_id=-100204))
+    st = B.game_state(-100204)
+    _mine = next(iter(st["mines"]))
+    FakeMessage.outbox.clear()
+    await B.cmd_mines_pick(client, FakeMessage(f"/pick {_mine // 5 + 1} {_mine % 5 + 1}", uid=111, name="Miner", chat_id=-100204))
+    check("mines boom", B.game_state(-100204) is None and any("BOOM" in t for _, t in FakeMessage.outbox))
+
+    # ---- Tap: lobby + race end (sleep injected to feed taps) ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_tap(client, FakeMessage("/tap 100", uid=111, name="Tap1", chat_id=-100205))
+    await B.cmd_join_generic(client, FakeMessage("/jointap", uid=222, name="Tap2", chat_id=-100205))
+    st = B.game_state(-100205)
+    check("tap lobby", st is not None and st["players"] == [111, 222])
+    _post_bet = B.get_user(111)["coins"]
+    FakeMessage.outbox.clear()
+
+    async def _inject_taps(d):
+        s = B.game_state(-100205)
+        if s is not None and s.get("started"):
+            s["taps"] = {"111": 5, "222": 3}
+
+    asyncio.sleep = _inject_taps
+    try:
+        await B._tap_start(-100205)
+    finally:
+        asyncio.sleep = _orig_sleep
+    check("tap winner", B.game_state(-100205) is None and any("jeet gaya" in t for _, t in FakeMessage.outbox)
+          and B.get_user(111)["coins"] == _post_bet + 200)
+
+    # ---- Crash: lobby + crash end (fast sleep), and cashout unit test ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_crash(client, FakeMessage("/crash 100", uid=111, name="Crash1", chat_id=-100206))
+    await B.cmd_join_generic(client, FakeMessage("/joincrash", uid=222, name="Crash2", chat_id=-100206))
+    st = B.game_state(-100206)
+    check("crash lobby", st is not None and len(st["players"]) == 2)
+    FakeMessage.outbox.clear()
+    asyncio.sleep = _fast_sleep
+    try:
+        await B._crash_start(-100206)
+    finally:
+        asyncio.sleep = _orig_sleep
+    check("crash ends", B.game_state(-100206) is None and any("CRASH" in t for _, t in FakeMessage.outbox))
+    B.get_user(111)["coins"] = 5000
+    await B.cmd_crash(client, FakeMessage("/crash 100", uid=111, name="Crash1", chat_id=-100216))
+    st = B.game_state(-100216)
+    st["started"] = True; st["mult"] = 2.5; st["players"] = [111]
+    FakeMessage.outbox.clear()
+    await B.cmd_cashout(client, FakeMessage("/cashout", uid=111, name="Crash1", chat_id=-100216))
+    check("crash cashout", B.get_user(111)["coins"] == 4900 + 250 and any("cashout" in t for _, t in FakeMessage.outbox))
+
+    # ---- Jumble + Charades: wrong guess ignored, right guess wins ----
+    await B.cmd_jumble(client, FakeMessage("/jumble", uid=111, name="Jum", chat_id=-100217))
+    st = B.game_state(-100217)
+    check("jumble start", st is not None and "word" in st and st.get("started"))
+    check("jumble wrong ignored", await B.handle_jumble_guess(FakeMessage("zzzqqq", uid=222, name="G2", chat_id=-100217)) is False)
+    _before = B.get_user(222)["coins"]
+    check("jumble win", await B.handle_jumble_guess(FakeMessage(st["word"], uid=222, name="G2", chat_id=-100217)) is True
+          and B.game_state(-100217) is None and B.get_user(222)["coins"] == _before + 300)
+    await B.cmd_charades(client, FakeMessage("/charades", uid=111, name="Cha", chat_id=-100218))
+    st = B.game_state(-100218)
+    check("charades start", st is not None and "answer" in st and st.get("started"))
+    check("charades wrong ignored", await B.handle_charades_guess(FakeMessage("zzzqqq", uid=222, name="G2", chat_id=-100218)) is False)
+    check("charades win", await B.handle_charades_guess(FakeMessage(st["answer"], uid=222, name="G2", chat_id=-100218)) is True
+          and B.game_state(-100218) is None)
+
+    # ---- Bingo: lobby + full draw loop (fast sleep) ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_bingo(client, FakeMessage("/bingo 100", uid=111, name="Bingo1", chat_id=-100207))
+    await B.cmd_join_generic(client, FakeMessage("/joinbingo", uid=222, name="Bingo2", chat_id=-100207))
+    st = B.game_state(-100207)
+    check("bingo lobby", st is not None and st["players"] == [111, 222])
+    FakeMessage.outbox.clear()
+    asyncio.sleep = _fast_sleep
+    try:
+        await B._bingo_start(-100207)
+    finally:
+        asyncio.sleep = _orig_sleep
+    check("bingo ends", B.game_state(-100207) is None and any("BINGO" in t for _, t in FakeMessage.outbox))
+
+    # ---- Xoxo: wrong turn, occupied cell, full win line ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_xoxo(client, FakeMessage("/xoxo 100", uid=111, name="X1", chat_id=-100208))
+    await B.cmd_join_generic(client, FakeMessage("/joinxoxo", uid=222, name="X2", chat_id=-100208))
+    st = B.game_state(-100208)
+    check("xoxo start", st is not None and st.get("started") and st["board"] == [""] * 9)
+    FakeMessage.outbox.clear()
+    await B.cmd_xoxo_place(client, FakeMessage("/place 5", uid=222, name="X2", chat_id=-100208))
+    check("xoxo wrong turn", any("baari nahi" in t for _, t in FakeMessage.outbox))
+    await B.cmd_xoxo_place(client, FakeMessage("/place 1", uid=111, name="X1", chat_id=-100208))
+    FakeMessage.outbox.clear()
+    await B.cmd_xoxo_place(client, FakeMessage("/place 1", uid=222, name="X2", chat_id=-100208))
+    check("xoxo occupied", any("bhari hai" in t for _, t in FakeMessage.outbox))
+    await B.cmd_xoxo_place(client, FakeMessage("/place 5", uid=222, name="X2", chat_id=-100208))
+    await B.cmd_xoxo_place(client, FakeMessage("/place 2", uid=111, name="X1", chat_id=-100208))
+    await B.cmd_xoxo_place(client, FakeMessage("/place 6", uid=222, name="X2", chat_id=-100208))
+    FakeMessage.outbox.clear()
+    await B.cmd_xoxo_place(client, FakeMessage("/place 3", uid=111, name="X1", chat_id=-100208))
+    check("xoxo win", B.game_state(-100208) is None and any("jeet gaya" in t for _, t in FakeMessage.outbox))
+
+    # ---- Mafia: lobby -> roles -> night kill -> day vote -> town wins ----
+    await B.cmd_mafia(client, FakeMessage("/mafia", uid=111, name="Asha", chat_id=-100209))
+    for _uid, _name in [(222, "Bina"), (333, "Chetan"), (444, "Deepak"), (555, "Esha")]:
+        await B.cmd_join_generic(client, FakeMessage("/join", uid=_uid, name=_name, chat_id=-100209))
+    FakeMessage.outbox.clear()
+    await B.cmd_forcestart(client, FakeMessage("/forcestart", uid=111, name="Asha", chat_id=-100209))
+    mst = B.MAFIA.get(-100209)
+    check("mafia started", mst is not None and mst.get("started") and len(mst["players"]) == 5)
+    _roles = list(mst["roles"].values())
+    check("mafia roles dealt", _roles.count("mafia") == 1 and _roles.count("detective") == 1 and _roles.count("doctor") == 1)
+    _mafia_uid = next(u for u, r in mst["roles"].items() if r == "mafia")
+    _doctor_uid = next(u for u, r in mst["roles"].items() if r == "doctor")
+    _det_uid = next(u for u, r in mst["roles"].items() if r == "detective")
+    _townies = [u for u, r in mst["roles"].items() if r == "townie"]
+    _target_uid = _townies[0]
+    _target_name = mst["names"][str(_target_uid)]
+    FakeMessage.outbox.clear()
+    await B.cmd_mafiakill(client, FakeMessage(f"/mafiakill {_target_name}", uid=_mafia_uid, name=mst["names"][str(_mafia_uid)], chat_id=_mafia_uid, ctype="private"))
+    check("mafia kill set", mst["night"].get("kill") == _target_uid)
+    _other_townie = _townies[1]
+    await B.cmd_mafia_save(client, FakeMessage(f"/save {mst['names'][str(_other_townie)]}", uid=_doctor_uid, name=mst["names"][str(_doctor_uid)], chat_id=_doctor_uid, ctype="private"))
+    check("mafia save set", mst["night"].get("save") == _other_townie)
+    FakeMessage.outbox.clear()
+    await B.cmd_mafia_check(client, FakeMessage(f"/check {mst['names'][str(_mafia_uid)]}", uid=_det_uid, name=mst["names"][str(_det_uid)], chat_id=_det_uid, ctype="private"))
+    check("mafia check reply", any("MAFIA" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B._mafia_resolve_night(-100209)
+    check("mafia night kill", _target_uid not in mst["alive"] and mst["phase"] == "day")
+    _mafia_name = mst["names"][str(_mafia_uid)]
+    for _u in list(mst["alive"]):
+        if _u != _mafia_uid:
+            await B.cmd_mafia_vote(client, FakeMessage(f"/vote {_mafia_name}", uid=_u, name=mst["names"][str(_u)], chat_id=-100209))
+    asyncio.sleep = _fast_sleep
+    try:
+        await B._mafia_day_timer(-100209, 1)
+    finally:
+        asyncio.sleep = _orig_sleep
+    check("mafia town wins", -100209 not in B.MAFIA and any("TOWN JEET" in t for _, t in FakeMessage.outbox))
+
+    # ---- Hack: wrong guess, then the real code ----
+    B.get_user(111)["coins"] = 5000
+    await B.cmd_hack(client, FakeMessage("/hack 100", uid=111, name="Hacker", chat_id=-100210))
+    st = B.game_state(-100210)
+    check("hack start", st is not None and len(st["code"]) == 4)
+    FakeMessage.outbox.clear()
+    await B.cmd_hackguess(client, FakeMessage("/hackguess 0000", uid=111, name="Hacker", chat_id=-100210))
+    check("hack wrong guess", any("sahi jagah" in t for _, t in FakeMessage.outbox))
+    _before = B.get_user(111)["coins"]
+    await B.cmd_hackguess(client, FakeMessage(f"/hackguess {st['code']}", uid=111, name="Hacker", chat_id=-100210))
+    check("hack win", B.game_state(-100210) is None and B.get_user(111)["coins"] == _before + 100)
+
+    # ---- Bomb: lobby -> pass -> fuse explodes ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_bomb(client, FakeMessage("/bomb", uid=111, name="Bomber1", chat_id=-100211))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Bomber2", chat_id=-100211))
+    await B.cmd_forcestart(client, FakeMessage("/forcestart", uid=111, name="Bomber1", chat_id=-100211))
+    st = B.game_state(-100211)
+    check("bomb start", st is not None and st.get("started") and st.get("holder") in (111, 222))
+    _holder = st["holder"]
+    _other = 222 if _holder == 111 else 111
+    _other_msg = FakeMessage("hi", uid=_other, name="Bomber2" if _other == 222 else "Bomber1", chat_id=-100211)
+    FakeMessage.outbox.clear()
+    await B.cmd_pass(client, FakeMessage("/pass", uid=_holder, name="Bomber1" if _holder == 111 else "Bomber2", chat_id=-100211, reply_to=_other_msg))
+    check("bomb pass", B.game_state(-100211)["holder"] == _other)
+    _gid = st.get("gid")
+    await B._bomb_fuse(-100211, _gid, 0)
+    check("bomb explodes", B.game_state(-100211) is None and any("BOOM" in t for _, t in FakeMessage.outbox))
+
+    # ---- Roulette: reply + coins move by exactly the bet ----
+    B.get_user(111)["coins"] = 5000
+    _before = B.get_user(111)["coins"]
+    FakeMessage.outbox.clear()
+    await B.cmd_roulette(client, FakeMessage("/roulette 100 red", uid=111, name="Rou", chat_id=111, ctype="private"))
+    check("roulette replies", any("Roulette" in t for _, t in FakeMessage.outbox))
+    check("roulette coins", B.get_user(111)["coins"] in (_before - 100, _before + 100))
+
+    # ---- Bluff: claim -> call -> win path ----
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_bluff(client, FakeMessage("/bluff 100", uid=111, name="Bluff1", chat_id=-100212))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Bluff2", chat_id=-100212))
+    await B.cmd_forcestart(client, FakeMessage("/forcestart", uid=111, name="Bluff1", chat_id=-100212))
+    st = B.game_state(-100212)
+    check("bluff start", st is not None and st.get("started") and len(st["hands"][111]) == 26)
+    FakeMessage.outbox.clear()
+    await B.cmd_bluff_claim(client, FakeMessage("/claim A 2", uid=111, name="Bluff1", chat_id=-100212))
+    check("bluff claim", len(st["hands"][111]) == 24 and len(st["pile"]) == 2)
+    FakeMessage.outbox.clear()
+    await B.cmd_bluff_call(client, FakeMessage("/call", uid=222, name="Bluff2", chat_id=-100212))
+    check("bluff call resolves", len(st["pile"]) == 0 and any("SACH" in t or "BLUFF PAKDA" in t for _, t in FakeMessage.outbox))
+    st["hands"][111] = ["AH"]
+    st["turn"] = 0
+    st["last_claim"] = None
+    st["pile"] = []
+    FakeMessage.outbox.clear()
+    await B.cmd_bluff_claim(client, FakeMessage("/claim A 1", uid=111, name="Bluff1", chat_id=-100212))
+    check("bluff win", B.game_state(-100212) is None and any("Bluff jeet gaya" in t for _, t in FakeMessage.outbox))
+
+    # ---- Subway: right move scores, wrong move ends the run ----
+    B.get_user(111)["coins"] = 5000
+    await B.cmd_subway(client, FakeMessage("/subway", uid=111, name="Sub", chat_id=-100213))
+    st = B.game_state(-100213)
+    check("subway start", st is not None and st.get("kind") == "subway")
+    st["action"] = "jump"
+    FakeMessage.outbox.clear()
+    await B.cmd_subway_action(client, FakeMessage("/jump", uid=111, name="Sub", chat_id=-100213))
+    check("subway correct", B.game_state(-100213)["score"] == 1)
+    st = B.game_state(-100213)
+    st["action"] = "slide"
+    st["answered"] = False
+    FakeMessage.outbox.clear()
+    await B.cmd_subway_action(client, FakeMessage("/jump", uid=111, name="Sub", chat_id=-100213))
+    check("subway wrong ends", B.game_state(-100213) is None and any("SUBWAY KHATAM" in t for _, t in FakeMessage.outbox))
+
+    # ---- Scribble: guess the word, guesser +200, drawer +100 ----
+    await B.cmd_scribble(client, FakeMessage("/scribble", uid=111, name="Scrib1", chat_id=-100214))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Scrib2", chat_id=-100214))
+    await B.cmd_forcestart(client, FakeMessage("/forcestart", uid=111, name="Scrib1", chat_id=-100214))
+    st = B.game_state(-100214)
+    check("scribble start", st is not None and st.get("started") and st.get("round_started") and st.get("word"))
+    _bg = B.get_user(222)["coins"]
+    _bd = B.get_user(111)["coins"]
+    check("scribble guess", await B.handle_scribble_guess(FakeMessage(st["word"], uid=222, name="Scrib2", chat_id=-100214)) is True
+          and B.get_user(222)["coins"] == _bg + 200 and B.get_user(111)["coins"] == _bd + 100)
+
+    # ---- /end clears an active game, does nothing with no game ----
+    await B.cmd_wordguess(client, FakeMessage("/wordguess", uid=111, name="End1", chat_id=-100215))
+    check("end setup", B.game_state(-100215) is not None)
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=111, name="End1", chat_id=-100215))
+    check("/end clears", B.game_state(-100215) is None and any("Game khatam" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=111, name="End1", chat_id=-100215))
+    check("/end no game", len(FakeMessage.outbox) == 0)
+
+    # ---- AI chat: no key -> None, fallback rule-based; toggle off -> None;
+    #      mocked API success; first model fails -> second model answers ----
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    check("ai no key", await B.ai_chat_reply("hello ji", "Tester") is None)
+    _rb = await B.chat_reply_ai("hello ji")
+    check("ai fallback rule-based", isinstance(_rb, str) and len(_rb) > 0)
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode()
+
+    _real_urlopen = urllib.request.urlopen
+    B.DATA["toggles"]["ai"] = False
+    os.environ["OPENROUTER_API_KEY"] = "dummy-test-key"
+    check("ai toggle off", await B.ai_chat_reply("hello ji", "Tester") is None)
+    B.DATA["toggles"]["ai"] = True
+
+    def _fake_urlopen_ok(req, timeout=20):
+        return _FakeResp({"choices": [{"message": {"content": "arey hello ji, kaise ho? 😄"}}]})
+
+    urllib.request.urlopen = _fake_urlopen_ok
+    try:
+        _got = await B.ai_chat_reply("hi chulbuli", "Tester")
+    finally:
+        urllib.request.urlopen = _real_urlopen
+    check("ai mocked success", _got == "arey hello ji, kaise ho? 😄", str(_got))
+
+    def _fake_urlopen_fail_first(req, timeout=20):
+        # fail the FIRST model in the chain (whatever it currently is),
+        # the second one must answer
+        if B.AI_MODELS[0].encode() in (req.data or b""):
+            raise urllib.error.URLError("boom")
+        return _FakeResp({"choices": [{"message": {"content": "fallback reply"}}]})
+
+    urllib.request.urlopen = _fake_urlopen_fail_first
+    try:
+        _got2 = await B.ai_chat_reply("hi", "Tester")
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    check("ai fallback model", _got2 == "fallback reply", str(_got2))
+
+    # ---- safe_reply logs failures instead of swallowing them ----
+    class _BadMsg(FakeMessage):
+        async def reply_text(self, text, **kwargs):
+            raise RuntimeError("boom")
+
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _res = await B.safe_reply(_BadMsg("hi", uid=111, chat_id=111, ctype="private"), "hello")
+    check("safe_reply logs", _res is None and "safe_reply failed" in _buf.getvalue(), _buf.getvalue())
+
+    # ================= v2.1.0: no user-visible "AI", real-girl prompt ============
+    import re as _re
+    _ai_word = _re.compile(r"\bAI\b", _re.IGNORECASE)
+    _visible = [B.START_TEXT, B.HELP_TEXT, B.MENU_GAMES_TEXT, B.MENU_ECONOMY_TEXT,
+                B.MENU_WORDGUESS_TEXT, B.MENU_ROMANCE_TEXT, B.owner_panel_text(),
+                B.balance_text(B.get_user(111), 111, "Tester"), B.toprich_text()]
+    for _lst in (B.CHAT_GREET, B.CHAT_HOW, B.CHAT_DEFAULT, B.CHAT_LOVE, B.CHAT_ANGRY, B.CHAT_REAL):
+        _visible += list(_lst)
+    for _i in range(30):
+        _visible.append(B.chat_reply_text("hello ji", "Tester"))
+        _visible.append(B.chat_reply_text("kaise ho", "Tester"))
+        _visible.append(B.chat_reply_text("tum AI ho?", "Tester"))
+        _visible.append(B.chat_reply_text("are you a bot?", "Tester"))
+    check("no AI word user-visible", not any(_ai_word.search(s) for s in _visible),
+          str([s for s in _visible if _ai_word.search(s)][:2]))
+    check("no artificial/openrouter user-visible",
+          not any(w in s.lower() for s in _visible for w in ("artificial", "openrouter")), "")
+    check("no robot emoji user-visible", not any("🤖" in s for s in _visible), "")
+    check("owner panel says Baatein", "💬 Baatein:" in B.owner_panel_text()
+          and "AI" not in B.owner_panel_text(), B.owner_panel_text())
+    check("ai system never-ai rule", "NOT an AI" in B.AI_SYSTEM and "NEVER" in B.AI_SYSTEM
+          and "unless asked" not in B.AI_SYSTEM, "")
+    check("ai system memory instruction", "remember" in B.AI_SYSTEM.lower()
+          and "facts" in B.AI_SYSTEM.lower(), "")
+    check("ai system deflects identity", "Chulbuli hun" in B.AI_SYSTEM, "")
+    check("rule-based deflects identity",
+          B.chat_reply_text("tum AI ho?", "Tester") in B.CHAT_REAL
+          and B.chat_reply_text("are you a bot?", "Tester") in B.CHAT_REAL, "")
+
+    # ================= v2.1.0: strong memory ================================
+    _mem_uid = 777001
+    B.DATA["memory"].pop(str(_mem_uid), None)
+    B.extract_facts(_mem_uid, "mera naam Arjun hai")
+    check("memory name", B.memory_name(_mem_uid) == "Arjun", B.memory_name(_mem_uid))
+    B.extract_facts(_mem_uid, "mujhe cricket pasand hai")
+    B.extract_facts(_mem_uid, "main Delhi se hun")
+    _facts = B.memory_facts(_mem_uid)
+    check("memory facts", "cricket pasand hai" in _facts and "Delhi se hai" in _facts, str(_facts))
+    B.extract_facts(_mem_uid, "mujhe cricket pasand hai")  # duplicate
+    check("memory dedupe", B.memory_facts(_mem_uid).count("cricket pasand hai") == 1)
+    B.extract_facts(_mem_uid, "mujhe cricket pasand nahi")  # opinion change replaces
+    check("memory opinion replace", "cricket pasand nahi" in B.memory_facts(_mem_uid)
+          and "cricket pasand hai" not in B.memory_facts(_mem_uid), str(B.memory_facts(_mem_uid)))
+    B.extract_facts(_mem_uid, "yaad rakhna main doctor hun")
+    check("memory explicit remember", any("doctor" in f for f in B.memory_facts(_mem_uid)),
+          str(B.memory_facts(_mem_uid)))
+    check("memory no false name", B.memory_name(_mem_uid) == "Arjun", B.memory_name(_mem_uid))
+    # /yaad shows name + facts
+    FakeMessage.outbox.clear()
+    await B.cmd_yaad(client, FakeMessage("/yaad", uid=_mem_uid, name="Arjun", chat_id=_mem_uid, ctype="private"))
+    check("yaad shows memory", any("Arjun" in t and "cricket pasand nahi" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox[-1:]))
+    # history caps at 20
+    B.DATA["history"].pop(str(-100777), None)
+    for _i in range(15):
+        B.record_exchange(-100777, _mem_uid, "Arjun", f"msg {_i}", f"reply {_i}")
+    check("history caps 20", len(B.DATA["history"][str(-100777)]) == 20,
+          str(len(B.DATA["history"][str(-100777)])))
+    # AI payload carries facts + recent history
+    _captured = {}
+    _real_post = B._ai_post
+
+    def _capture_post(model, messages):
+        _captured["messages"] = messages
+        return "haan Arjun, yaad hai mujhe 😄"
+
+    B._ai_post = _capture_post
+    B.DATA["toggles"]["ai"] = True
+    os.environ["OPENROUTER_API_KEY"] = "test-key"
+    try:
+        _r = await B.ai_chat_reply("aur batao", "Arjun", chat_id=-100777, user_id=_mem_uid)
+    finally:
+        B._ai_post = _real_post
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    _sys = _captured["messages"][0]["content"]
+    check("ai payload has facts", "cricket pasand nahi" in _sys and "Naam: Arjun" in _sys, _sys[:300])
+    _mid = _captured["messages"][1:-1]
+    check("ai payload has history", len(_mid) == 15
+          and all(m["role"] in ("user", "assistant") for m in _mid), str(len(_mid)))
+    check("ai payload memory first", _captured["messages"][0]["content"].startswith("TUMHE IS USER"),
+          _captured["messages"][0]["content"][:80])
+    check("ai payload current msg", _captured["messages"][-1]["content"] == "Arjun: aur batao",
+          _captured["messages"][-1]["content"])
+    check("ai payload reply", _r == "haan Arjun, yaad hai mujhe 😄", str(_r))
+    # ---- Name call (Baka/Mimi style): bare "chulbuli" gets a short greeting, NO AI call ----
+    check("name call plain", B.is_name_call("chulbuli"))
+    check("name call caps", B.is_name_call("Chulbuli"))
+    check("name call hi", B.is_name_call("hii chulbuli"))
+    check("name call hlo", B.is_name_call("chulbuli hlo"))
+    check("name call emoji", B.is_name_call("chulbuli 💕"))
+    check("name call oye", B.is_name_call("oye chulbuli"))
+    check("not name call question", not B.is_name_call("chulbuli kaise ho?"))
+    check("not name call joke", not B.is_name_call("chulbuli joke sunao"))
+    check("not name call doing", not B.is_name_call("chulbuli tum kya kar rahi ho"))
+    check("not name call no name", not B.is_name_call("hello"))
+    check("not name call sentence", not B.is_name_call("mujhe chulbuli pasand hai"))
+    _nc_calls = []
+    _real_post2 = B._ai_post
+
+    def _record_post(model, messages):
+        _nc_calls.append(model)
+        return "YEH AI KA LAMBA JAWAB HAI"
+
+    B._ai_post = _record_post
+    B.DATA["toggles"]["ai"] = True
+    os.environ["OPENROUTER_API_KEY"] = "test-key"
+    B.DATA["history"].pop(str(889001), None)
+    B.DATA["memory"].pop(str(889001), None)
+    try:
+        _greet_r = await B.chat_reply_ai("chulbuli", "Tester", chat_id=889001, user_id=889001)
+        _q_calls_before = len(_nc_calls)
+        _q_r = await B.chat_reply_ai("chulbuli, tumhe cricket pasand hai?", "Tester", chat_id=889001, user_id=889001)
+    finally:
+        B._ai_post = _real_post2
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    check("name call no AI call", _q_calls_before == 0, str(_nc_calls))
+    check("name call short greeting", _greet_r in B.CHAT_GREET or _greet_r.startswith("hiee Tester") or "Tester" in _greet_r, str(_greet_r))
+    check("name call recorded", len(B.DATA["history"].get(str(889001), [])) >= 2)
+    check("real question calls AI", len(_nc_calls) == 1 and _q_r == "YEH AI KA LAMBA JAWAB HAI", str(_q_r))
+    # name call uses the remembered name
+    B.DATA["memory"].pop(str(889002), None)
+    B.DATA["history"].pop(str(889002), None)
+    B.extract_facts(889002, "mera naam Arjun hai")
+    _greet_named = await B.chat_reply_ai("chulbuli", "", chat_id=889002, user_id=889002)
+    check("name call remembered name", "Arjun" in _greet_named, str(_greet_named))
+    # ---- Daizy style: lowercase, short one-liners, sweet ----
+    _all_chat = B.CHAT_GREET + B.CHAT_HOW + B.CHAT_DEFAULT + B.CHAT_LOVE + B.CHAT_ANGRY
+    check("daizy all lowercase", all(not s or not s[0].isalpha() or s[0].islower() for s in _all_chat),
+          str([s for s in _all_chat if s and s[0].isalpha() and not s[0].islower()]))
+    check("daizy all short", all(len(s) <= 60 for s in _all_chat),
+          str([s for s in _all_chat if len(s) > 60]))
+    check("daizy system lowercase", "lowercase" in B.AI_SYSTEM.lower(), "")
+    check("daizy system daizy", "daizy" in B.AI_SYSTEM.lower(), "")
+    check("daizy system one line", "one-line" in B.AI_SYSTEM.lower() or "one line" in B.AI_SYSTEM.lower(), "")
+    _g = B._greet("")
+    check("daizy greet lowercase", _g.startswith(("hiee", "hlooo", "haan")), _g)
+    check("daizy start lowercase", B.START_TEXT.startswith("hiee"), B.START_TEXT[:20])
+    check("daizy no AI in chat lists", not any("AI" in s for s in _all_chat), "")
+    # chat_reply_ai records the exchange + greets by remembered name (no key -> fallback)
+    B.DATA["history"].pop(str(888001), None)
+    B.DATA["memory"].pop(str(888001), None)
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    await B.chat_reply_ai("mera naam Simran hai", "Simran", chat_id=888001, user_id=888001)
+    check("chat records name", B.memory_name(888001) == "Simran", B.memory_name(888001))
+    _r2 = await B.chat_reply_ai("hii", "Simran", chat_id=888001, user_id=888001)
+    check("chat greeting uses name", "Simran" in _r2, _r2)
+    check("chat history recorded", len(B.DATA["history"][str(888001)]) == 4,
+          str(len(B.DATA["history"][str(888001)])))
+    # /bhool clears facts but keeps coins
+    _coins_before = B.get_user(_mem_uid)["coins"]
+    FakeMessage.outbox.clear()
+    await B.cmd_bhool(client, FakeMessage("/bhool", uid=_mem_uid, name="Arjun", chat_id=_mem_uid, ctype="private"))
+    check("bhool clears facts", B.memory_facts(_mem_uid) == [] and B.memory_name(_mem_uid) == "")
+    check("bhool keeps coins", B.get_user(_mem_uid)["coins"] == _coins_before)
+    FakeMessage.outbox.clear()
+    await B.cmd_yaad(client, FakeMessage("/yaad", uid=_mem_uid, name="Arjun", chat_id=_mem_uid, ctype="private"))
+    check("yaad empty after bhool", any("kuch khaas yaad nahi" in t for _, t in FakeMessage.outbox))
+
+    # ================= v2.1.0: inline buttons ===============================
+    def _cbs_of(markup):
+        return [b.callback_data for row in (markup.inline_keyboard if markup else []) for b in row]
+
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); FakeMessage.edits.clear()
+    await B.cmd_start_help(client, FakeMessage("/start", uid=111, name="Tester", chat_id=111, ctype="private"))
+    _kb = FakeMessage.outbox_full[-1][2].get("reply_markup")
+    check("start has menu keyboard", _kb is not None, "")
+    check("start menu buttons", "menu:games" in _cbs_of(_kb) and "menu:balance" in _cbs_of(_kb)
+          and "menu:help" in _cbs_of(_kb) and "menu:wordguess" in _cbs_of(_kb), str(_cbs_of(_kb)))
+    _cb_msg = FakeMessage(B.START_TEXT.format(name="Tester"), uid=999, name="Chulbuli", chat_id=111, ctype="private")
+    FakeMessage.edits.clear()
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:games", uid=111, name="Tester", message=_cb_msg))
+    check("menu games shows games", any("/uno" in t and "/mafia" in t for _, t, _ in FakeMessage.edits),
+          str([t[:60] for _, t, _ in FakeMessage.edits]))
+    check("menu games back button", "menu:home" in _cbs_of(FakeMessage.edits[-1][2].get("reply_markup")))
+    FakeMessage.edits.clear(); FakeMessage.outbox.clear()
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:balance", uid=111, name="Tester", message=_cb_msg))
+    await B.cmd_bal(client, FakeMessage("/bal", uid=111, name="Tester", chat_id=111, ctype="private"))
+    check("menu balance same as bal", FakeMessage.edits[-1][1] == FakeMessage.outbox[-1][1],
+          f"{FakeMessage.edits[-1][1][:60]!r} vs {FakeMessage.outbox[-1][1][:60]!r}")
+    check("menu balance back button", "menu:home" in _cbs_of(FakeMessage.edits[-1][2].get("reply_markup")))
+    FakeMessage.edits.clear(); FakeMessage.outbox.clear()
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:top", uid=111, name="Tester", message=_cb_msg))
+    await B.cmd_toprich(client, FakeMessage("/toprich", uid=111, name="Tester", chat_id=111, ctype="private"))
+    check("menu top same as toprich", FakeMessage.edits[-1][1] == FakeMessage.outbox[-1][1])
+    FakeMessage.edits.clear()
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:help", uid=111, name="Tester", message=_cb_msg))
+    check("menu help shows help", any("Economy" in t for _, t, _ in FakeMessage.edits))
+    # UNO lobby has a Join button; button join works and keeps the button
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); FakeMessage.edits.clear()
+    B.get_user(111)["coins"] = 5000
+    B.get_user(222)["coins"] = 5000
+    await B.cmd_uno(client, FakeMessage("/uno", uid=111, name="Uno1", chat_id=-100201))
+    _lobby_kb = FakeMessage.outbox_full[-1][2].get("reply_markup")
+    check("uno lobby has join button", _lobby_kb is not None and "join:game" in _cbs_of(_lobby_kb),
+          str(_cbs_of(_lobby_kb)))
+    _lobby_msg = FakeMessage(FakeMessage.outbox[-1][1], uid=999, name="Chulbuli", chat_id=-100201)
+    _jq = FakeCallbackQuery("join:game", uid=222, name="Uno2", message=_lobby_msg)
+    await B.join_callbacks(client, _jq)
+    check("button join adds player", 222 in B.game_state(-100201)["players"])
+    check("button join keeps button", any("join:game" in _cbs_of(kw.get("reply_markup"))
+                                          for _, _, kw in FakeMessage.edits), str(FakeMessage.edits))
+    check("button join lists players", any("Players:" in t and "Uno2" in t for _, t, _ in FakeMessage.edits),
+          str([t for _, t, _ in FakeMessage.edits]))
+    check("button join answered", any(a[0] and "Join ho gaya" in a[0] for a in _jq.answers), str(_jq.answers))
+    # /join command still works (same logic)
+    FakeMessage.outbox.clear()
+    _jr = await B.do_join(-100201, 333, "Uno3")
+    check("do_join returns text", isinstance(_jr, str) and "join ho gaya" in _jr, str(_jr))
+    check("do_join adds player", 333 in B.game_state(-100201)["players"])
+    await B.cmd_end_game(client, FakeMessage("/end", uid=111, name="Uno1", chat_id=-100201))
+
+    # ================= v2.2.0: AI model order + memory, music, gap features ====
+    # ---- AI: chat model first, code model last; persona + memory ----
+    check("ai first is chat model", B.AI_MODELS[0] == "meta-llama/llama-3.1-8b-instruct:free",
+          str(B.AI_MODELS))
+    check("ai code model last", B.AI_MODELS[-1] == "cohere/north-mini-code:free",
+          str(B.AI_MODELS))
+    check("ai all models free", all(m.endswith(":free") for m in B.AI_MODELS))
+    check("ai system girl persona", "sweet desi girl" in B.AI_SYSTEM
+          and "yaar" in B.AI_SYSTEM and "arre" in B.AI_SYSTEM, "")
+    check("ai system memory use", "MEMORY" in B.AI_SYSTEM and "remember" in B.AI_SYSTEM.lower()
+          and "facts" in B.AI_SYSTEM.lower(), "")
+    check("ai system never robotic", "robotic" in B.AI_SYSTEM.lower()
+          and "never lecture" in B.AI_SYSTEM.lower(), "")
+    # rule-based fallback still greets by the remembered name
+    B.extract_facts(889777, "mera naam Arjun hai")
+    _fb_greet = await B.chat_reply_ai("hii", "Tester", chat_id=889777, user_id=889777)
+    check("ai fallback greets by name", "Arjun" in _fb_greet, str(_fb_greet))
+
+    # ---- Music: pure queue logic ----
+    B.MUSIC.clear()
+    _t1 = {"title": "Gaana One", "url": "https://x/1", "audio": "https://a/1", "duration": 200, "by": "A", "by_id": 1}
+    _t2 = {"title": "Gaana Two", "url": "https://x/2", "audio": "https://a/2", "duration": 61, "by": "B", "by_id": 2}
+    check("music queue add pos", B.music_queue_add(-100500, _t1) == 1
+          and B.music_queue_add(-100500, _t2) == 2)
+    check("music queue next", B.music_queue_next(-100500)["title"] == "Gaana One")
+    check("music queue text", "Gaana Two" in B.music_queue_text(-100500))
+    check("music fmt duration", B.fmt_duration(200) == "3:20" and B.fmt_duration(3661) == "1:01:01")
+    B.MUSIC.clear()
+    _st = B.music_state(-100500)
+    _st["current"] = _t1
+    check("music player text", "Gaana One" in B.music_player_text(-100500)
+          and "baj raha hai" in B.music_player_text(-100500))
+    check("music player buttons", "mus:skip" in _cbs_of(B.music_player_markup())
+          and "mus:pause" in _cbs_of(B.music_player_markup())
+          and "mus:stop" in _cbs_of(B.music_player_markup()))
+    # resolve_track raises MusicError when yt-dlp is missing
+    _saved_ytdlp = B._yt_dlp
+    B._yt_dlp = None
+    try:
+        B.resolve_track("koi gaana")
+        check("music resolve no ytdlp raises", False)
+    except B.MusicError:
+        check("music resolve no ytdlp raises", True)
+    finally:
+        B._yt_dlp = _saved_ytdlp
+
+    # ---- Music: /play with no assistant -> honest message, nothing faked ----
+    class _FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            return {"title": "Test Gaana", "webpage_url": "https://youtube.com/watch?v=test",
+                    "url": "https://audio.example/test.m4a", "duration": 200}
+
+    class _FakeYtDlp:
+        YoutubeDL = _FakeYDL
+
+    _real_ytdlp = B._yt_dlp
+    _real_calls = B._PyTgCalls
+    _real_piped = B._AudioPiped
+    _real_mkc = B._music_make_client
+    _real_session = B.ASSISTANT_SESSION
+    B._yt_dlp = _FakeYtDlp
+    B.MUSIC.clear()
+    FakeMessage.outbox.clear()
+    B.ASSISTANT_SESSION = ""
+    B._PyTgCalls = None
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
+    check("music play no assistant honest", any("assistant" in t and "connect nahi" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    check("music play no assistant no fake", B.music_state(-100501).get("current") is None
+          and B.music_state(-100501).get("playing") is False)
+    # /play in DM -> group-only
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=111, ctype="private"))
+    check("music play dm group only", any("group" in t for _, t in FakeMessage.outbox))
+    # /ping works
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/ping", uid=111, name="Tester", chat_id=-100501))
+    check("music ping", any("pong!" in t for _, t in FakeMessage.outbox))
+    # /queue empty, /skip nothing, /stop nothing
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/queue", uid=111, name="Tester", chat_id=-100501))
+    check("music queue empty", any("khaali" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/skip", uid=111, name="Tester", chat_id=-100501))
+    check("music skip nothing", any("baj nahi raha" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100501))
+    check("music stop nothing", any("chal nahi raha" in t for _, t in FakeMessage.outbox))
+
+    # ---- Music: mocked assistant -> queue + player card + controls ----
+    class _FakeCalls:
+        def __init__(self, user_client):
+            self.user_client = user_client
+            self.joined = []
+            self.left = []
+            self.paused = []
+            self.resumed = []
+            self.changed = []
+
+        async def start(self):
+            return True
+
+        async def join_group_call(self, chat_id, stream, **kwargs):
+            self.joined.append((chat_id, stream))
+
+        async def change_stream(self, chat_id, stream, **kwargs):
+            self.changed.append((chat_id, stream))
+
+        async def pause_stream(self, chat_id):
+            self.paused.append(chat_id)
+
+        async def resume_stream(self, chat_id):
+            self.resumed.append(chat_id)
+
+        async def leave_group_call(self, chat_id):
+            self.left.append(chat_id)
+
+        def on_stream_end(self):
+            def deco(fn):
+                return fn
+            return deco
+
+    class _FakeAssistantClient:
+        async def start(self):
+            return True
+
+        async def get_me(self):
+            class _Me:
+                username = "CBIOFINDIA"
+                id = 8617937893
+            return _Me()
+
+        async def join_chat(self, link):
+            return True
+
+    B._PyTgCalls = _FakeCalls
+    B._AudioPiped = lambda audio, **kw: ("piped", audio)
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    FakeMessage.outbox.clear()
+    FakeApp.calls.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked play card", any("Test Gaana" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    check("music mocked playing", B.music_state(-100502).get("playing") is True
+          and B.music_state(-100502)["current"]["title"] == "Test Gaana")
+    check("music mocked joined call", len(B._ASSISTANT["calls"].joined) == 1)
+    check("music assistant identity logged", B._ASSISTANT.get("me") is not None
+          and B._ASSISTANT["me"].username == "CBIOFINDIA"
+          and B._ASSISTANT["me"].id == 8617937893)
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked queue second", any("queue me add" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/queue", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked queue shows", any("Test Gaana" in t for _, t in FakeMessage.outbox))
+    await B.cmd_music(client, FakeMessage("/pause", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked pause", B.music_state(-100502).get("paused") is True)
+    await B.cmd_music(client, FakeMessage("/resume", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked resume", B.music_state(-100502).get("paused") is False)
+    FakeMessage.edits.clear()
+    await B.cmd_music(client, FakeMessage("/skip", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked skip plays next", B.music_state(-100502)["current"]["title"] == "Test Gaana"
+          and len(B._ASSISTANT["calls"].changed) == 1)
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/clear", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked clear", B.music_state(-100502)["queue"] == []
+          and any("clear" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100502))
+    check("music mocked stop", B.music_state(-100502).get("playing") is False
+          and len(B._ASSISTANT["calls"].left) >= 1)
+    # music buttons: pause/resume via callback
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100503))
+    _pq = FakeCallbackQuery("mus:pause", uid=111, name="Tester",
+                            message=FakeMessage("x", uid=111, chat_id=-100503))
+    await B.music_callbacks(client, _pq)
+    check("music button pause", B.music_state(-100503).get("paused") is True)
+    _rq = FakeCallbackQuery("mus:resume", uid=111, name="Tester",
+                            message=FakeMessage("x", uid=111, chat_id=-100503))
+    await B.music_callbacks(client, _rq)
+    check("music button resume", B.music_state(-100503).get("paused") is False)
+    # /play stays silent while a UNO game is running (UNO owns /play then)
+    B.set_game(-100504, {"kind": "uno", "players": [111], "started": True})
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100504))
+    check("music play defers to uno", len(FakeMessage.outbox) == 0)
+    B.set_game(-100504, None)
+    # restore real music deps
+    B._yt_dlp = _real_ytdlp
+    B._PyTgCalls = _real_calls
+    B._AudioPiped = _real_piped
+    B._music_make_client = _real_mkc
+    B.ASSISTANT_SESSION = _real_session
+    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+
+    # ---- Gap features: moderation (Baka/Rose/Protectron) ----
+    _owner = B.OWNER_ID
+    _fake_app = FakeApp()
+    _bad = FakeMessage("bad msg", uid=222, name="BadGuy", chat_id=-100600)
+    FakeMessage.outbox.clear()
+    await B.cmd_warn(client, FakeMessage("/warn", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap warn 1/3", any("warn 1/3" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_warns(client, FakeMessage("/warns", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap warns list", any("warns: 1/3" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_promote(_fake_app, FakeMessage("/promote", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap promote", any("admin ban gaya" in t for _, t in FakeMessage.outbox)
+          and any(c[0] == "promote" for c in FakeApp.calls))
+    FakeMessage.outbox.clear()
+    await B.cmd_title(_fake_app, FakeMessage("/title Star Admin", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap title", any("Star Admin" in t for _, t in FakeMessage.outbox)
+          and any(c[0] == "title" for c in FakeApp.calls))
+    # dot-prefix: .warn via the group text handler
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage(".warn", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap dot warn", any("warn 2/3" in t for _, t in FakeMessage.outbox))
+    # sudo / auth
+    FakeMessage.outbox.clear()
+    await B.cmd_addsudo(client, FakeMessage("/addsudo 555", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap addsudo", 555 in B.DATA.get("sudos", [])
+          and any("sudo ban gaya" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_sudolist(client, FakeMessage("/sudolist", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap sudolist", any("555" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_delsudo(client, FakeMessage("/delsudo 555", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap delsudo", 555 not in B.DATA.get("sudos", []))
+    FakeMessage.outbox.clear()
+    await B.cmd_auth(client, FakeMessage("/auth", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap auth", 222 in B._chat_data(-100600).get("auth", []))
+    B.track_user(_bad)
+    FakeMessage.outbox.clear()
+    await B.cmd_authlist(client, FakeMessage("/authlist", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap authlist", any("BadGuy" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_unauth(client, FakeMessage("/unauth", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap unauth", 222 not in B._chat_data(-100600).get("auth", []))
+    # rules + notes
+    FakeMessage.outbox.clear()
+    await B.cmd_setrules(client, FakeMessage("/setrules 1. gaali mat do", uid=_owner, name="Sanji", chat_id=-100600))
+    await B.cmd_rules(client, FakeMessage("/rules", uid=111, name="Tester", chat_id=-100600))
+    check("gap rules", any("gaali mat do" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_note(client, FakeMessage("/note welcome hiee welcome!", uid=_owner, name="Sanji", chat_id=-100600))
+    await B.cmd_getnote(client, FakeMessage("/get welcome", uid=111, name="Tester", chat_id=-100600))
+    check("gap note get", any("hiee welcome!" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_notes(client, FakeMessage("/notes", uid=111, name="Tester", chat_id=-100600))
+    check("gap notes list", any("welcome" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_delnote(client, FakeMessage("/delnote welcome", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap delnote", "welcome" not in B._chat_data(-100600).get("notes", {}))
+    # report / runs / limits
+    FakeMessage.outbox.clear()
+    await B.cmd_report(_fake_app, FakeMessage("/report spam hai", uid=111, name="Tester", chat_id=-100600, reply_to=_bad))
+    check("gap report", any("Report" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_runs(client, FakeMessage("/runs", uid=111, name="Tester", chat_id=-100600))
+    check("gap runs", any(t in B.RUN_LINES for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_limits(client, FakeMessage("/limits", uid=111, name="Tester", chat_id=-100600))
+    check("gap limits", any("Kills aaj" in t for _, t in FakeMessage.outbox))
+    # filters: set + trigger + approve bypass + stopfilter
+    FakeMessage.outbox.clear()
+    await B.cmd_filter(client, FakeMessage("/filter hiee hiee, kya haal hai!", uid=_owner, name="Sanji", chat_id=-100600))
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("hiee doston", uid=111, name="Tester", chat_id=-100600))
+    check("gap filter triggers", any("kya haal hai" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_approve(client, FakeMessage("/approve", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("hiee doston", uid=222, name="BadGuy", chat_id=-100600))
+    check("gap approved bypasses filter", len(FakeMessage.outbox) == 0)
+    FakeMessage.outbox.clear()
+    await B.cmd_unapprove(client, FakeMessage("/unapprove", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("gap unapprove", 222 not in B._chat_data(-100600).get("approved", []))
+    FakeMessage.outbox.clear()
+    await B.cmd_stopfilter(client, FakeMessage("/stopfilter hiee", uid=_owner, name="Sanji", chat_id=-100600))
+    check("gap stopfilter", "hiee" not in B._chat_data(-100600).get("filters", {}))
+    # antiflood: 4 fast messages -> warning
+    FakeMessage.outbox.clear()
+    await B.cmd_antiflood(client, FakeMessage("/antiflood", uid=_owner, name="Sanji", chat_id=-100601))
+    check("gap antiflood on", any("Antiflood" in t and "ON" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    for _i in range(4):
+        await B.group_text_handler(client, FakeMessage("spam spam", uid=111, name="Tester", chat_id=-100601))
+    check("gap antiflood warns", any("flood" in t for _, t in FakeMessage.outbox))
+    await B.cmd_antiflood(client, FakeMessage("/antiflood", uid=_owner, name="Sanji", chat_id=-100601))
+    # profanity: gaali message with 'chulbuli' gets deleted (no chat reply)
+    FakeMessage.outbox.clear()
+    await B.cmd_profanity(client, FakeMessage("/profanity", uid=_owner, name="Sanji", chat_id=-100602))
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli tu madarchod hai", uid=111, name="Tester", chat_id=-100602))
+    check("gap profanity deletes", len(FakeMessage.outbox) == 0)
+    await B.cmd_profanity(client, FakeMessage("/profanity", uid=_owner, name="Sanji", chat_id=-100602))
+    # blacklist clear
+    FakeMessage.outbox.clear()
+    await B.cmd_blacklist_add(client, FakeMessage("/blacklist_add badword", uid=_owner, name="Sanji", chat_id=-100603))
+    check("gap blacklist add", "badword" in B._chat_data(-100603).get("blacklist", []))
+    await B.cmd_blacklist_clear(client, FakeMessage("/blacklist_clear", uid=_owner, name="Sanji", chat_id=-100603))
+    check("gap blacklist clear", B._chat_data(-100603).get("blacklist", []) == [])
+    # whitelist: whitelisted link passes the link filter, others don't
+    await B.cmd_nolinks(client, FakeMessage("/nolinks", uid=_owner, name="Sanji", chat_id=-100604))
+    await B.cmd_whitelist_add(client, FakeMessage("/whitelist_add example.com", uid=_owner, name="Sanji", chat_id=-100604))
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli https://example.com/song", uid=111, name="Tester", chat_id=-100604))
+    check("gap whitelist passes", len(FakeMessage.outbox) > 0)
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli https://badsite.com/x", uid=111, name="Tester", chat_id=-100604))
+    check("gap link filter blocks", len(FakeMessage.outbox) == 0)
+    await B.cmd_nolinks(client, FakeMessage("/nolinks", uid=_owner, name="Sanji", chat_id=-100604))
+    # noforwards + antispam
+    FakeMessage.outbox.clear()
+    await B.cmd_noforwards(client, FakeMessage("/noforwards", uid=_owner, name="Sanji", chat_id=-100605))
+    _fwd = FakeMessage("chulbuli dekho", uid=111, name="Tester", chat_id=-100605)
+    _fwd.forward_from = object()
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, _fwd)
+    check("gap noforwards deletes", len(FakeMessage.outbox) == 0)
+    await B.cmd_noforwards(client, FakeMessage("/noforwards", uid=_owner, name="Sanji", chat_id=-100605))
+    await B.cmd_antispam(client, FakeMessage("/antispam", uid=_owner, name="Sanji", chat_id=-100606))
+    B._chat_data(-100606).setdefault("joined_at", {})["111"] = int(time.time())
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli https://x.com/y", uid=111, name="Tester", chat_id=-100606))
+    check("gap antispam new member link", len(FakeMessage.outbox) == 0)
+    await B.cmd_antispam(client, FakeMessage("/antispam", uid=_owner, name="Sanji", chat_id=-100606))
+
+    # ---- Gap features: wordchain modes, wordgrid, mafia, mimi ----
+    FakeMessage.outbox.clear()
+    await B.cmd_wc_modes(client, FakeMessage("/startclassic", uid=111, name="Tester", chat_id=-100610))
+    check("gap wc classic lobby", any("WORDCHAIN (classic)" in t for _, t in FakeMessage.outbox)
+          and B.game_state(-100610).get("mode") == "classic")
+    B.set_game(-100610, None)
+    FakeMessage.outbox.clear()
+    await B.cmd_wc_modes(client, FakeMessage("/starthard", uid=111, name="Tester", chat_id=-100610))
+    check("gap wc hard mode", B.game_state(-100610).get("min_len") == 4)
+    B.set_game(-100610, None)
+    FakeMessage.outbox.clear()
+    await B.cmd_wc_modes(client, FakeMessage("/startelim", uid=111, name="Tester", chat_id=-100610))
+    check("gap wc elim mode", B.game_state(-100610).get("strikes_max") == 1)
+    B.set_game(-100610, None)
+    FakeMessage.outbox.clear()
+    await B.cmd_wc_modes(client, FakeMessage("/startchaos", uid=111, name="Tester", chat_id=-100610))
+    check("gap wc chaos letter", B.game_state(-100610).get("chaos_letter") in "abcdefghijklmnopqrstuvwxyz")
+    B.set_game(-100610, None)
+    # hard mode: 3-letter word is a strike (min 4)
+    B.set_game(-100611, {"kind": "wordchain", "players": [111, 222], "names": {"111": "Tester", "222": "Two"},
+                            "started": True, "turn": 0, "last_word": None, "used": set(),
+                            "strikes": {}, "starter": 111, "mode": "hard", "min_len": 4, "strikes_max": 3})
+    FakeMessage.outbox.clear()
+    await B.handle_wordchain_word(FakeMessage("abc", uid=111, name="Tester", chat_id=-100611))
+    check("gap wc hard short word strike", any("kam se kam 4" in t for _, t in FakeMessage.outbox))
+    # elim mode: one wrong word = OUT, other player wins + wc_wins
+    B.set_game(-100612, {"kind": "wordchain", "players": [111, 222], "names": {"111": "Tester", "222": "Two"},
+                            "started": True, "turn": 0, "last_word": "apple", "used": {"apple"},
+                            "strikes": {}, "starter": 111, "mode": "elim", "min_len": 2, "strikes_max": 1})
+    FakeMessage.outbox.clear()
+    await B.handle_wordchain_word(FakeMessage("banana", uid=111, name="Tester", chat_id=-100612))
+    check("gap wc elim one strike out", any("OUT" in t for _, t in FakeMessage.outbox)
+          and B.game_state(-100612) is None)
+    check("gap wc wins counted", B.get_user(222).get("wc_wins", 0) >= 1)
+    FakeMessage.outbox.clear()
+    await B.cmd_wcstats(client, FakeMessage("/wcstats", uid=222, name="Two", chat_id=-100612))
+    check("gap wcstats", any("wins: 1" in t or "wins: " in t for _, t in FakeMessage.outbox))
+    # flee + runinfo
+    await B.cmd_wc_modes(client, FakeMessage("/startclassic", uid=111, name="Tester", chat_id=-100613))
+    await B.do_join(-100613, 222, "Two")
+    FakeMessage.outbox.clear()
+    await B.cmd_flee(client, FakeMessage("/flee", uid=222, name="Two", chat_id=-100613))
+    check("gap flee lobby", any("nikal gaya" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_runinfo(client, FakeMessage("/runinfo", uid=111, name="Tester", chat_id=-100613))
+    check("gap runinfo", any("Wordchain run info" in t for _, t in FakeMessage.outbox))
+    B.set_game(-100613, None)
+    # wordgrid: /new alias + /gridtop
+    FakeMessage.outbox.clear()
+    await B.cmd_wordgrid(client, FakeMessage("/new", uid=111, name="Tester", chat_id=-100614))
+    check("gap new is wordgrid", B.game_state(-100614) is not None
+          and B.game_state(-100614).get("kind") == "wordgrid")
+    B.set_game(-100614, None)
+    B.get_user(111)["grid_points"] = 15
+    B.get_user(222)["grid_points"] = 7
+    FakeMessage.outbox.clear()
+    await B.cmd_gridtop(client, FakeMessage("/gridtop", uid=111, name="Tester", chat_id=-100614))
+    check("gap gridtop", any("Word Grid Top" in t and "15" in t for _, t in FakeMessage.outbox))
+    # /revealgrid + /checkgrid need an active grid
+    await B.cmd_wordgrid(client, FakeMessage("/wordgrid", uid=111, name="Tester", chat_id=-100615))
+    FakeMessage.outbox.clear()
+    await B.cmd_revealgrid(client, FakeMessage("/revealgrid", uid=_owner, name="Sanji", chat_id=-100615))
+    check("gap revealgrid", any("Grid reveal" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_checkgrid(client, FakeMessage("/checkgrid", uid=_owner, name="Sanji", chat_id=-100615))
+    check("gap checkgrid", any("status" in t for _, t in FakeMessage.outbox))
+    B.set_game(-100615, None)
+    # mafia /profile
+    FakeMessage.outbox.clear()
+    await B.cmd_profile(client, FakeMessage("/profile", uid=111, name="Tester", chat_id=-100616))
+    check("gap profile", any("Profile" in t and "Coins" in t for _, t in FakeMessage.outbox))
+    # mimi: alive/vault/shop/inv/guide/free
+    FakeMessage.outbox.clear()
+    await B.cmd_alive(client, FakeMessage("/alive", uid=111, name="Tester", chat_id=-100617))
+    check("gap alive", any("alive" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_vault(client, FakeMessage("/vault", uid=111, name="Tester", chat_id=-100617))
+    check("gap vault", any("Vault" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_shop(client, FakeMessage("/shop", uid=111, name="Tester", chat_id=-100617))
+    check("gap shop", any("Shop" in t and "Rampage" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_inv(client, FakeMessage("/inv", uid=111, name="Tester", chat_id=-100617))
+    check("gap inv", any("Inventory" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_guide(client, FakeMessage("/guide", uid=111, name="Tester", chat_id=-100617))
+    check("gap guide", any("Guide" in t for _, t in FakeMessage.outbox))
+    # gift codes: gencode -> redeem -> redeem again -> cinfo -> delcode
+    FakeMessage.outbox.clear()
+    await B.cmd_gencode(client, FakeMessage("/gencode 5000", uid=_owner, name="Sanji", chat_id=-100618))
+    _code = None
+    for _, t in FakeMessage.outbox:
+        import re as _re
+        _m = _re.search(r"CHUL-[A-Z0-9]{6}", t)
+        if _m:
+            _code = _m.group(0)
+    check("gap gencode", _code is not None, str(FakeMessage.outbox))
+    _before = B.get_user(222)["coins"]
+    FakeMessage.outbox.clear()
+    await B.cmd_redeem(client, FakeMessage(f"/redeem {_code}", uid=222, name="Two", chat_id=-100618))
+    check("gap redeem", B.get_user(222)["coins"] == _before + 5000
+          and any("coins mile" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_redeem(client, FakeMessage(f"/redeem {_code}", uid=222, name="Two", chat_id=-100618))
+    check("gap redeem once", any("pehle hi redeem" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_cinfo(client, FakeMessage(f"/cinfo {_code}", uid=_owner, name="Sanji", chat_id=-100618))
+    check("gap cinfo", any("uses: 1/1" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_delcode(client, FakeMessage(f"/delcode {_code}", uid=_owner, name="Sanji", chat_id=-100618))
+    check("gap delcode", _code not in B.DATA.get("gift_codes", {}))
+    # /free + cooldown
+    B.get_user(333)["last_free"] = 0
+    FakeMessage.outbox.clear()
+    await B.cmd_free(client, FakeMessage("/free", uid=333, name="Free", chat_id=-100619))
+    check("gap free", any("+500 free coins" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_free(client, FakeMessage("/free", uid=333, name="Free", chat_id=-100619))
+    check("gap free cooldown", any("cooldown" in t for _, t in FakeMessage.outbox))
+    # +hug via group text handler (reply-based)
+    _target_msg = FakeMessage("hello", uid=222, name="Two", chat_id=-100620)
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("+hug", uid=111, name="Tester", chat_id=-100620, reply_to=_target_msg))
+    check("gap plus hug", any("hug kiya" in t for _, t in FakeMessage.outbox))
+    # aliases: /acc, /wordly, /lb
+    FakeMessage.outbox.clear()
+    await B.cmd_bal(client, FakeMessage("/acc", uid=111, name="Tester", chat_id=111, ctype="private"))
+    check("gap acc alias", any("$" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_jumble(client, FakeMessage("/wordly", uid=111, name="Tester", chat_id=-100621))
+    check("gap wordly alias", B.game_state(-100621) is not None
+          and B.game_state(-100621).get("kind") == "jumble")
+    B.set_game(-100621, None)
+    # leaderboard buttons
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    await B.cmd_toprich(client, FakeMessage("/leaderboard", uid=111, name="Tester", chat_id=-100622))
+    _lb_kb = FakeMessage.outbox_full[-1][2].get("reply_markup")
+    check("gap leaderboard buttons", _lb_kb is not None and "lb:chess" in _cbs_of(_lb_kb),
+          str(_cbs_of(_lb_kb)))
+    FakeMessage.edits.clear()
+    _lbq = FakeCallbackQuery("lb:chess", uid=111, name="Tester",
+                             message=FakeMessage("x", uid=111, chat_id=-100622))
+    await B.leaderboard_callbacks(client, _lbq)
+    check("gap leaderboard chess top", any("Chess Top" in t for _, t, _ in FakeMessage.edits))
+    # /mystats shows today count + group rank
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("hello ji", uid=111, name="Tester", chat_id=-100623))
+    await B.group_text_handler(client, FakeMessage("aur batao", uid=111, name="Tester", chat_id=-100623))
+    FakeMessage.outbox.clear()
+    await B.cmd_mystats(client, FakeMessage("/mystats", uid=111, name="Tester", chat_id=-100623))
+    check("gap mystats today", any("aaj:" in t for _, t in FakeMessage.outbox))
+
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+    if FAIL:
+        print("FAILED:", FAIL)
+        sys.exit(1)
+
+
+asyncio.run(main())
