@@ -1086,6 +1086,18 @@ async def main():
             return False
 
         def extract_info(self, src, download=False):
+            if download:
+                # simulate a real download: write a dummy audio file where
+                # outtmpl points — mp3 when the ffmpeg postprocessor is on
+                # (as _music_download_sync requests), else the native ext
+                ext = "mp3" if self.opts.get("postprocessors") else "m4a"
+                path = self.opts["outtmpl"].replace("%(ext)s", ext)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as _f:
+                    _f.write(b"fake-audio")
+                return {"title": "Test Gaana", "webpage_url": "https://youtube.com/watch?v=test",
+                        "url": "https://audio.example/test.m4a", "duration": 200,
+                        "requested_downloads": [{"filepath": path}]}
             return {"title": "Test Gaana", "webpage_url": "https://youtube.com/watch?v=test",
                     "url": "https://audio.example/test.m4a", "duration": 200}
 
@@ -1093,15 +1105,14 @@ async def main():
         YoutubeDL = _FakeYDL
 
     _real_ytdlp = B._yt_dlp
-    _real_calls = B._PyTgCalls
-    _real_piped = B._AudioPiped
+    _real_factory = B._GroupCallFactory
     _real_mkc = B._music_make_client
     _real_session = B.ASSISTANT_SESSION
     B._yt_dlp = _FakeYtDlp
     B.MUSIC.clear()
     FakeMessage.outbox.clear()
     B.ASSISTANT_SESSION = ""
-    B._PyTgCalls = None
+    B._GroupCallFactory = None
     await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
     check("music play no assistant honest", any("assistant" in t and "connect nahi" in t for _, t in FakeMessage.outbox),
           str([t for _, t in FakeMessage.outbox]))
@@ -1127,37 +1138,70 @@ async def main():
     check("music stop nothing", any("chal nahi raha" in t for _, t in FakeMessage.outbox))
 
     # ---- Music: mocked assistant -> queue + player card + controls ----
-    class _FakeCalls:
+    # Fakes mirror the REAL pytgcalls 2.1.0 API (verified from the wheel):
+    # GroupCallFactory(client) -> get_file_group_call(input_filename,
+    # play_on_repeat) -> GroupCallFile with async start(chat_id)/stop(),
+    # sync pause_playout()/resume_playout()/stop_playout(), an
+    # input_filename property whose setter restarts playout when connected,
+    # and an on_playout_ended decorator for async (gc, filename) handlers.
+    # There is deliberately NO join_group_call / change_stream /
+    # pause_stream / resume_stream / on_stream_end here — calling one raises
+    # AttributeError, exactly like the real library would (the v2.2.0–v2.3.3
+    # harness faked those names, which is why 401 tests never caught the
+    # dead import).
+    class _FakeGroupCallFile:
+        def __init__(self, input_filename="", output_filename=None, play_on_repeat=False):
+            self._input_filename = input_filename or ""
+            self.play_on_repeat = play_on_repeat
+            self.is_connected = False
+            self.started = []
+            self.stopped = 0
+            self.restarts = []
+            self.paused = False
+            self._end_handlers = []
+
+        @property
+        def input_filename(self):
+            return self._input_filename
+
+        @input_filename.setter
+        def input_filename(self, value):
+            self._input_filename = value or ""
+            if self.is_connected:
+                self.restarts.append(value)
+
+        async def start(self, chat_id):
+            self.started.append(chat_id)
+            self.is_connected = True
+
+        async def stop(self):
+            self.stopped += 1
+            self.is_connected = False
+
+        def pause_playout(self):
+            self.paused = True
+
+        def resume_playout(self):
+            self.paused = False
+
+        def stop_playout(self):
+            self.input_filename = ""
+
+        def on_playout_ended(self, fn):
+            self._end_handlers.append(fn)
+            return fn
+
+    class _FakeGroupCallFactory:
         def __init__(self, user_client):
             self.user_client = user_client
-            self.joined = []
-            self.left = []
-            self.paused = []
-            self.resumed = []
-            self.changed = []
+            self.created = []
 
-        async def start(self):
-            return True
-
-        async def join_group_call(self, chat_id, stream, **kwargs):
-            self.joined.append((chat_id, stream))
-
-        async def change_stream(self, chat_id, stream, **kwargs):
-            self.changed.append((chat_id, stream))
-
-        async def pause_stream(self, chat_id):
-            self.paused.append(chat_id)
-
-        async def resume_stream(self, chat_id):
-            self.resumed.append(chat_id)
-
-        async def leave_group_call(self, chat_id):
-            self.left.append(chat_id)
-
-        def on_stream_end(self):
-            def deco(fn):
-                return fn
-            return deco
+        def get_file_group_call(self, input_filename=None, output_filename=None,
+                                play_on_repeat=True):
+            gc = _FakeGroupCallFile(input_filename=input_filename,
+                                    play_on_repeat=play_on_repeat)
+            self.created.append(gc)
+            return gc
 
     class _FakeAssistantClient:
         async def start(self):
@@ -1172,11 +1216,10 @@ async def main():
         async def join_chat(self, link):
             return True
 
-    B._PyTgCalls = _FakeCalls
-    B._AudioPiped = lambda audio, **kw: ("piped", audio)
+    B._GroupCallFactory = _FakeGroupCallFactory
     B._music_make_client = lambda: _FakeAssistantClient()
     B.ASSISTANT_SESSION = "fake-session-for-test"
-    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": True})
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
     B.MUSIC.clear()
     FakeMessage.outbox.clear()
     FakeApp.calls.clear()
@@ -1185,7 +1228,12 @@ async def main():
           str([t for _, t in FakeMessage.outbox]))
     check("music mocked playing", B.music_state(-100502).get("playing") is True
           and B.music_state(-100502)["current"]["title"] == "Test Gaana")
-    check("music mocked joined call", len(B._ASSISTANT["calls"].joined) == 1)
+    _gc502 = B.music_state(-100502)["gc"]
+    _file502 = B.music_state(-100502)["file"]
+    check("music mocked joined call", _gc502 is not None and len(_gc502.started) == 1
+          and len(B._ASSISTANT["factory"].created) == 1)
+    check("music mocked downloaded file", _file502 is not None and os.path.isfile(_file502),
+          str(_file502))
     check("music assistant identity logged", B._ASSISTANT.get("me") is not None
           and B._ASSISTANT["me"].username == "CBIOFINDIA"
           and B._ASSISTANT["me"].id == 8617937893)
@@ -1196,21 +1244,28 @@ async def main():
     await B.cmd_music(client, FakeMessage("/queue", uid=111, name="Tester", chat_id=-100502))
     check("music mocked queue shows", any("Test Gaana" in t for _, t in FakeMessage.outbox))
     await B.cmd_music(client, FakeMessage("/pause", uid=111, name="Tester", chat_id=-100502))
-    check("music mocked pause", B.music_state(-100502).get("paused") is True)
+    check("music mocked pause", B.music_state(-100502).get("paused") is True
+          and _gc502.paused is True)
     await B.cmd_music(client, FakeMessage("/resume", uid=111, name="Tester", chat_id=-100502))
-    check("music mocked resume", B.music_state(-100502).get("paused") is False)
+    check("music mocked resume", B.music_state(-100502).get("paused") is False
+          and _gc502.paused is False)
     FakeMessage.edits.clear()
     await B.cmd_music(client, FakeMessage("/skip", uid=111, name="Tester", chat_id=-100502))
     check("music mocked skip plays next", B.music_state(-100502)["current"]["title"] == "Test Gaana"
-          and len(B._ASSISTANT["calls"].changed) == 1)
+          and len(_gc502.restarts) == 1)
+    check("music mocked skip deletes old file", not os.path.exists(_file502))
     FakeMessage.outbox.clear()
     await B.cmd_music(client, FakeMessage("/clear", uid=111, name="Tester", chat_id=-100502))
     check("music mocked clear", B.music_state(-100502)["queue"] == []
           and any("clear" in t for _, t in FakeMessage.outbox))
+    _file_before_stop = B.music_state(-100502)["file"]
     FakeMessage.outbox.clear()
     await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100502))
     check("music mocked stop", B.music_state(-100502).get("playing") is False
-          and len(B._ASSISTANT["calls"].left) >= 1)
+          and _gc502.stopped >= 1)
+    check("music mocked stop deletes file", _file_before_stop is not None
+          and not os.path.exists(_file_before_stop)
+          and B.music_state(-100502)["file"] is None)
     # music buttons: pause/resume via callback
     await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100503))
     _pq = FakeCallbackQuery("mus:pause", uid=111, name="Tester",
@@ -1229,37 +1284,28 @@ async def main():
     B.set_game(-100504, None)
     # restore real music deps
     B._yt_dlp = _real_ytdlp
-    B._PyTgCalls = _real_calls
-    B._AudioPiped = _real_piped
+    B._GroupCallFactory = _real_factory
     B._music_make_client = _real_mkc
     B.ASSISTANT_SESSION = _real_session
-    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": False})
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
     B.MUSIC.clear()
 
     # ---- v2.3.3: voice-stack diagnostics (logs must show WHY /play fails) ----
     # Live report (2026-11-12 ~22:04 IST): /play found the song but said the
     # voice assistant is not connected — and the logs said nothing about why.
     # voice_unavailable_reason: which piece is missing, never the session value
-    _real_calls = B._PyTgCalls
+    _real_factory = B._GroupCallFactory
     _real_session = B.ASSISTANT_SESSION
-    B._PyTgCalls = None
+    B._GroupCallFactory = None
     B.ASSISTANT_SESSION = ""
-    check("voice reason pytgcalls missing", B.voice_unavailable_reason() == "pytgcalls missing",
+    check("voice reason factory missing", B.voice_unavailable_reason() == "GroupCallFactory missing",
           B.voice_unavailable_reason())
 
-    class _FakeCalls2:
+    class _FakeFactory2:
         def __init__(self, user_client):
             self.user_client = user_client
 
-        async def start(self):
-            return True
-
-        def on_stream_end(self):
-            def deco(fn):
-                return fn
-            return deco
-
-    B._PyTgCalls = _FakeCalls2
+    B._GroupCallFactory = _FakeFactory2
     check("voice reason session missing", B.voice_unavailable_reason() == "ASSISTANT_SESSION missing",
           B.voice_unavailable_reason())
     B.ASSISTANT_SESSION = "fake-session-for-test"
@@ -1284,19 +1330,19 @@ async def main():
           and "session=set" in _diag2, _diag2)
     B.ASSISTANT_SESSION = ""
     # /play with no voice stack logs the exact reason (reply stays honest)
-    B._PyTgCalls = None
+    B._GroupCallFactory = None
     B._yt_dlp = _FakeYtDlp
     FakeMessage.outbox.clear()
     _buf3 = io.StringIO()
     with contextlib.redirect_stdout(_buf3):
         await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100505))
-    check("play voice unavailable logged", "/play voice unavailable: pytgcalls missing" in _buf3.getvalue(),
+    check("play voice unavailable logged", "/play voice unavailable: GroupCallFactory missing" in _buf3.getvalue(),
           _buf3.getvalue())
     check("play voice unavailable honest reply", any("connect nahi" in t for _, t in FakeMessage.outbox),
           str([t for _, t in FakeMessage.outbox]))
     B._yt_dlp = _real_ytdlp
     # _music_ensure_assistant: every failure path prints the real reason
-    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": True})
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
     _buf4 = io.StringIO()
     with contextlib.redirect_stdout(_buf4):
         _r = await B._music_ensure_assistant()
@@ -1317,7 +1363,7 @@ async def main():
             raise RuntimeError("should not reach get_me")
 
     _real_mkc = B._music_make_client
-    B._PyTgCalls = _FakeCalls2
+    B._GroupCallFactory = _FakeFactory2
     B._music_make_client = lambda: _BoomClient()
     _buf6 = io.StringIO()
     with contextlib.redirect_stdout(_buf6):
@@ -1345,9 +1391,138 @@ async def main():
     check("import failure print ffmpeg", "imageio-ffmpeg import failed" in _imp_out and "boom-ff" in _imp_out,
           _imp_out[:500])
     # restore music state
-    B._PyTgCalls = _real_calls
+    B._GroupCallFactory = _real_factory
     B.ASSISTANT_SESSION = _real_session
-    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": False})
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+
+    # ---- v2.3.4: voice layer on the REAL pytgcalls 2.1.0 API ----
+    # Root cause (v2.3.3 logs, 2026-11-12 ~22:14 IST): the import failed with
+    # "cannot import name 'PyTgCalls'" — the 2.1.0 wheel has no such class,
+    # and 2.1.0 is the latest pytgcalls on PyPI. The voice layer now uses
+    # GroupCallFactory -> GroupCallFile (local file, input_filename switch,
+    # on_playout_ended auto-advance) instead of the never-shipped 3.x API.
+    _src = open(os.path.join(os.path.dirname(B.__file__), "bot.py")).read()
+    _old_api = ["PyTgCalls", "AudioPiped", "join_group_call", "leave_group_call",
+                "change_stream", "pause_stream", "resume_stream", "on_stream_end"]
+    check("old voice api absent from bot.py",
+          all(name not in _src for name in _old_api),
+          str([n for n in _old_api if n in _src]))
+    check("new voice api present in bot.py",
+          "GroupCallFactory" in _src and "get_file_group_call" in _src
+          and "on_playout_ended" in _src and "input_filename" in _src)
+    # download: sync function writes a real file; blocked download -> honest error
+    B._yt_dlp = _FakeYtDlp
+    _dl_track = {"title": "Test Gaana", "url": "https://youtube.com/watch?v=test",
+                 "audio": "https://audio.example/test.m4a", "duration": 200}
+    _dl_path = B._music_download_sync(_dl_track)
+    check("download sync writes file", os.path.isfile(_dl_path), str(_dl_path))
+    B._music_delete_file(_dl_path)
+    check("download delete removes file", not os.path.exists(_dl_path))
+
+    class _FakeYtDlpBlockedDl:
+        class YoutubeDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, src, download=False):
+                if download:
+                    raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+                return {"title": "Test Gaana", "webpage_url": "https://youtube.com/watch?v=test",
+                        "url": "https://audio.example/test.m4a", "duration": 200}
+
+    _real_ytdlp2 = B._yt_dlp
+    B._yt_dlp = _FakeYtDlpBlockedDl
+    try:
+        B._music_download_sync(_dl_track)
+        check("download sync youtube blocked", False)
+    except B.MusicError as _e:
+        check("download sync youtube blocked", str(_e) == "youtube_blocked", str(_e))
+    B._yt_dlp = _real_ytdlp2
+    # full mocked flow on the 2.1.0 API: play -> skip -> playout-end advance -> stop
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100506))
+    _gc506 = B.music_state(-100506)["gc"]
+    _f506 = B.music_state(-100506)["file"]
+    check("v234 play downloads then joins", B.music_state(-100506).get("playing") is True
+          and _gc506 is not None and _gc506.started == [-100506]
+          and _f506 is not None and os.path.isfile(_f506), str(_f506))
+    check("v234 play uses file group call", _gc506.play_on_repeat is False
+          and _gc506.input_filename == _f506)
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100506))
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100506))
+    check("v234 two queued", len(B.music_state(-100506)["queue"]) == 2)
+    # playout-end hook fires -> auto-advance to the next queued track
+    _end_handlers = list(_gc506._end_handlers)
+    check("v234 playout-end hook registered", len(_end_handlers) == 1)
+    _old_file = B.music_state(-100506)["file"]
+    await _end_handlers[0](_gc506, _old_file)
+    check("v234 playout-end advances", B.music_state(-100506).get("playing") is True
+          and len(_gc506.restarts) == 1
+          and B.music_state(-100506)["file"] != _old_file
+          and len(B.music_state(-100506)["queue"]) == 1)
+    check("v234 advance deletes old file", not os.path.exists(_old_file))
+    # skip -> switches to the last queued track via the input_filename setter
+    await B.cmd_music(client, FakeMessage("/skip", uid=111, name="Tester", chat_id=-100506))
+    check("v234 skip switches file", len(_gc506.restarts) == 2
+          and len(B.music_state(-100506)["queue"]) == 0)
+    # playout-end with an empty queue -> leaves the call, nothing playing
+    await _end_handlers[0](_gc506, B.music_state(-100506)["file"])
+    check("v234 playout-end empty queue leaves", B.music_state(-100506).get("playing") is False
+          and B.music_state(-100506).get("current") is None
+          and _gc506.stopped >= 1)
+    # play again after leaving -> a FRESH group call is created
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100506))
+    _gc506b = B.music_state(-100506)["gc"]
+    check("v234 fresh call after leave", _gc506b is not None and _gc506b is not _gc506
+          and _gc506b.started == [-100506])
+    # stop -> leaves + deletes the temp file + clears state
+    _f506b = B.music_state(-100506)["file"]
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100506))
+    check("v234 stop cleans up", B.music_state(-100506).get("playing") is False
+          and _gc506b.stopped >= 1 and B.music_state(-100506)["file"] is None
+          and not os.path.exists(_f506b))
+    # download failure mid-play -> honest reply, never a fake "playing" state
+    B._yt_dlp = _FakeYtDlpBlockedDl
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100507))
+    check("v234 download blocked honest", any("block" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    check("v234 download blocked no fake", B.music_state(-100507).get("current") is None
+          and B.music_state(-100507).get("playing") is False)
+    # pause/resume go through the per-chat group call (sync playout calls)
+    B._yt_dlp = _FakeYtDlp
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100508))
+    _gc508 = B.music_state(-100508)["gc"]
+    await B.cmd_music(client, FakeMessage("/pause", uid=111, name="Tester", chat_id=-100508))
+    check("v234 pause via gc", B.music_state(-100508).get("paused") is True and _gc508.paused is True)
+    await B.cmd_music(client, FakeMessage("/resume", uid=111, name="Tester", chat_id=-100508))
+    check("v234 resume via gc", B.music_state(-100508).get("paused") is False and _gc508.paused is False)
+    # voice-unavailable reason names the real class
+    B._GroupCallFactory = None
+    check("v234 voice reason names factory",
+          B.voice_unavailable_reason() == "GroupCallFactory missing")
+    # restore music state
+    B._yt_dlp = _real_ytdlp
+    B._GroupCallFactory = _real_factory
+    B._music_make_client = _real_mkc
+    B.ASSISTANT_SESSION = _real_session
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
     B.MUSIC.clear()
 
     # ---- Gap features: moderation (Baka/Rose/Protectron) ----
