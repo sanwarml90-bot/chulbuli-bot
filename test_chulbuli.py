@@ -177,14 +177,26 @@ class FakeCallbackQuery:
 
 
 class FakeChatMember:
-    def __init__(self, user, status="administrator"):
+    def __init__(self, user, status="administrator", privileges=None):
         self.user = user
         self.status = status
+        self.privileges = privileges
 
 
 class FakeApp:
     """Stand-in for the module-global Pyrogram client (DM sends in games)."""
     calls = []
+    me = FakeUser(8405203833, "Chulbuli")
+    # The bot's own admin rights in the test group (real ChatPrivileges object,
+    # like get_chat_member returns for an admin). Tests may narrow it.
+    bot_privileges = B.ChatPrivileges(
+        can_manage_chat=True, can_delete_messages=True, can_manage_video_chats=True,
+        can_restrict_members=True, can_promote_members=True, can_change_info=True,
+        can_post_messages=True, can_edit_messages=True, can_invite_users=True,
+        can_pin_messages=True)
+
+    async def get_me(self):
+        return FakeApp.me
 
     async def send_message(self, chat_id, text, **kwargs):
         FakeMessage.outbox.append((chat_id, text))
@@ -212,13 +224,19 @@ class FakeApp:
         yield FakeChatMember(FakeUser(222, "Admin2"), "administrator")
 
     async def get_chat_member(self, chat_id, user_id):
-        return FakeChatMember(FakeUser(user_id, "Tester"), "administrator")
+        return FakeChatMember(FakeUser(user_id, "Tester"), "administrator",
+                              privileges=FakeApp.bot_privileges)
 
-    async def promote_chat_member(self, chat_id, user_id, **kwargs):
-        FakeApp.calls.append(("promote", chat_id, user_id, kwargs))
+    async def promote_chat_member(self, chat_id, user_id, privileges=None, **kwargs):
+        # Mirror real Pyrogram 2.0.106: only a ChatPrivileges object is accepted.
+        # The old bot code passed boolean kwargs and raised TypeError on every
+        # call — the permissive fake hid that, so the fake must be strict now.
+        if kwargs:
+            raise TypeError(f"promote_chat_member() got unexpected keyword arguments {sorted(kwargs)}")
+        FakeApp.calls.append(("promote", chat_id, user_id, privileges))
         return True
 
-    async def set_chat_admin_custom_title(self, chat_id, user_id, title):
+    async def set_administrator_title(self, chat_id, user_id, title):
         FakeApp.calls.append(("title", chat_id, user_id, title))
         return True
 
@@ -1727,6 +1745,114 @@ async def main():
     await B._math_single_timeout(_mg, "old-gid", 0)
     check("math single stale timeout keeps new", _mg in B._MATH_SINGLE)
     B._MATH_SINGLE.pop(_mg, None)
+
+    # ---- v2.3.1: /play never goes silent on a YouTube bot-check (live bug) ----
+    class _BlockedYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            raise Exception("ERROR: [youtube] nYxC9j1BnRw: Sign in to confirm you're not a bot")
+
+    class _FakeYtDlpBlocked:
+        YoutubeDL = _BlockedYDL
+
+    _saved_ydl = B._yt_dlp
+    B._yt_dlp = _FakeYtDlpBlocked
+    try:
+        B.resolve_track("test gaana")
+        check("play youtube_blocked classified", False, "resolve_track did not raise")
+    except B.MusicError as _e:
+        check("play youtube_blocked classified", str(_e) == "youtube_blocked", str(_e))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
+    check("play blocked replies honestly", any("youtube" in t and "block" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+
+    class _FailYDL(_BlockedYDL):
+        def extract_info(self, src, download=False):
+            raise Exception("some random yt-dlp failure")
+
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FailYDL})
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
+    check("play generic failure replies", len(FakeMessage.outbox) > 0,
+          str([t for _, t in FakeMessage.outbox]))
+    B._yt_dlp = _saved_ydl
+
+    # ---- v2.3.1: /promote uses ChatPrivileges (real Pyrogram API) ----
+    _fake_app2 = FakeApp()
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_promote(_fake_app2, FakeMessage("/promote", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    _promo = [c for c in FakeApp.calls if c[0] == "promote"]
+    check("promote uses ChatPrivileges", len(_promo) == 1 and _promo[0][3] is not None
+          and _promo[0][3].can_promote_members is False
+          and _promo[0][3].can_delete_messages is True, str(_promo))
+    check("promote success reply", any("admin ban gaya" in t for _, t in FakeMessage.outbox))
+    # bot without can_promote_members -> specific message, no promote call
+    FakeApp.bot_privileges = B.ChatPrivileges(can_manage_chat=True, can_delete_messages=True,
+                                              can_promote_members=False)
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_promote(_fake_app2, FakeMessage("/promote", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("promote no right names it", any("Add New Admins" in t for _, t in FakeMessage.outbox)
+          and not any(c[0] == "promote" for c in FakeApp.calls),
+          str([t for _, t in FakeMessage.outbox]))
+    FakeApp.bot_privileges = B.ChatPrivileges(
+        can_manage_chat=True, can_delete_messages=True, can_manage_video_chats=True,
+        can_restrict_members=True, can_promote_members=True, can_change_info=True,
+        can_post_messages=True, can_edit_messages=True, can_invite_users=True,
+        can_pin_messages=True)
+    # demote -> all-False privileges
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_demote(_fake_app2, FakeMessage("/demote", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    _dem = [c for c in FakeApp.calls if c[0] == "promote"]
+    check("demote all false privileges", len(_dem) == 1 and _dem[0][3] is not None and not any([
+        _dem[0][3].can_manage_chat, _dem[0][3].can_delete_messages,
+        _dem[0][3].can_restrict_members, _dem[0][3].can_promote_members,
+        _dem[0][3].can_change_info, _dem[0][3].can_invite_users,
+        _dem[0][3].can_pin_messages, _dem[0][3].can_manage_video_chats]), str(_dem))
+    # title -> set_administrator_title (real Pyrogram name)
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_title(_fake_app2, FakeMessage("/title Star Admin", uid=_owner, name="Sanji", chat_id=-100600, reply_to=_bad))
+    check("title uses set_administrator_title", any(c[0] == "title" and c[3] == "Star Admin" for c in FakeApp.calls)
+          and any("Star Admin" in t for _, t in FakeMessage.outbox), str(FakeApp.calls))
+
+    # ---- v2.3.1: bare name-call in a group ALWAYS gets a reply ----
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("chulbuli", uid=111, name="Tester", chat_id=-100700))
+    check("name call group replies", len(FakeMessage.outbox) > 0
+          and any(t.strip() for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    # chat_reply_ai never raises / never returns blank even if memory breaks
+    _orig_extract = B.extract_facts
+    B.extract_facts = lambda uid, text: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        _r = await B.chat_reply_ai("chulbuli", "Tester", chat_id=-100701, user_id=111)
+        check("chat reply ai never raises", isinstance(_r, str) and _r.strip() != "", repr(_r))
+    finally:
+        B.extract_facts = _orig_extract
+    # whitespace AI reply falls back to a real line
+    _orig_ai = B.ai_chat_reply
+
+    async def _blank_ai(*a, **k):
+        return "   "
+
+    B.ai_chat_reply = _blank_ai
+    try:
+        _r2 = await B.chat_reply_ai("kya haal hai", "Tester", chat_id=-100702, user_id=111)
+        check("chat reply ai blank falls back", isinstance(_r2, str) and _r2.strip() != "", repr(_r2))
+    finally:
+        B.ai_chat_reply = _orig_ai
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

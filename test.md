@@ -150,7 +150,17 @@ Sanji: "har bar emojis send karti hai esse ai lagti hai or bat karte karte fir s
 - [ ] Memory/continuity: pehle ki baat yaad rakh ke bole — wahi sawaal dobara nahi, dobara introduce nahi; naam yaad rahe to naam se bole (bina greet kiye, jab baat chal rahi ho)
 - [ ] LIVE test Sanji ke phone se: group me "chulbuli" bolo → typing dikhe → quote reply aaye → reaction dikhe; beech me dobara "hiee" na aaye; 5 min baad group me khud baat shuru kare; math question aaye aur sahi jawab par coins mile
 
+## 16. Live bug fixes (v2.3.1 — Sanji ki live report, 2026-11-12 ~21:28 IST)
+Sanji: "naam lene par bhi reply nahi aa raha hai... /promote try kiya to permission error... /play wala kam nahi kar raha hai, koi response nahi"
+- [ ] /play: YouTube bot-check ("Sign in to confirm you're not a bot") ab bot ko chup nahi karata — resolve_track DownloadError ko MusicError("youtube_blocked") me badalta hai, /play hamesha imaandari se jawab deta hai ("youtube ne block kar diya, thodi der me try karo"); koi bhi aur error bhi reply deta hai, kabhi silence nahi. (YouTube ka bot-check khud fix NAHI hua — sirf silence fix hua.)
+- [ ] /promote: Pyrogram 2.0.106 me `promote_chat_member` sirf `ChatPrivileges` object leta hai — purana boolean-kwargs call HAR BAAR TypeError deta tha, isliye /promote kabhi kaam hi nahi karta tha (permission ki baat hi nahi thi). Ab: bot ke apne rights mirror karke promote karta hai; bot ke paas "Add New Admins" na ho to wahi specific right naam se batata hai; asli error logs me print hota hai
+- [ ] /demote: all-False ChatPrivileges se demote (dhyaan: ChatPrivileges() default can_manage_chat=True hota hai — sab fields explicit False)
+- [ ] /title: `set_chat_admin_custom_title` naam ka method Pyrogram me hai hi nahi — sahi naam `set_administrator_title` use hota hai
+- [ ] Name-call: chat_reply_ai kabhi raise nahi karta, kabhi blank reply nahi deta (AI fail ho ya blank de to rule-based line); group + DM handler dono me safety net; naam lete hi Railway logs me "[chulbuli] name-call in <chat> from <user>" line aati hai — isse pata chalta hai message bot tak pahuncha ya nahi (privacy mode = line hi nahi aayegi)
+- [ ] LIVE test Sanji ke phone se: test group me (bot ko ADMIN banao, "Add New Admins" ke saath) — "chulbuli" bolo → reply aaye; /promote (reply karke) → admin bane; /play <gaana> → ya to baje ya youtube-block wali imaandari wali baat aaye (silence nahi)
+
 ## Pending / Known gaps
 - Word Guess: seedha guess (bina reply) — WordSeek style — NAHI banega (previous attempt refused — do NOT retry, rephrase, ya route around)
 - Music: module bana hua hai, ASSISTANT_SESSION set hai, builder Nixpacks + Python 3.9 ho gaya aur tgcalls-2.0.0-cp39 wheel install hua (2026-11-12, deployment 932c1a76) — ab sirf LIVE /play test baaki hai Sanji ke phone se; PYTHONUNBUFFERED=1 fix parent kar raha hai
+- Name-call ka sabse likely live cause (code se bahar): test group me bot ADMIN nahi hai → Telegram privacy mode me plain "chulbuli" bot tak pahuncht hi nahi (commands /promote, /play phir bhi pahunchte hain — isliye /promote ne reply diya par naam pe kuch nahi aaya). Fix: group me bot ko admin banao (full rights + "Add New Admins"). Agar admin banane ke baad bhi naam pe reply na aaye to Railway logs me "[chulbuli] name-call" line dhoondho — line na ho = message aaya hi nahi; line ho = handler me kuch aur hai.
 - Live test hamesha Sanji ke phone se (browser ka Telegram send kaam nahi karta)

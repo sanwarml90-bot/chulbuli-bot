@@ -39,6 +39,7 @@ from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
     ChatPermissions,
+    ChatPrivileges,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -69,7 +70,7 @@ try:
 except Exception:  # noqa: BLE001
     _imageio_ffmpeg = None
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3160,8 +3161,17 @@ def resolve_track(query: str) -> dict:
     src = q if q.startswith(("http://", "https://")) else f"ytsearch1:{q}"
     opts = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
             "no_warnings": True, "skip_download": True}
-    with _yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(src, download=False)
+    try:
+        with _yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(src, download=False)
+    except Exception as exc:  # noqa: BLE001 - yt-dlp DownloadError (e.g. YouTube bot-check)
+        # NEVER let a search failure escape raw: the /play handler only knows
+        # MusicError, and an uncaught DownloadError used to kill the handler
+        # so the user got NO reply at all (live bug, 2026-11-12).
+        msg = str(exc)
+        if "confirm you're not a bot" in msg or "Sign in to confirm" in msg:
+            raise MusicError("youtube_blocked")
+        raise MusicError(f"search failed: {msg[:120]}")
     if not info:
         raise MusicError("not found")
     if "entries" in info:
@@ -3427,8 +3437,19 @@ async def cmd_music(client: Client, message: Message):
         return
     try:
         track = resolve_track(query)
-    except MusicError:
-        await safe_reply(message, "wo gaana nahi mila — koi aur naam try karo 🙂")
+    except MusicError as exc:
+        reason = str(exc)
+        if reason == "youtube_blocked":
+            await safe_reply(
+                message,
+                "🎵 youtube ne block kar diya (bot-check) — gaana nahi mila 🙂 "
+                "thodi der me dobara try karo, ya koi aur gaana try karo")
+        else:
+            await safe_reply(message, "wo gaana nahi mila — koi aur naam try karo 🙂")
+        return
+    except Exception as exc:  # noqa: BLE001 - /play must NEVER go silent
+        print(f"[chulbuli] /play resolve failed: {exc!r}")
+        await safe_reply(message, "🎵 gaana dhundhte waqt error aaya — thodi der me dobara try karo 🙂")
         return
     track["by"] = display_name(message.from_user)
     track["by_id"] = message.from_user.id
@@ -3798,29 +3819,43 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
 
     Learns facts from the user's message first, then records the whole
     exchange in memory so Chulbuli remembers this chat next time.
+
+    NEVER raises and NEVER returns an empty reply: if anything goes wrong
+    (or the reply comes back blank), a short rule-based line is used so a
+    chat message never goes unanswered (live bug, 2026-11-12).
     """
-    if user_id is not None:
-        extract_facts(user_id, text)
-        mem_name = memory_name(user_id)
-        if mem_name:
-            user_name = mem_name
-    ongoing = _conversation_ongoing(chat_id, user_id)
-    if is_name_call(text):
-        # Bare name call — Baka/Mimi style: short greeting, NO long AI reply.
-        # But mid-conversation it is a continuation, never a greeting again.
-        reply = _continue(user_name) if ongoing else _greet(user_name)
-    else:
-        try:
-            ai = await ai_chat_reply(text, user_name, chat_id, user_id)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chulbuli] AI reply error: {exc!r}")
-            ai = None
-        facts = memory_facts(user_id) if user_id is not None else []
-        reply = ai if ai else chat_reply_text(text, user_name, facts, ongoing=ongoing)
-    if chat_id is not None and user_id is not None:
-        record_exchange(chat_id, user_id, user_name, text, reply)
-    elif user_id is not None:
-        save_data()
+    try:
+        if user_id is not None:
+            extract_facts(user_id, text)
+            mem_name = memory_name(user_id)
+            if mem_name:
+                user_name = mem_name
+        ongoing = _conversation_ongoing(chat_id, user_id)
+        if is_name_call(text):
+            # Bare name call — Baka/Mimi style: short greeting, NO long AI reply.
+            # But mid-conversation it is a continuation, never a greeting again.
+            reply = _continue(user_name) if ongoing else _greet(user_name)
+        else:
+            try:
+                ai = await ai_chat_reply(text, user_name, chat_id, user_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[chulbuli] AI reply error: {exc!r}")
+                ai = None
+            facts = memory_facts(user_id) if user_id is not None else []
+            reply = ai if ai else chat_reply_text(text, user_name, facts, ongoing=ongoing)
+        reply = (reply or "").strip()
+        if not reply:
+            reply = random.choice(CHAT_DEFAULT)
+    except Exception as exc:  # noqa: BLE001 - chat must never go silent
+        print(f"[chulbuli] chat_reply_ai failed: {exc!r}")
+        reply = random.choice(CHAT_DEFAULT)
+    try:
+        if chat_id is not None and user_id is not None:
+            record_exchange(chat_id, user_id, user_name, text, reply)
+        elif user_id is not None:
+            save_data()
+    except Exception:  # noqa: BLE001
+        pass
     return reply
 
 
@@ -6521,6 +6556,50 @@ async def cmd_warns(client: Client, message: Message):
     await safe_reply(message, f"⚠️ {display_name(target)} ke warns: {n}/3 🙂")
 
 
+# --- /promote /demote /title: Pyrogram 2.0.106 takes a ChatPrivileges object,
+# NOT individual boolean kwargs (the old kwargs call raised TypeError on
+# EVERY call, so /promote could never work — live bug, 2026-11-12). Telegram
+# also rejects a promote if ANY requested right exceeds what the bot itself
+# has, so we mirror the bot's own rights and name the missing right. ---
+async def _bot_privileges(client, chat_id: int):
+    """The bot's own admin privileges in this chat (None if not admin/unknown)."""
+    try:
+        me = getattr(client, "me", None)
+        me_id = me.id if me is not None else (await client.get_me()).id
+        member = await client.get_chat_member(chat_id, me_id)
+        return getattr(member, "privileges", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mirror_privileges(bot_privs) -> ChatPrivileges:
+    """ChatPrivileges for a new admin: exactly what the bot itself has, minus
+    the right to promote others and minus anonymous mode."""
+    return ChatPrivileges(
+        can_manage_chat=bool(getattr(bot_privs, "can_manage_chat", False)),
+        can_delete_messages=bool(getattr(bot_privs, "can_delete_messages", False)),
+        can_manage_video_chats=bool(getattr(bot_privs, "can_manage_video_chats", False)),
+        can_restrict_members=bool(getattr(bot_privs, "can_restrict_members", False)),
+        can_promote_members=False,
+        can_change_info=bool(getattr(bot_privs, "can_change_info", False)),
+        can_post_messages=bool(getattr(bot_privs, "can_post_messages", False)),
+        can_edit_messages=bool(getattr(bot_privs, "can_edit_messages", False)),
+        can_invite_users=bool(getattr(bot_privs, "can_invite_users", False)),
+        can_pin_messages=bool(getattr(bot_privs, "can_pin_messages", False)),
+        is_anonymous=False,
+    )
+
+
+def _demote_privileges() -> ChatPrivileges:
+    """All rights off (note: ChatPrivileges() defaults can_manage_chat=True,
+    so every field must be set False explicitly for a demote)."""
+    return ChatPrivileges(
+        can_manage_chat=False, can_delete_messages=False, can_manage_video_chats=False,
+        can_restrict_members=False, can_promote_members=False, can_change_info=False,
+        can_post_messages=False, can_edit_messages=False, can_invite_users=False,
+        can_pin_messages=False, is_anonymous=False)
+
+
 @app.on_message(filters.command(["promote"]))
 async def cmd_promote(client: Client, message: Message):
     user = track_user(message)
@@ -6533,13 +6612,18 @@ async def cmd_promote(client: Client, message: Message):
     if not target:
         await safe_reply(message, "Kisko promote karna hai? Reply karke /promote likho 🙂")
         return
+    bot_privs = await _bot_privileges(client, message.chat.id)
+    if bot_privs is None or not getattr(bot_privs, "can_promote_members", False):
+        await safe_reply(
+            message,
+            "Promote nahi kar sakti — mujhe admin banao aur **'Add New Admins'** ka right do 🙂")
+        return
     try:
         await client.promote_chat_member(
-            message.chat.id, target.id, can_change_info=True, can_delete_messages=True,
-            can_restrict_members=True, can_invite_users=True, can_pin_messages=True,
-            can_manage_chat=True, can_manage_video_chats=True)
+            message.chat.id, target.id, privileges=_mirror_privileges(bot_privs))
         await safe_reply(message, f"⬆️ {display_name(target)} admin ban gaya! 🎉")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] promote failed: {exc!r}")
         await safe_reply(message, "Promote nahi kar payi — mujhe admin banao (promote permission ke saath) 🙂")
 
 
@@ -6557,11 +6641,10 @@ async def cmd_demote(client: Client, message: Message):
         return
     try:
         await client.promote_chat_member(
-            message.chat.id, target.id, can_change_info=False, can_delete_messages=False,
-            can_restrict_members=False, can_invite_users=False, can_pin_messages=False,
-            can_manage_chat=False, can_manage_video_chats=False)
+            message.chat.id, target.id, privileges=_demote_privileges())
         await safe_reply(message, f"⬇️ {display_name(target)} admin se hata diya 🙂")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] demote failed: {exc!r}")
         await safe_reply(message, "Demote nahi kar payi — mujhe admin banao 🙂")
 
 
@@ -6579,9 +6662,12 @@ async def cmd_title(client: Client, message: Message):
         await safe_reply(message, "Aise: admin ke message pe reply karke `/title Star Admin` 🙂")
         return
     try:
-        await client.set_chat_admin_custom_title(message.chat.id, target.id, title[:16])
+        # Pyrogram 2.0.106: set_administrator_title (set_chat_admin_custom_title
+        # does not exist — the old call raised AttributeError on every /title).
+        await client.set_administrator_title(message.chat.id, target.id, title[:16])
         await safe_reply(message, f"🎖️ {display_name(target)} ka title: **{title[:16]}** 🙂")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] title failed: {exc!r}")
         await safe_reply(message, "Title nahi de payi — pehle /promote se admin banao 🙂")
 
 
@@ -7831,9 +7917,19 @@ async def group_text_handler(client: Client, message: Message):
                 if "chulbuligamebot" in name:
                     mentioned = True
     if mentioned:
+        # Diagnostic: log name-calls so Railway logs prove whether the bot
+        # RECEIVED the message at all — with privacy mode on (bot not admin),
+        # plain "chulbuli" never arrives and NO log line appears (live bug,
+        # 2026-11-12: bot needs admin in the group to hear its name).
+        print(f"[chulbuli] name-call in {message.chat.id} from {message.from_user.id}")
         # v2.3.0 — chat reply like a real person: typing, pause, quote, react
-        await send_chat_reply(client, message, await chat_reply_ai(text, display_name(message.from_user),
-                                                      message.chat.id, message.from_user.id))
+        try:
+            reply = await chat_reply_ai(text, display_name(message.from_user),
+                                        message.chat.id, message.from_user.id)
+        except Exception as exc:  # noqa: BLE001 - chat must never go silent
+            print(f"[chulbuli] chat reply failed: {exc!r}")
+            reply = random.choice(CHAT_DEFAULT)
+        await send_chat_reply(client, message, reply or random.choice(CHAT_DEFAULT))
 
 
 @app.on_message(filters.private & filters.text, group=1)
@@ -7853,8 +7949,13 @@ async def private_text_handler(client: Client, message: Message):
     if not chat_on():
         return
     # v2.3.0 — chat reply like a real person: typing, pause, quote, react
-    await send_chat_reply(client, message, await chat_reply_ai(text, display_name(message.from_user),
-                                                  message.chat.id, message.from_user.id))
+    try:
+        reply = await chat_reply_ai(text, display_name(message.from_user),
+                                    message.chat.id, message.from_user.id)
+    except Exception as exc:  # noqa: BLE001 - chat must never go silent
+        print(f"[chulbuli] chat reply failed: {exc!r}")
+        reply = random.choice(CHAT_DEFAULT)
+    await send_chat_reply(client, message, reply or random.choice(CHAT_DEFAULT))
 
 
 # ---------------------------------------------------------------------------
