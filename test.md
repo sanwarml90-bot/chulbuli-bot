@@ -116,7 +116,7 @@ Live test sirf Sanji ke phone se (browser se Telegram send nahi hota).
 - [ ] /play DM me → group-only message
 - [ ] /play jab UNO chal raha hai → UNO ka /play chalta hai, music chup rehta hai
 - [ ] Assistant startup par Railway logs me @CBIOFINDIA (id 8617937893) dikhta hai (get_me se)
-- [ ] LIVE voice test — asli group voice chat me, Sanji ke phone se — ABHI BAAKI (blocker: Railway par ASSISTANT_SESSION set karna + real VC test)
+- [ ] LIVE voice test — asli group voice chat me, Sanji ke phone se — ABHI BAAKI. Update 2026-11-12 ~21:09 IST: ASSISTANT_SESSION set hai; builder Railpack → Nixpacks + Python 3.9 ho gaya, build log me tgcalls-2.0.0-cp39-manylinux wheel install hua (deployment 932c1a76, ACTIVE) — ab sirf LIVE /play test baaki hai
 
 ## 14. Gap audit v2.2.0 (16 moonlight bots — kya missing tha, kya bana, kya nahi ban sakta)
 Per-bot detail — source: analysis-3-bots.md (live GHOST test 2026-11-12).
@@ -137,7 +137,20 @@ Per-bot detail — source: analysis-3-bots.md (live GHOST test 2026-11-12).
 - **VC music @vcmusiclubot (KUST MUSIC)** — v2.2.0 me bana: /play /queue /skip /pause /resume /stop (/end) /clear /ping + player card buttons (YouTube via yt-dlp; assistant @CBIOFINDIA via ASSISTANT_SESSION env). NAHI BAN SAKTA abhi: voice backend — pytgcalls 2.1.0 ka native dep `tgcalls` ke Linux wheels sirf Python ≤3.9 ke liye hain; Railway Python 3.12 par voice inactive rehta hai (module honestly degrade karta hai, fake playback nahi). Nahi bana: /mute /unmute /tmute /kick /ban in VC, /playlist (baad me), Spotify/SoundCloud/Apple/Resso sources (sirf YouTube), 24×7 mode, /clone (skip).
 - **Vctts @Vcttsrobot** — COPY NAHI KIYA (Sanji ka apna bot hai — standing rule).
 
+## 15. Chat realism (v2.3.0 — Sanji ki shikayat, 2026-11-12 21:15 IST)
+Sanji: "har bar emojis send karti hai esse ai lagti hai or bat karte karte fir se hi hello send karti hai... typing dikhe... reaction bhi de... reply kar ke bat kare... har 5 mint me group ke last msg pade... daizy ki trah math question... har bar ese bat na kare jese bat start hui hai"
+- [ ] Emojis: zyada tar chat replies me KOI emoji nahi — sirf kabhi-kabhi ek. Har message me emoji = AI jaisa lagta hai, ab nahi
+- [ ] Beech me "hiee"/"hello" dobara nahi — jis se baat chal rahi hai us se continue kare; 30 min ke gap ke baad hi dobara greet kare; naya user ab bhi greet hota hai
+- [ ] Reply length: aam taur par 1-2 lines, kabhi 3-4 lines bhi (topic ke hisaab se)
+- [ ] Typing indicator: chat reply se pehle upar "typing..." dikhe, 1-3 sec ka natural pause (reply jitna lamba, utna zyada) — DM aur group dono me; commands/games turant rehte hain
+- [ ] Reply-to quote: chat reply usi ke message ko quote karke aaye
+- [ ] Reaction: jawaab dete hue us message par kabhi-kabhi emoji reaction (❤️ 😄 😂 👍 🔥 🥰) — har bar nahi; reaction fail ho to reply phir bhi jaye
+- [ ] Proactive (har 5 min): active group (10 min me message aaya ho) me ek person ko reply karke baat shuru kare — group ki history ke hisaab se; 30 min me bot bol chuka ho to chup rahe; chat off ho to kuch nahi; DM me kabhi nahi; apne ya dusre bot ke message par nahi
+- [ ] Math poster (har 30-60 min, ek active group me): Daizy-style math question — level (easy/medium/hard) + reward (easy +100, medium +250, hard +500 coins); pehla sahi jawab jeete; 5 min me koi jawab na de to chup-chaap khatam (koi spam nahi); game chal raha ho to post nahi
+- [ ] Memory/continuity: pehle ki baat yaad rakh ke bole — wahi sawaal dobara nahi, dobara introduce nahi; naam yaad rahe to naam se bole (bina greet kiye, jab baat chal rahi ho)
+- [ ] LIVE test Sanji ke phone se: group me "chulbuli" bolo → typing dikhe → quote reply aaye → reaction dikhe; beech me dobara "hiee" na aaye; 5 min baad group me khud baat shuru kare; math question aaye aur sahi jawab par coins mile
+
 ## Pending / Known gaps
 - Word Guess: seedha guess (bina reply) — WordSeek style — NAHI banega (previous attempt refused — do NOT retry, rephrase, ya route around)
-- Music: module bana hua hai, par LIVE voice test baaki — Railway par ASSISTANT_SESSION set karna hai (parent karega), phir asli group VC me test; pytgcalls Python 3.12 par install nahi hota isliye voice tabhi chalega jab compatible release aaye ya Python ≤3.9 runtime mile
+- Music: module bana hua hai, ASSISTANT_SESSION set hai, builder Nixpacks + Python 3.9 ho gaya aur tgcalls-2.0.0-cp39 wheel install hua (2026-11-12, deployment 932c1a76) — ab sirf LIVE /play test baaki hai Sanji ke phone se; PYTHONUNBUFFERED=1 fix parent kar raha hai
 - Live test hamesha Sanji ke phone se (browser ka Telegram send kaam nahi karta)

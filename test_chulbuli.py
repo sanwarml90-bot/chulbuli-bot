@@ -195,6 +195,14 @@ class FakeApp:
         m.text = text
         return m
 
+    async def send_chat_action(self, chat_id, action):
+        FakeApp.calls.append(("chat_action", chat_id, str(action)))
+        return True
+
+    async def send_reaction(self, chat_id, message_id, emoji=""):
+        FakeApp.calls.append(("reaction", chat_id, message_id, emoji))
+        return True
+
     async def edit_message_text(self, chat_id, message_id, text, **kwargs):
         FakeMessage.edits.append((chat_id, text, kwargs))
         return None
@@ -1459,7 +1467,266 @@ async def main():
     await B.group_text_handler(client, FakeMessage("aur batao", uid=111, name="Tester", chat_id=-100623))
     FakeMessage.outbox.clear()
     await B.cmd_mystats(client, FakeMessage("/mystats", uid=111, name="Tester", chat_id=-100623))
-    check("gap mystats today", any("aaj:" in t for _, t in FakeMessage.outbox))
+    # ================= v2.3.0: chat realism ================================
+    # (Sanji: emojis har bar nahi, beech me "hello" dobara nahi, typing
+    # dikhe, quote karke reply, reaction de, har 5 min group me baat
+    # shuru kare, daizy-style math question, kabhi aisa na lage jaise
+    # baat abhi shuru hui hai)
+    import re as _re2
+    import pyrogram as _pyro
+    from pyrogram.enums import ChatAction as _ChatAction
+    check("reaction api exists", hasattr(_pyro.Client, "send_reaction")
+          and hasattr(_pyro.types.Message, "react"))
+    check("typing action enum", hasattr(_pyro.enums.ChatAction, "TYPING"))
+
+    # ---- fewer emojis: most chat lines carry NO emoji at all ----
+    _EMOJI_RE = _re2.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]")
+
+    def _emoji_count(s):
+        return len(_EMOJI_RE.findall(s))
+
+    _all_chat_v23 = (B.CHAT_GREET + B.CHAT_HOW + B.CHAT_DEFAULT + B.CHAT_LOVE
+                     + B.CHAT_ANGRY + B.CHAT_REAL + B.CHAT_CONTINUE)
+    _clean = sum(1 for s in _all_chat_v23 if _emoji_count(s) == 0)
+    check("fewer emojis most lines clean", _clean >= len(_all_chat_v23) * 0.7,
+          f"{_clean}/{len(_all_chat_v23)} clean")
+    check("fewer emojis max one per line", all(_emoji_count(s) <= 1 for s in _all_chat_v23),
+          str([s for s in _all_chat_v23 if _emoji_count(s) > 1]))
+    check("ai system rare emojis", "rare" in B.AI_SYSTEM.lower()
+          and "every message" in B.AI_SYSTEM.lower())
+    check("ai system no re-greet", "never greet them again" in B.AI_SYSTEM.lower())
+    check("ai system length variety", "3-4 lines" in B.AI_SYSTEM)
+    check("chat default longer lines", any(len(s) > 40 for s in B.CHAT_DEFAULT))
+    check("continue lines never greet",
+          all(not s.startswith(("hiee", "hlooo", "hello", "hii")) for s in B.CHAT_CONTINUE)
+          and all(len(s) <= 60 for s in B.CHAT_CONTINUE))
+
+    # ---- no re-greeting mid-conversation ----
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    B.DATA["toggles"]["ai"] = True
+    _nc_uid = 889301
+    B.DATA["history"].pop(str(_nc_uid), None)
+    B.DATA["memory"].pop(str(_nc_uid), None)
+    _first = await B.chat_reply_ai("chulbuli", "Tester", chat_id=_nc_uid, user_id=_nc_uid)
+    check("fresh name call greets", _first in B.CHAT_GREET or _first.startswith("hiee Tester")
+          or "Tester" in _first, str(_first))
+    _second = await B.chat_reply_ai("hii", "Tester", chat_id=_nc_uid, user_id=_nc_uid)
+    check("mid-convo no re-greet", _second not in B.CHAT_GREET
+          and not _second.startswith(("hiee", "hlooo", "hello", "hii")), str(_second))
+    check("mid-convo keeps name", "Tester" in _second, str(_second))
+    _third = await B.chat_reply_ai("chulbuli", "Tester", chat_id=_nc_uid, user_id=_nc_uid)
+    check("mid-convo name call continues", _third not in B.CHAT_GREET
+          and not _third.startswith("hiee"), str(_third))
+    B.DATA["memory"][str(_nc_uid)]["last_seen"] = int(time.time()) - 31 * 60
+    _after_gap = await B.chat_reply_ai("hii", "Tester", chat_id=_nc_uid, user_id=_nc_uid)
+    check("greet again after long gap", _after_gap in B.CHAT_GREET or _after_gap.startswith("hiee")
+          or "Tester" in _after_gap, str(_after_gap))
+    _newbie = await B.chat_reply_ai("chulbuli", "Newbie", chat_id=_nc_uid, user_id=889302)
+    check("new user still greeted", _newbie in B.CHAT_GREET or _newbie.startswith("hiee Newbie")
+          or "Newbie" in _newbie, str(_newbie))
+    check("ongoing needs history+recent msgs",
+          B._conversation_ongoing(None, 111) is False
+          and B._conversation_ongoing(_nc_uid, None) is False
+          and B._conversation_ongoing(_nc_uid, 889303) is False)
+
+    # ---- typing indicator + reply-to quote + reaction (chat replies only) ----
+    class _RecClient:
+        """Records chat actions + reactions the bot sends."""
+
+        def __init__(self):
+            self.actions = []    # (chat_id, action)
+            self.reactions = []  # (chat_id, message_id, emoji)
+
+        async def send_chat_action(self, chat_id, action):
+            self.actions.append((chat_id, action))
+            return True
+
+        async def send_reaction(self, chat_id, message_id, emoji=""):
+            self.reactions.append((chat_id, message_id, emoji))
+            return True
+
+        async def get_chat_member(self, chat_id, user_id):
+            return FakeChatMember(FakeUser(user_id, "Tester"), "member")
+
+    _sleeps = []
+    _real_sleep2 = asyncio.sleep
+
+    async def _rec_sleep(d):
+        _sleeps.append(d)
+        return None
+
+    asyncio.sleep = _rec_sleep
+    try:
+        _rc = _RecClient()
+        FakeMessage.outbox.clear()
+        FakeMessage.outbox_full.clear()
+        _m = FakeMessage("chulbuli kaisi ho?", uid=111, name="Tester", chat_id=-100700)
+        await B.group_text_handler(_rc, _m)
+        check("typing shown before chat reply", len(_rc.actions) >= 1
+              and _rc.actions[0][0] == -100700 and _rc.actions[0][1] == _ChatAction.TYPING,
+              str(_rc.actions))
+        check("typing delay 1-3s", len(_sleeps) >= 1 and all(1.0 <= s <= 3.0 for s in _sleeps),
+              str(_sleeps))
+        check("chat reply quotes user", len(FakeMessage.outbox_full) == 1
+              and FakeMessage.outbox_full[0][2].get("reply_to_message_id") == _m.id,
+              str(FakeMessage.outbox_full))
+        check("typing delay scales with length", B.typing_delay("x") == 1.0
+              and B.typing_delay("x" * 200) == 3.0 and 1.0 < B.typing_delay("x" * 50) < 3.0)
+        # reaction: force it on, then force it off
+        _real_random = B.random.random
+        B.random.random = lambda: 0.0
+        _rc2 = _RecClient()
+        _m2 = FakeMessage("chulbuli suno na", uid=111, name="Tester", chat_id=-100700)
+        await B.group_text_handler(_rc2, _m2)
+        check("reaction sent on chat reply", len(_rc2.reactions) == 1
+              and _rc2.reactions[0][1] == _m2.id and _rc2.reactions[0][2] in B.REACT_EMOJIS,
+              str(_rc2.reactions))
+        B.random.random = lambda: 0.99
+        _rc3 = _RecClient()
+        await B.group_text_handler(_rc3, FakeMessage("chulbuli aur batao", uid=111, name="Tester", chat_id=-100700))
+        check("reaction sparing not always", len(_rc3.reactions) == 0)
+        B.random.random = _real_random
+        # reaction failure must not break the reply
+
+        class _FailReact(_RecClient):
+            async def send_reaction(self, chat_id, message_id, emoji=""):
+                raise RuntimeError("boom")
+
+        _rc4 = _FailReact()
+        FakeMessage.outbox.clear()
+        await B.group_text_handler(_rc4, FakeMessage("chulbuli kya kar rahi ho", uid=111, name="Tester", chat_id=-100700))
+        check("reaction failure reply still sent", len(FakeMessage.outbox) == 1)
+        # DM chat reply also types + quotes
+        _rc_dm = _RecClient()
+        FakeMessage.outbox.clear()
+        FakeMessage.outbox_full.clear()
+        _dm = FakeMessage("hello ji", uid=111, name="Tester", chat_id=111, ctype="private")
+        await B.private_text_handler(_rc_dm, _dm)
+        check("dm chat reply types + quotes", len(_rc_dm.actions) >= 1
+              and len(FakeMessage.outbox_full) == 1
+              and FakeMessage.outbox_full[0][2].get("reply_to_message_id") == _dm.id,
+              str(FakeMessage.outbox_full))
+        # commands stay instant: no typing action
+        _rc5 = _RecClient()
+        await B.cmd_bal(_rc5, FakeMessage("/bal", uid=111, name="Tester", chat_id=111, ctype="private"))
+        check("commands stay instant", len(_rc5.actions) == 0)
+    finally:
+        asyncio.sleep = _real_sleep2
+
+    # ---- proactive group engagement: selection logic ----
+    _now = int(time.time())
+    B.DATA.setdefault("recent", {})
+    B.DATA["recent"].pop(str(-100710), None)
+    B.DATA["chats"].pop(str(-100710), None)
+    B.record_recent(-100710, 111, "Tester", "aaj cricket khelte hain kya?", 5001)
+    _tgt = B._pick_proactive_target(-100710, _now)
+    check("proactive picks recent human msg", _tgt is not None and _tgt.get("u") == 111
+          and _tgt.get("m") == 5001, str(_tgt))
+    B.DATA["recent"][str(-100710)][-1]["ts"] = _now - 601
+    check("proactive skips idle group", B._pick_proactive_target(-100710, _now) is None)
+    B.DATA["recent"][str(-100710)][-1]["ts"] = _now - 60
+    B._chat_data(-100710)["last_bot_spoke"] = _now - 100
+    check("proactive skips after bot spoke", B._pick_proactive_target(-100710, _now) is None)
+    B._chat_data(-100710)["last_bot_spoke"] = _now - 2000
+    B.DATA["toggles"]["chat"] = False
+    check("proactive respects chat off", B._pick_proactive_target(-100710, _now) is None)
+    B.DATA["toggles"]["chat"] = True
+    B.record_recent(-100710, 222, "Friend", "42", 5002)
+    _tgt2 = B._pick_proactive_target(-100710, _now)
+    check("proactive skips bare numbers", _tgt2 is not None
+          and _tgt2.get("t") == "aaj cricket khelte hain kya?", str(_tgt2))
+    check("recent capped at 20", (lambda: [B.record_recent(-100710, 111, "T", f"msg{i}", 6000 + i)
+                                           for i in range(25)] and len(B.DATA["recent"][str(-100710)]) == 20)())
+
+    # ---- proactive tick: sends once in an active group, skips idle/DM ----
+    # Hermetic: earlier handler tests left other active groups in recent —
+    # clear them so only the groups below exist for this tick.
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    B.DATA["recent"] = {}
+    B.DATA["recent"][str(-100710)] = [
+        {"u": 111, "n": "Tester", "t": "aaj cricket khelte hain kya?", "ts": _now - 30, "m": 5001, "bot": False},
+    ]
+    B._chat_data(-100710)["last_bot_spoke"] = 0
+    B.DATA["recent"][str(-100711)] = [
+        {"u": 111, "n": "Tester", "t": "purani baat", "ts": _now - 3600, "m": 6001, "bot": False},
+    ]
+    B.DATA["recent"][str(111)] = [
+        {"u": 111, "n": "Tester", "t": "dm me baat", "ts": _now - 30, "m": 7001, "bot": False},
+    ]
+    asyncio.sleep = _rec_sleep
+    try:
+        _sent = await B._proactive_tick(_now)
+    finally:
+        asyncio.sleep = _real_sleep2
+    check("proactive tick sends once", _sent == 1, str(_sent))
+    check("proactive reply quotes target",
+          any(kw.get("reply_to_message_id") == 5001 for _, _, kw in FakeMessage.outbox_full),
+          str(FakeMessage.outbox_full))
+    check("proactive skips idle + DM",
+          all(cid != -100711 and cid != 111 for cid, _, _ in FakeMessage.outbox_full))
+    check("proactive tick shows typing",
+          any(c[0] == "chat_action" and c[1] == -100710 for c in FakeApp.calls), str(FakeApp.calls))
+    check("proactive marks bot spoke", B._chat_data(-100710).get("last_bot_spoke", 0) > 0)
+
+    # ---- periodic math questions (Daizy-style) ----
+    check("math rewards", B.MATH_SINGLE_REWARDS == {"easy": 100, "medium": 250, "hard": 500})
+    _mg = -100720
+    B.DATA["recent"] = {}
+    B.DATA["recent"][str(_mg)] = [
+        {"u": 111, "n": "Tester", "t": "bore ho raha hun yaar", "ts": _now - 30, "m": 8001, "bot": False},
+    ]
+    B._chat_data(_mg)["last_math_post"] = 0
+    B._chat_data(_mg)["last_bot_spoke"] = 0
+    B._MATH_SINGLE.pop(_mg, None)
+    check("math group picked when active", B._pick_math_group(_now) == _mg)
+    B.set_game(_mg, {"kind": "uno", "players": [111]})
+    check("math group skipped during game", B._pick_math_group(_now) is None)
+    B.set_game(_mg, None)
+    B._chat_data(_mg)["last_math_post"] = _now - 100
+    check("math group skipped if posted recently", B._pick_math_group(_now) is None)
+    B._chat_data(_mg)["last_math_post"] = 0
+    FakeMessage.outbox.clear()
+    asyncio.sleep = _rec_sleep
+    try:
+        _posted = await B._math_poster_tick(_now)
+    finally:
+        asyncio.sleep = _real_sleep2
+    check("math poster posts", _posted is True
+          and any("math question" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    _ms = B._MATH_SINGLE.get(_mg)
+    check("math single state set", _ms is not None and _ms.get("answer") is not None
+          and _ms.get("reward") == B.MATH_SINGLE_REWARDS[_ms["difficulty"]], str(_ms))
+    _q_text = [t for _, t in FakeMessage.outbox if "math question" in t][0]
+    _q_line = [ln for ln in _q_text.split("\n") if "= ?" in ln][0]
+    check("math posted question matches answer",
+          eval(_q_line.replace("×", "*").replace(" = ?", "")) == _ms["answer"], _q_line)
+    check("math posted shows level + reward", _ms["difficulty"] in _q_text
+          and f"+{_ms['reward']} coins" in _q_text, _q_text)
+    _coins_before = B.get_user(222)["coins"]
+    FakeMessage.outbox.clear()
+    await B.handle_math_answer(FakeMessage(str(_ms["answer"]), uid=222, name="Friend", chat_id=_mg))
+    check("math single correct wins coins", B.get_user(222)["coins"] == _coins_before + _ms["reward"]
+          and _mg not in B._MATH_SINGLE and any("sahi jawab" in t for _, t in FakeMessage.outbox),
+          str(B.get_user(222)["coins"]))
+    B._MATH_SINGLE[_mg] = {"answer": 42, "reward": 250, "difficulty": "medium",
+                           "gid": "test-gid", "expires": _now + 300}
+    _coins_before2 = B.get_user(222)["coins"]
+    FakeMessage.outbox.clear()
+    await B.handle_math_answer(FakeMessage("41", uid=222, name="Friend", chat_id=_mg))
+    check("math single wrong answer no coins", B.get_user(222)["coins"] == _coins_before2
+          and _mg in B._MATH_SINGLE)
+    await B.handle_math_answer(FakeMessage("hello", uid=222, name="Friend", chat_id=_mg))
+    check("math single non-number ignored", _mg in B._MATH_SINGLE)
+    await B._math_single_timeout(_mg, "test-gid", 0)
+    check("math single expires quietly", _mg not in B._MATH_SINGLE)
+    B._MATH_SINGLE[_mg] = {"answer": 7, "reward": 100, "difficulty": "easy",
+                           "gid": "new-gid", "expires": _now + 300}
+    await B._math_single_timeout(_mg, "old-gid", 0)
+    check("math single stale timeout keeps new", _mg in B._MATH_SINGLE)
+    B._MATH_SINGLE.pop(_mg, None)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

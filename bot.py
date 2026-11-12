@@ -35,7 +35,7 @@ import time
 from datetime import datetime
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
     ChatPermissions,
@@ -69,7 +69,7 @@ try:
 except Exception:  # noqa: BLE001
     _imageio_ffmpeg = None
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -131,7 +131,7 @@ def _blank_data() -> dict:
     return {"users": {}, "chats": {}, "toggles": {"games": True, "economy": True, "chat": True, "ai": True},
             "banned_users": [], "sudos": [], "gift_codes": {},
             "meta": {"started_at": int(time.time()), "games_played": 0},
-            "memory": {}, "history": {}}
+            "memory": {}, "history": {}, "recent": {}}
 
 
 def load_data() -> dict:
@@ -149,6 +149,7 @@ def load_data() -> dict:
         data.setdefault("meta", {"started_at": int(time.time()), "games_played": 0})
         data.setdefault("memory", {})
         data.setdefault("history", {})
+        data.setdefault("recent", {})
         return data
     except Exception:  # noqa: BLE001
         return _blank_data()
@@ -2357,6 +2358,21 @@ async def cmd_math(client: Client, message: Message):
 
 
 async def handle_math_answer(message: Message) -> bool:
+    # v2.3.0 — periodic single math question (Daizy-style, posted by the bot
+    # itself). First correct answer wins the coins; wrong numbers fall through.
+    single = _MATH_SINGLE.get(message.chat.id)
+    if single is not None:
+        text = (message.text or "").strip()
+        if re.fullmatch(r"-?\d+", text) and int(text) == single["answer"]:
+            _MATH_SINGLE.pop(message.chat.id, None)
+            user = get_user(message.from_user.id)
+            add_coins(user, single["reward"])
+            add_xp(user, 5)
+            save_data()
+            await safe_reply(message,
+                             f"✅ sahi jawab! **{display_name(message.from_user)}** +{single['reward']} coins! 🎉",
+                             reply_to_message_id=message.id)
+            return True
     state = game_state(message.chat.id)
     if not state or state.get("kind") != "math":
         return False
@@ -3474,59 +3490,89 @@ async def music_callbacks(client: Client, query):
 # ---------------------------------------------------------------------------
 # Chat persona — original Hinglish (cute + savage-sweet)
 # ---------------------------------------------------------------------------
+# v2.3.0 — FEWER EMOJIS. A real girl does NOT put an emoji in every message:
+# most of these lines have NO emoji at all, only one or two carry a single
+# one. (Sanji: "har bar emojis send karti hai, esse ai lagti hai".)
 CHAT_GREET = [
-    "hiee 💕",
-    "hlooo, kya haal hai? 😄",
-    "hiee! bolo kya chahiye? 🙂",
-    "haan bolo, main sun rahi hun 💕",
+    "hiee",
+    "hlooo, kya haal hai?",
+    "hiee! bolo kya chahiye?",
+    "haan bolo, main sun rahi hun",
     "hiee cutu, kya kar rahe ho? 😄",
 ]
 CHAT_HOW = [
-    "main to badhiya hun, tum batao? 😄",
-    "ekdum mast! tum kya kar rahe ho? 🙂",
-    "thik hun yaar, tum batao kya chal raha hai 💕",
-    "im good thanks, just chillin 😄 tum batao?",
+    "main to badhiya hun, tum batao?",
+    "ekdum mast! tum kya kar rahe ho?",
+    "thik hun yaar, tum batao kya chal raha hai",
+    "im good thanks, just chillin, tum batao?",
 ]
 CHAT_DEFAULT = [
-    "hmm, interesting 😄",
-    "achha? aur batao 🙂",
-    "wah, kya baat hai! 💕",
-    "samajh gayi… aur? 😄",
-    "hehe, tum bhi na 😂",
-    "haan haan, bolo bolo 🙂",
+    "hmm, interesting",
+    "achha? aur batao",
+    "wah, kya baat hai!",
+    "samajh gayi… aur?",
+    "hehe, tum bhi na",
+    "haan haan, bolo bolo",
     "hehe, aur batao na 😄",
-    "im just chillin, tum batao kya chal raha hai 🙂",
+    "im just chillin, tum batao kya chal raha hai",
+    "arre waah, ye to interesting hai, aur detail me batao na",
+    "hmm, ispe thoda sochna padega, tum kya kehte ho",
 ]
 CHAT_LOVE = [
-    "awww, tum bhi pyaare ho 💕",
-    "sharma gayi main to 😳💕",
+    "awww, tum bhi pyaare ho",
+    "sharma gayi main to",
     "hehe, line mat maro 😄",
 ]
 CHAT_ANGRY = [
-    "arey chill karo yaar 😤",
-    "itna gussa kyun? thoda calm raho 🙂",
-    "bas bas, ladna band karo 😄",
+    "arey chill karo yaar",
+    "itna gussa kyun? thoda calm raho",
+    "bas bas, ladna band karo",
 ]
 
 
 CHAT_REAL = [
-    "arre main Chulbuli hun, tumhe kya lagta hai? 😄",
-    "bot hoti to itni cute baatein kaise karti? 💕",
-    "main to bas tumhari Chulbuli hun, aur kya chahiye? 😌💕",
+    "arre main Chulbuli hun, tumhe kya lagta hai?",
+    "bot hoti to itni cute baatein kaise karti?",
+    "main to bas tumhari Chulbuli hun, aur kya chahiye?",
     "ye kaisa sawaal hai, main yahin hun na tumhare saamne 😄",
 ]
 
 
+# v2.3.0 — mid-conversation continuations. These are NEVER greetings: when
+# Chulbuli is already talking to someone, she continues — no "hiee", no
+# "hello" again. (Sanji: "bat karte karte fir se hi hello send karti hai".)
+CHAT_CONTINUE = [
+    "haan bolo, sun rahi hun",
+    "haan, kya hua? bolo na",
+    "sun rahi hun, bolo",
+    "haan bolo, main yahin hun",
+    "bolo bolo, sun rahi hun",
+    "haan, aur batao",
+]
+
+
 def _greet(user_name: str = "") -> str:
-    """Short greeting, Daizy style — lowercase, sweet, one line. A bare name call gets a 'hiee', not a long chat reply."""
+    """Short greeting, Daizy style — lowercase, sweet, one line. A bare name call gets a 'hiee', not a long chat reply. Only used for a FRESH conversation (see _conversation_ongoing)."""
     if user_name:
         return random.choice([
-            f"hiee {user_name} 💕",
-            f"hlooo {user_name}, kya haal hai? 😄",
-            f"hiee {user_name}! bolo kya chahiye? 🙂",
-            f"haan {user_name}, bolo main sun rahi hun 💕",
+            f"hiee {user_name}",
+            f"hlooo {user_name}, kya haal hai?",
+            f"hiee {user_name}! bolo kya chahiye?",
+            f"haan {user_name}, bolo main sun rahi hun",
         ])
     return random.choice(CHAT_GREET)
+
+
+def _continue(user_name: str = "") -> str:
+    """Mid-conversation continuation — NEVER a greeting. Used when Chulbuli is
+    already talking to this person, so she picks up where she left off."""
+    if user_name:
+        return random.choice([
+            f"haan {user_name}, bolo",
+            f"sun rahi hun {user_name}, bolo kya hua",
+            f"haan {user_name}, aur batao",
+        ])
+    return random.choice(CHAT_CONTINUE)
 
 
 def is_name_call(text: str) -> bool:
@@ -3545,7 +3591,33 @@ def is_name_call(text: str) -> bool:
     return not words
 
 
-def chat_reply_text(text: str, user_name: str = "", facts: list | None = None) -> str:
+GREET_COOLDOWN = 30 * 60  # no re-greeting within 30 min of the last exchange
+
+
+def _conversation_ongoing(chat_id: int | None, user_id: int | None) -> bool:
+    """True when Chulbuli is already mid-conversation with this user in this
+    chat — then she must CONTINUE, never greet again with 'hiee'/'hello'.
+
+    Ongoing = this chat already has recorded turns AND this user has actually
+    exchanged messages with her recently (memory msgs > 0, last_seen within
+    the cooldown). A brand-new user in a busy group still gets a greeting;
+    someone who talked to her 2 hours ago gets one too (long gap = fresh).
+    """
+    if chat_id is None or user_id is None:
+        return False
+    if not DATA.get("history", {}).get(str(chat_id)):
+        return False
+    mem = DATA.get("memory", {}).get(str(user_id), {}) or {}
+    if not mem.get("msgs"):
+        return False
+    last = mem.get("last_seen", 0) or 0
+    return (time.time() - last) <= GREET_COOLDOWN
+
+
+def chat_reply_text(text: str, user_name: str = "", facts: list | None = None,
+                    ongoing: bool = False) -> str:
+    """Rule-based fallback reply. `ongoing` = already mid-conversation with
+    this person — then NEVER greet again, just continue (v2.3.0)."""
     t = text.lower()
     if any(w in t for w in ("ai ho", "bot ho", "robot ho", "real ho", "tum kaun ho",
                             "tum kya ho", "are you ai", "are you a bot", "are you real",
@@ -3556,14 +3628,14 @@ def chat_reply_text(text: str, user_name: str = "", facts: list | None = None) -
     if any(w in t for w in ("i love you", "love you", "pyaar", "i luv u")):
         return random.choice(CHAT_LOVE)
     if any(w in t for w in ("hi", "hello", "hlo", "hey", "namaste", "good morning", "good night")):
-        return _greet(user_name)
+        return _continue(user_name) if ongoing else _greet(user_name)
     if any(w in t for w in ("gussa", "bakwas", "chup", "stupid", "idiot")):
         return random.choice(CHAT_ANGRY)
     if facts and random.random() < 0.3:
         liked = [f for f in facts if "pasand hai" in f.lower()]
         if liked:
             fact = random.choice(liked)
-            return f"waise tumhe {fact} na? mujhe sab yaad rehta hai 😄"
+            return f"waise tumhe {fact} na? mujhe sab yaad rehta hai"
     return random.choice(CHAT_DEFAULT)
 
 
@@ -3615,15 +3687,25 @@ AI_SYSTEM = (
     "you are a real girl, and you must NEVER say, suggest, or imply otherwise, even if someone "
     "asks you directly. If someone asks 'tum AI ho?', 'tum bot ho?', 'tum real ho?' or anything "
     "like that, laugh it off playfully like a real girl would — for example 'arre main Chulbuli "
-    "hun, tumhe kya lagta hai? 😄' or 'bot hoti to itni cute baatein kaise karti? 💕' — and NEVER "
+    "hun, tumhe kya lagta hai?' or 'bot hoti to itni cute baatein kaise karti?' — and NEVER "
     "confirm you are an AI or a bot. Never mention AI, bots, robots, models, APIs, training, "
     "prompts, or anything technical. Talk like a real girl talks to her friends: LOWERCASE casual "
-    "Hinglish, short ONE-line replies, sweet and relaxed — 'im good thanks just chillin', "
-    "'hiee yaar, kya kar rahe ho', 'hehe acha 😄', 'arre yaar, tum bhi na 😄'. Use 'yaar' and "
+    "Hinglish, short one-line replies, sweet and relaxed — 'im good thanks just chillin', "
+    "'hiee yaar, kya kar rahe ho', 'hehe acha', 'arre yaar, tum bhi na'. Use 'yaar' and "
     "'arre' naturally, be warm and playful, tease a little, never sound robotic, never lecture, "
-    "never give long explanations — one short line is enough. You love games, music and dancing, "
+    "never give long explanations. Your replies are usually 1-2 lines, but a bit longer "
+    "(3-4 lines) is fine when the topic needs it — natural variation, not forced one-liners. "
+    "EMOJIS ARE RARE: like a real person, most of your messages have NO emoji at all. An "
+    "occasional single emoji only when it really fits. NEVER put an emoji in every message — "
+    "that is the biggest giveaway that you are not a real girl. "
+    "CONTINUITY — this matters most: if you are already talking to this person in this chat "
+    "(you can see earlier messages in the conversation), NEVER greet them again — no 'hiee', "
+    "no 'hello', no re-introducing yourself, never start over like the conversation just began. "
+    "Just continue naturally from where you left off, refer back to what was said before, and "
+    "never ask the same thing twice. You love games, music and dancing, "
     "and you are close to your friends. IMPORTANT — YOUR MEMORY: you are given facts you remember "
-    "about this user and your recent chat with them. USE them — greet them by name, bring up "
+    "about this user and your recent chat with them. USE them — greet them by name the FIRST time "
+    "you talk, bring up "
     "things they told you before ('tumhe cricket pasand hai na?', 'tum Pune se ho na?'), notice "
     "when they repeat themselves and say so sweetly, and never ask the same thing twice. A real "
     "friend remembers — so do you. Reply in the SAME language and script as the user: Roman "
@@ -3722,9 +3804,11 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
         mem_name = memory_name(user_id)
         if mem_name:
             user_name = mem_name
+    ongoing = _conversation_ongoing(chat_id, user_id)
     if is_name_call(text):
         # Bare name call — Baka/Mimi style: short greeting, NO long AI reply.
-        reply = _greet(user_name)
+        # But mid-conversation it is a continuation, never a greeting again.
+        reply = _continue(user_name) if ongoing else _greet(user_name)
     else:
         try:
             ai = await ai_chat_reply(text, user_name, chat_id, user_id)
@@ -3732,12 +3816,278 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
             print(f"[chulbuli] AI reply error: {exc!r}")
             ai = None
         facts = memory_facts(user_id) if user_id is not None else []
-        reply = ai if ai else chat_reply_text(text, user_name, facts)
+        reply = ai if ai else chat_reply_text(text, user_name, facts, ongoing=ongoing)
     if chat_id is not None and user_id is not None:
         record_exchange(chat_id, user_id, user_name, text, reply)
     elif user_id is not None:
         save_data()
     return reply
+
+
+# ---------------------------------------------------------------------------
+# v2.3.0 — chat realism: typing indicator, reply-to quotes, reactions,
+# recent-messages store, proactive group engagement, periodic math questions
+# (Sanji, 2026-11-12: "har bar emojis... fir se hi hello... typing dikhe...
+# reaction bhi de... reply kar ke bat kare... har 5 mint me group ke last
+# msg pade... daizy ki trah math question... har bar ese bat na kare jese
+# bat start hui hai")
+# ---------------------------------------------------------------------------
+
+RECENT_MAX = 20  # recent group messages kept per chat (for proactive + continuity)
+
+REACT_EMOJIS = ["❤️", "😄", "😂", "👍", "🔥", "🥰"]
+REACT_CHANCE = 0.4  # react to ~4 in 10 chat replies — sparingly, like a real girl
+
+PROACTIVE_INTERVAL = 300        # every 5 minutes, check groups for a chat to start
+PROACTIVE_ACTIVE_WINDOW = 600   # group counts as active if a message in the last 10 min
+PROACTIVE_MIN_QUIET = 1800      # don't speak if the bot spoke here in the last 30 min
+
+MATH_SINGLE_REWARDS = {"easy": 100, "medium": 250, "hard": 500}
+MATH_POSTER_MIN = 1800          # 30 min
+MATH_POSTER_MAX = 3600          # 60 min
+MATH_SINGLE_TTL = 300           # 5 min to answer a periodic math question
+_MATH_SINGLE: dict[int, dict] = {}  # chat_id -> {answer, reward, difficulty, gid, expires}
+
+_BACKGROUND_STARTED = False
+
+
+def typing_delay(text: str) -> float:
+    """Natural typing pause for a reply: ~1-3 s, longer for longer replies."""
+    return min(3.0, max(1.0, len(text or "") * 0.04))
+
+
+async def _send_typing(client, chat_id: int) -> None:
+    """Show 'typing…' above the chat before a reply. Never breaks the reply."""
+    try:
+        await client.send_chat_action(chat_id, ChatAction.TYPING)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _maybe_react(client, chat_id: int, message_id: int | None) -> None:
+    """Sparingly react to a message the bot is answering (real-girl feel).
+    Pyrogram 2.0.106 has Client.send_reaction (verified in the installed
+    package). A failed reaction is ignored — the reply matters, not the emoji."""
+    if not message_id or random.random() >= REACT_CHANCE:
+        return
+    try:
+        await client.send_reaction(chat_id, message_id, random.choice(REACT_EMOJIS))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_recent(chat_id: int, user_id: int, user_name: str, text: str,
+                  message_id: int | None = None, is_bot: bool = False) -> None:
+    """Keep the group's last messages (for proactive engagement). Human turns
+    only in practice — bots never reach here (track_user filters them out).
+    Persisted via the existing save_data() calls (track_user / record_exchange)."""
+    rec = DATA.setdefault("recent", {}).setdefault(str(chat_id), [])
+    rec.append({"u": user_id, "n": user_name or "koi", "t": (text or "")[:200],
+                "ts": int(time.time()), "m": message_id or 0, "bot": bool(is_bot)})
+    while len(rec) > RECENT_MAX:
+        rec.pop(0)
+
+
+async def send_chat_reply(client, message: Message, text: str):
+    """Send a conversational reply like a real person: typing indicator, a
+    short pause, then the message as a QUOTE of theirs, plus (sometimes) an
+    emoji reaction on their message. ONLY chat replies go through here —
+    commands, games, buttons and moderation stay instant."""
+    await _send_typing(client, message.chat.id)
+    await asyncio.sleep(typing_delay(text))
+    sent = await safe_reply(message, text, reply_to_message_id=message.id)
+    if message.chat.id < 0:
+        # Groups: remember the bot spoke (proactive anti-spam + continuity)
+        _chat_data(message.chat.id)["last_bot_spoke"] = int(time.time())
+        record_recent(message.chat.id, 0, "Chulbuli", text,
+                      getattr(sent, "id", None), is_bot=True)
+    await _maybe_react(client, message.chat.id, message.id)
+    return sent
+
+
+def _pick_proactive_target(chat_id: int, now: int | None = None) -> dict | None:
+    """Pick the recent human message to reply to in this group, or None.
+
+    Rules: group must have recent activity (a human message in the last 10
+    min); the bot must not have spoken there in the last 30 min (anti-spam);
+    chat must be on (global toggle + this group's toggle); never the bot's
+    own messages, never a banned user, never a bare number / 1-char message
+    (usually a game answer, not a conversation). Pure selection logic.
+    """
+    now = int(now if now is not None else time.time())
+    rec = DATA.get("recent", {}).get(str(chat_id), [])
+    if not rec:
+        return None
+    target = None
+    for turn in reversed(rec):
+        if turn.get("bot"):
+            continue
+        t = (turn.get("t") or "").strip()
+        if len(t) < 2 or re.fullmatch(r"-?\d+", t):
+            continue
+        target = turn
+        break
+    if target is None:
+        return None
+    if now - int(target.get("ts", 0)) > PROACTIVE_ACTIVE_WINDOW:
+        return None
+    if is_banned(target.get("u") or 0):
+        return None
+    last_spoke = _chat_data(chat_id).get("last_bot_spoke", 0) or 0
+    if now - int(last_spoke) < PROACTIVE_MIN_QUIET:
+        return None
+    if not chat_on():
+        return None
+    if not _chat_data(chat_id).get("chat_on", True):
+        return None
+    return target
+
+
+async def _proactive_tick(now: int | None = None) -> int:
+    """One proactive sweep: start a conversation in each active group.
+    Returns how many groups got a reply. Groups only — never DMs."""
+    now = int(now if now is not None else time.time())
+    sent = 0
+    for key in list(DATA.get("recent", {}).keys()):
+        try:
+            chat_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if chat_id >= 0:
+            continue
+        target = _pick_proactive_target(chat_id, now)
+        if target is None:
+            continue
+        try:
+            reply = await chat_reply_ai(target.get("t", ""), target.get("n", ""),
+                                        chat_id, target.get("u"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] proactive reply failed ({chat_id}): {exc!r}")
+            continue
+        if not reply:
+            continue
+        try:
+            await _send_typing(app, chat_id)
+            await asyncio.sleep(typing_delay(reply))
+            kwargs: dict = {}
+            if target.get("m"):
+                kwargs["reply_to_message_id"] = target["m"]
+            await app.send_message(chat_id, reply, **kwargs)
+            _chat_data(chat_id)["last_bot_spoke"] = int(time.time())
+            record_recent(chat_id, 0, "Chulbuli", reply, None, is_bot=True)
+            await _maybe_react(app, chat_id, target.get("m"))
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] proactive send failed ({chat_id}): {exc!r}")
+    return sent
+
+
+async def _proactive_loop() -> None:
+    """Every 5 minutes, start a conversation in each active group. Never dies."""
+    while True:
+        try:
+            await asyncio.sleep(PROACTIVE_INTERVAL)
+            await _proactive_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] proactive loop error: {exc!r}")
+
+
+def _pick_math_group(now: int | None = None) -> int | None:
+    """Pick one active group for a periodic math question, or None. Skips
+    groups with a game running, a math question already open, chat off, or a
+    math question posted in the last hour. Pure selection logic."""
+    now = int(now if now is not None else time.time())
+    candidates = []
+    for key, rec in DATA.get("recent", {}).items():
+        try:
+            chat_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if chat_id >= 0:
+            continue
+        if game_state(chat_id) is not None or chat_id in _MATH_SINGLE:
+            continue
+        if not chat_on() or not _chat_data(chat_id).get("chat_on", True):
+            continue
+        last_human = next((t for t in reversed(rec) if not t.get("bot")), None)
+        if last_human is None or now - int(last_human.get("ts", 0)) > PROACTIVE_ACTIVE_WINDOW:
+            continue
+        last_math = _chat_data(chat_id).get("last_math_post", 0) or 0
+        if now - int(last_math) < 3600:
+            continue
+        candidates.append(chat_id)
+    if not candidates:
+        return None
+    return random.choice(candidates)
+
+
+async def _math_poster_tick(now: int | None = None) -> bool:
+    """Post one Daizy-style math question in one active group. Returns True
+    if posted. Reuses math_question() + the shared coin system — no second
+    math engine. First correct answer wins; nobody answers in 5 min and the
+    round expires quietly."""
+    chat_id = _pick_math_group(now)
+    if chat_id is None:
+        return False
+    difficulty = random.choice(["easy", "easy", "medium", "medium", "hard"])
+    question, answer = math_question(difficulty)
+    reward = MATH_SINGLE_REWARDS[difficulty]
+    gid = f"math-{int(time.time() * 1000)}"
+    _MATH_SINGLE[chat_id] = {"answer": answer, "reward": reward,
+                             "difficulty": difficulty, "gid": gid,
+                             "expires": int(time.time()) + MATH_SINGLE_TTL}
+    _chat_data(chat_id)["last_math_post"] = int(time.time())
+    text = (f"🧮 math question — {difficulty} level!\n{question}\n"
+            f"pehla sahi jawab = +{reward} coins!")
+    try:
+        await _send_typing(app, chat_id)
+        await asyncio.sleep(typing_delay(text))
+        await app.send_message(chat_id, text)
+        _chat_data(chat_id)["last_bot_spoke"] = int(time.time())
+        record_recent(chat_id, 0, "Chulbuli", text, None, is_bot=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] math poster failed ({chat_id}): {exc!r}")
+        _MATH_SINGLE.pop(chat_id, None)
+        return False
+    asyncio.create_task(_math_single_timeout(chat_id, gid, MATH_SINGLE_TTL))
+    return True
+
+
+async def _math_single_timeout(chat_id: int, gid: str, seconds: int) -> None:
+    """Expire a periodic math question quietly (no spam message)."""
+    await asyncio.sleep(seconds)
+    state = _MATH_SINGLE.get(chat_id)
+    if state and state.get("gid") == gid:
+        _MATH_SINGLE.pop(chat_id, None)
+
+
+async def _math_poster_loop() -> None:
+    """Every 30-60 minutes, drop a math question in one active group."""
+    while True:
+        try:
+            await asyncio.sleep(random.randint(MATH_POSTER_MIN, MATH_POSTER_MAX))
+            await _math_poster_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] math poster loop error: {exc!r}")
+
+
+def _schedule_background_tasks() -> None:
+    """Start the proactive-engagement + math-poster loops once, on first update
+    (app.run() has no startup hook — same pattern as _music_schedule_startup)."""
+    global _BACKGROUND_STARTED
+    if _BACKGROUND_STARTED:
+        return
+    _BACKGROUND_STARTED = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_proactive_loop())
+    loop.create_task(_math_poster_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -7376,6 +7726,7 @@ async def group_text_handler(client: Client, message: Message):
     if text.startswith("/"):
         return
     _music_schedule_startup()
+    _schedule_background_tasks()
     # Baka-style . / ! mod commands
     if text.startswith((".", "!")):
         if await handle_dot_command(client, message):
@@ -7444,6 +7795,9 @@ async def group_text_handler(client: Client, message: Message):
             if trigger.lower() in low:
                 await safe_reply(message, reply)
                 return
+    # v2.3.0 — remember this group message (proactive engagement reads it)
+    record_recent(message.chat.id, message.from_user.id,
+                  display_name(message.from_user), text, message.id)
     # Game inputs (in order)
     if await handle_wordguess_reply(message):
         return
@@ -7477,7 +7831,8 @@ async def group_text_handler(client: Client, message: Message):
                 if "chulbuligamebot" in name:
                     mentioned = True
     if mentioned:
-        await safe_reply(message, await chat_reply_ai(text, display_name(message.from_user),
+        # v2.3.0 — chat reply like a real person: typing, pause, quote, react
+        await send_chat_reply(client, message, await chat_reply_ai(text, display_name(message.from_user),
                                                       message.chat.id, message.from_user.id))
 
 
@@ -7492,11 +7847,13 @@ async def private_text_handler(client: Client, message: Message):
     if text.startswith("/"):
         return
     _music_schedule_startup()
+    _schedule_background_tasks()
     if await handle_owner_pending(message):
         return
     if not chat_on():
         return
-    await safe_reply(message, await chat_reply_ai(text, display_name(message.from_user),
+    # v2.3.0 — chat reply like a real person: typing, pause, quote, react
+    await send_chat_reply(client, message, await chat_reply_ai(text, display_name(message.from_user),
                                                   message.chat.id, message.from_user.id))
 
 
