@@ -70,7 +70,7 @@ try:
 except Exception:  # noqa: BLE001
     _imageio_ffmpeg = None
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3151,6 +3151,51 @@ def music_player_markup() -> InlineKeyboardMarkup:
     ]])
 
 
+# YouTube bot-block markers (lowercased substring match on the yt-dlp error).
+# Live evidence: "Sign in to confirm you're not a bot" (2026-11-12 21:25:46,
+# 21:26:06) and "The page needs to be reloaded." (21:39:51, 21:40:01, 21:40:31).
+_YT_BLOCKED_MARKERS = ("not a bot", "sign in to confirm", "needs to be reloaded")
+
+
+def _is_youtube_blocked(msg: str) -> bool:
+    """True when a yt-dlp error is YouTube blocking us (bot-check / reload)."""
+    low = (msg or "").lower()
+    return any(m in low for m in _YT_BLOCKED_MARKERS)
+
+
+def _yt_extract(src: str):
+    """extract_info with anti-bot player clients + one retry on YouTube errors.
+
+    First attempt uses the mobile Innertube clients (android/ios) + web —
+    they often bypass the YouTube bot-check that blocks plain web requests
+    from datacenter IPs. If that fails with a YouTube block, retry ONCE with
+    the tv/web clients. Raises MusicError (never a raw yt-dlp error) so the
+    /play handler can always reply honestly instead of going silent.
+    Verified against installed yt-dlp 2026.10.26: `extractor_args` is a valid
+    YoutubeDL param ({"youtube": {"player_client": [...]}}), and
+    android/ios/web/tv are valid Innertube client names.
+    """
+    base = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
+            "no_warnings": True, "skip_download": True}
+    client_sets = (["android", "ios", "web"], ["tv", "web"])
+    last = None
+    for attempt, clients in enumerate(client_sets):
+        opts = dict(base)
+        opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+        try:
+            with _yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(src, download=False)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt == 0 and _is_youtube_blocked(str(exc)):
+                continue  # retry once with the alternate player clients
+            break
+    msg = str(last) if last is not None else ""
+    if _is_youtube_blocked(msg):
+        raise MusicError("youtube_blocked")
+    raise MusicError(f"search failed: {msg[:120]}")
+
+
 def resolve_track(query: str) -> dict:
     """YouTube search (or direct link) -> track dict. Raises MusicError."""
     if _yt_dlp is None:
@@ -3159,19 +3204,7 @@ def resolve_track(query: str) -> dict:
     if not q:
         raise MusicError("empty query")
     src = q if q.startswith(("http://", "https://")) else f"ytsearch1:{q}"
-    opts = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
-            "no_warnings": True, "skip_download": True}
-    try:
-        with _yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(src, download=False)
-    except Exception as exc:  # noqa: BLE001 - yt-dlp DownloadError (e.g. YouTube bot-check)
-        # NEVER let a search failure escape raw: the /play handler only knows
-        # MusicError, and an uncaught DownloadError used to kill the handler
-        # so the user got NO reply at all (live bug, 2026-11-12).
-        msg = str(exc)
-        if "confirm you're not a bot" in msg or "Sign in to confirm" in msg:
-            raise MusicError("youtube_blocked")
-        raise MusicError(f"search failed: {msg[:120]}")
+    info = _yt_extract(src)
     if not info:
         raise MusicError("not found")
     if "entries" in info:
@@ -3688,18 +3721,35 @@ async def welcome_new(client: Client, message: Message):
 # replies with an error message to users.
 # ---------------------------------------------------------------------------
 AI_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Chat models first (natural chat), the code model LAST as a fallback.
-# llama-3.1-8b was the live fallback before; cohere/north-mini-code:free was
-# VERIFIED live 2026-11-12 (needs max_tokens 800 — it spends tokens on a
-# reasoning field first). Each model is tried in order, then we fall back
-# to rule-based replies. NOTE: this order is NOT live-tested yet (no
-# OpenRouter key in this environment) — the fallback chain makes it safe,
-# and Sanji will live-test chat after deploy.
+# Chat models first (natural chat), the code model + rate-limited gemma-4
+# models late, openrouter/free LAST as an auto-route fallback.
+# 2026-11-12 live logs proved the old list dead: llama-3.1-8b-instruct:free,
+# qwen-2.5-7b-instruct:free and gemma-3-4b-it:free all 404'd, and
+# cohere/north-mini-code:free 429'd (21:44:31 IST) — verified against the
+# LIVE OpenRouter free list (2026-11-12 ~21:53 IST): the three 404 models are
+# no longer listed as free at all. This list is drawn ONLY from models that
+# were listed free at that check (Lyria music models and the huge
+# nemotron-3-ultra-550b excluded — not chat / too big). Small/fast
+# non-reasoning chat models first; reasoning models (ernie-5.5-flash,
+# nemotron-3-nano-omni, lfm-2.5) after them — they returned reasoning-only /
+# empty content in an earlier test with low max_tokens, so max_tokens stays
+# 800. NOTE: this order is NOT live-tested (no OpenRouter key in this
+# environment) — the live deploy's logs will prove which models work, and
+# the silent rule-based fallback covers all failures.
 AI_MODELS = [
-    "meta-llama/llama-3.1-8b-instruct:free",
-    "qwen/qwen-2.5-7b-instruct:free",
-    "google/gemma-3-4b-it:free",
+    "liquid/lfm-3-1.7b:free",
+    "thinkingmachines/inkling-2-small:free",
+    "recursive/flint-v1.0:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "dots-studio/dots-3-note-preview:free",
+    "liquid/lfm-2.5-2.6b:free",
+    "baidu/ernie-5.5-flash-preview:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "cohere/north-mini-code:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "google/gemma-4-31b-it:free",
+    "openrouter/free",
 ]
 AI_SYSTEM = (
     "You are Chulbuli, a real sweet desi girl chatting on Telegram — playful, warm, "

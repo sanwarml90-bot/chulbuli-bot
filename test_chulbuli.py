@@ -994,11 +994,45 @@ async def main():
 
     # ================= v2.2.0: AI model order + memory, music, gap features ====
     # ---- AI: chat model first, code model last; persona + memory ----
-    check("ai first is chat model", B.AI_MODELS[0] == "meta-llama/llama-3.1-8b-instruct:free",
+    # v2.3.2: old llama/qwen/gemma-3 models 404'd on live logs (2026-11-12) —
+    # the list is now drawn only from the live OpenRouter free list.
+    check("ai first is chat model", B.AI_MODELS[0] == "liquid/lfm-3-1.7b:free",
           str(B.AI_MODELS))
-    check("ai code model last", B.AI_MODELS[-1] == "cohere/north-mini-code:free",
+    check("ai no dead models", not any(m in B.AI_MODELS for m in (
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "qwen/qwen-2.5-7b-instruct:free",
+        "google/gemma-3-4b-it:free")), str(B.AI_MODELS))
+    _live_free = {
+        "baidu/ernie-5.5-flash-preview:free",
+        "thinkingmachines/inkling-2-small:free",
+        "liquid/lfm-3-1.7b:free", "recursive/flint-v1.0:free",
+        "nvidia/nemotron-3.5-super-vl:free",
+        "dots-studio/dots-3-note-preview:free",
+        "liquid/lfm-2.5-2.6b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "cohere/north-mini-code:free",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "google/gemma-4-31b-it:free",
+        "openrouter/free",
+    }
+    check("ai models from live free list", all(m in _live_free for m in B.AI_MODELS),
           str(B.AI_MODELS))
-    check("ai all models free", all(m.endswith(":free") for m in B.AI_MODELS))
+    check("ai code model late", "cohere/north-mini-code:free" in B.AI_MODELS[-4:],
+          str(B.AI_MODELS))
+    check("ai openrouter fallback last", B.AI_MODELS[-1] == "openrouter/free",
+          str(B.AI_MODELS))
+    check("ai all models free", all(m.endswith(":free") or m == "openrouter/free"
+                                     for m in B.AI_MODELS))
+    # fallback chain intact: with no key, ai_chat_reply returns None (the
+    # rule-based persona answers instead — never silence, never an error)
+    _saved_key = os.environ.pop("OPENROUTER_API_KEY", None)
+    try:
+        _no_key = await B.ai_chat_reply("hello", "Tester")
+        check("ai no key returns none", _no_key is None, str(_no_key))
+    finally:
+        if _saved_key is not None:
+            os.environ["OPENROUTER_API_KEY"] = _saved_key
     check("ai system girl persona", "sweet desi girl" in B.AI_SYSTEM
           and "yaar" in B.AI_SYSTEM and "arre" in B.AI_SYSTEM, "")
     check("ai system memory use", "MEMORY" in B.AI_SYSTEM and "remember" in B.AI_SYSTEM.lower()
@@ -1784,6 +1818,100 @@ async def main():
     await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
     check("play generic failure replies", len(FakeMessage.outbox) > 0,
           str([t for _, t in FakeMessage.outbox]))
+    B._yt_dlp = _saved_ydl
+
+    # ---- v2.3.2: YouTube anti-bot clients + retry, reload classified ----
+    # "The page needs to be reloaded." (live logs 21:39:51/21:40:01/21:40:31)
+    # is a YouTube block too, not "song not found".
+    check("play blocked marker live errors",
+          B._is_youtube_blocked("ERROR: [youtube] nYxC9j1BnRw: Sign in to confirm you're not a bot")
+          and B._is_youtube_blocked("ERROR: [youtube] abc123: The page needs to be reloaded.")
+          and B._is_youtube_blocked("Sign in to confirm you're not a bot")
+          and not B._is_youtube_blocked("some random yt-dlp failure"))
+
+    class _ReloadYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            raise Exception("ERROR: [youtube] abc123: The page needs to be reloaded.")
+
+    _saved_ydl = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _ReloadYDL})
+    try:
+        B.resolve_track("test gaana")
+        check("play reload classified blocked", False, "resolve_track did not raise")
+    except B.MusicError as _e:
+        check("play reload classified blocked", str(_e) == "youtube_blocked", str(_e))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100501))
+    check("play reload replies honestly", any("youtube" in t and "block" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+
+    # first attempt uses the mobile player clients; a YouTube block retries
+    # once with the tv/web clients; a generic failure does NOT retry.
+    class _RetryYDL:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            if len(type(self).calls) == 1:
+                raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+            return {"title": "Retry Gaana", "webpage_url": "https://youtube.com/watch?v=retry",
+                    "url": "https://audio.example/retry.m4a", "duration": 180}
+
+    _RetryYDL.calls.clear()
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _RetryYDL})
+    _retry_track = B.resolve_track("retry gaana")
+    check("play retry succeeds", _retry_track["title"] == "Retry Gaana", str(_retry_track))
+    check("play retry two attempts", len(_RetryYDL.calls) == 2, str(len(_RetryYDL.calls)))
+    check("play first attempt mobile clients",
+          _RetryYDL.calls[0].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["android", "ios", "web"], str(_RetryYDL.calls[0].get("extractor_args")))
+    check("play retry alternate clients",
+          _RetryYDL.calls[1].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["tv", "web"], str(_RetryYDL.calls[1].get("extractor_args")))
+
+    class _GenericYDL:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            raise Exception("some random yt-dlp failure")
+
+    _GenericYDL.calls.clear()
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _GenericYDL})
+    try:
+        B.resolve_track("test gaana")
+        check("play generic failure raises", False, "resolve_track did not raise")
+    except B.MusicError as _e:
+        check("play generic failure raises", str(_e).startswith("search failed"), str(_e))
+    check("play generic failure no retry", len(_GenericYDL.calls) == 1,
+          str(len(_GenericYDL.calls)))
     B._yt_dlp = _saved_ydl
 
     # ---- v2.3.1: /promote uses ChatPrivileges (real Pyrogram API) ----
