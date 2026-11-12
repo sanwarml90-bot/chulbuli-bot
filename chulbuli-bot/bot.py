@@ -57,20 +57,23 @@ except Exception:  # noqa: BLE001
 # Python it is usually absent — the module then degrades honestly).
 try:
     import yt_dlp as _yt_dlp
-except Exception:  # noqa: BLE001
+except Exception as exc:  # noqa: BLE001
+    print(f"[chulbuli] music: yt-dlp import failed: {exc!r}")
     _yt_dlp = None
 try:
     from pytgcalls import PyTgCalls as _PyTgCalls
     from pytgcalls.types.input_stream import AudioPiped as _AudioPiped
-except Exception:  # noqa: BLE001
+except Exception as exc:  # noqa: BLE001
+    print(f"[chulbuli] music: pytgcalls import failed: {exc!r}")
     _PyTgCalls = None
     _AudioPiped = None
 try:
     import imageio_ffmpeg as _imageio_ffmpeg
-except Exception:  # noqa: BLE001
+except Exception as exc:  # noqa: BLE001
+    print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3082,6 +3085,32 @@ def music_ffmpeg_setup() -> str | None:
     return None
 
 
+def voice_unavailable_reason() -> str:
+    """Short reason the voice stack cannot run — for the logs only.
+
+    Never includes the session string, only whether it is set.
+    """
+    if _PyTgCalls is None:
+        return "pytgcalls missing"
+    if not ASSISTANT_SESSION:
+        return "ASSISTANT_SESSION missing"
+    return "voice ok"
+
+
+def print_startup_diagnostics() -> None:
+    """One-time startup status for the Railway logs: the Python the bot
+    is actually running on, and which voice pieces are present.
+
+    NEVER prints the session string itself — only whether it is set.
+    Called once from __main__ right after the starting line.
+    """
+    ffmpeg = music_ffmpeg_setup()
+    print(f"[chulbuli] python: {sys.version.split()[0]} ({sys.platform})")
+    print(f"[chulbuli] voice: pytgcalls={_PyTgCalls is not None} "
+          f"session={'set' if ASSISTANT_SESSION else 'MISSING'} "
+          f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'}")
+
+
 def fmt_duration(sec: int) -> str:
     sec = int(sec or 0)
     mins, secs = divmod(sec, 60)
@@ -3237,6 +3266,7 @@ async def _music_ensure_assistant() -> bool:
     if _ASSISTANT["started"]:
         return True
     if not ASSISTANT_SESSION:
+        print("[chulbuli] music: ASSISTANT_SESSION missing — voice disabled")
         return False
     if _PyTgCalls is None:
         print("[chulbuli] music: pytgcalls not installed — voice disabled")
@@ -3258,8 +3288,8 @@ async def _music_ensure_assistant() -> bool:
                         await _music_play_next(update.chat_id)
                     except Exception as exc:  # noqa: BLE001
                         print(f"[chulbuli] music stream-end error: {exc!r}")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                print(f"[chulbuli] music stream-end hook failed: {exc!r}")
             await calls.start()
             _ASSISTANT.update({"client": user_client, "calls": calls,
                                "started": True, "me": me})
@@ -3487,6 +3517,7 @@ async def cmd_music(client: Client, message: Message):
     track["by"] = display_name(message.from_user)
     track["by_id"] = message.from_user.id
     if not music_voice_available():
+        print(f"[chulbuli] /play voice unavailable: {voice_unavailable_reason()}")
         await safe_reply(
             message,
             f"🎵 **{track['title']}** mil gaya! par voice assistant abhi connect nahi hai, "
@@ -8016,4 +8047,5 @@ if __name__ == "__main__":
         print("ERROR: BOT_TOKEN, API_ID and API_HASH env vars are required.")
         raise SystemExit(1)
     print(f"[chulbuli] starting v{VERSION} — owner {OWNER_ID}")
+    print_startup_diagnostics()
     app.run()

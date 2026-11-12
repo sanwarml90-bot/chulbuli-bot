@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -1230,6 +1232,120 @@ async def main():
     B._PyTgCalls = _real_calls
     B._AudioPiped = _real_piped
     B._music_make_client = _real_mkc
+    B.ASSISTANT_SESSION = _real_session
+    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+
+    # ---- v2.3.3: voice-stack diagnostics (logs must show WHY /play fails) ----
+    # Live report (2026-11-12 ~22:04 IST): /play found the song but said the
+    # voice assistant is not connected — and the logs said nothing about why.
+    # voice_unavailable_reason: which piece is missing, never the session value
+    _real_calls = B._PyTgCalls
+    _real_session = B.ASSISTANT_SESSION
+    B._PyTgCalls = None
+    B.ASSISTANT_SESSION = ""
+    check("voice reason pytgcalls missing", B.voice_unavailable_reason() == "pytgcalls missing",
+          B.voice_unavailable_reason())
+
+    class _FakeCalls2:
+        def __init__(self, user_client):
+            self.user_client = user_client
+
+        async def start(self):
+            return True
+
+        def on_stream_end(self):
+            def deco(fn):
+                return fn
+            return deco
+
+    B._PyTgCalls = _FakeCalls2
+    check("voice reason session missing", B.voice_unavailable_reason() == "ASSISTANT_SESSION missing",
+          B.voice_unavailable_reason())
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    check("voice reason ok", B.voice_unavailable_reason() == "voice ok" and B.music_voice_available() is True)
+    # startup diagnostics: format + session value redacted
+    _saved_path = os.environ.get("PATH", "")
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        B.print_startup_diagnostics()
+    _diag = _buf.getvalue()
+    os.environ["PATH"] = _saved_path
+    check("startup diagnostics python", f"[chulbuli] python: {sys.version.split()[0]}" in _diag, _diag)
+    check("startup diagnostics voice line",
+          "[chulbuli] voice: pytgcalls=True session=set yt_dlp=True ffmpeg=" in _diag, _diag)
+    B.ASSISTANT_SESSION = "SECRET-SESSION-VALUE-123"
+    _buf2 = io.StringIO()
+    with contextlib.redirect_stdout(_buf2):
+        B.print_startup_diagnostics()
+    _diag2 = _buf2.getvalue()
+    os.environ["PATH"] = _saved_path
+    check("startup diagnostics redacts session", "SECRET-SESSION-VALUE-123" not in _diag2
+          and "session=set" in _diag2, _diag2)
+    B.ASSISTANT_SESSION = ""
+    # /play with no voice stack logs the exact reason (reply stays honest)
+    B._PyTgCalls = None
+    B._yt_dlp = _FakeYtDlp
+    FakeMessage.outbox.clear()
+    _buf3 = io.StringIO()
+    with contextlib.redirect_stdout(_buf3):
+        await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100505))
+    check("play voice unavailable logged", "/play voice unavailable: pytgcalls missing" in _buf3.getvalue(),
+          _buf3.getvalue())
+    check("play voice unavailable honest reply", any("connect nahi" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    B._yt_dlp = _real_ytdlp
+    # _music_ensure_assistant: every failure path prints the real reason
+    B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": True})
+    _buf4 = io.StringIO()
+    with contextlib.redirect_stdout(_buf4):
+        _r = await B._music_ensure_assistant()
+    check("ensure assistant no session logs", _r is False and "ASSISTANT_SESSION missing" in _buf4.getvalue(),
+          _buf4.getvalue())
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    _buf5 = io.StringIO()
+    with contextlib.redirect_stdout(_buf5):
+        _r = await B._music_ensure_assistant()
+    check("ensure assistant no pytgcalls logs", _r is False and "pytgcalls not installed" in _buf5.getvalue(),
+          _buf5.getvalue())
+
+    class _BoomClient:
+        async def start(self):
+            raise RuntimeError("boom-start")
+
+        async def get_me(self):
+            raise RuntimeError("should not reach get_me")
+
+    _real_mkc = B._music_make_client
+    B._PyTgCalls = _FakeCalls2
+    B._music_make_client = lambda: _BoomClient()
+    _buf6 = io.StringIO()
+    with contextlib.redirect_stdout(_buf6):
+        _r = await B._music_ensure_assistant()
+    os.environ["PATH"] = _saved_path
+    check("ensure assistant start failure logs", _r is False and "boom-start" in _buf6.getvalue(),
+          _buf6.getvalue())
+    B._music_make_client = _real_mkc
+    # import-failure prints: real import blocks, shadowed modules, subprocess
+    _shadow = tempfile.mkdtemp(prefix="chulbuli-import-shadow-")
+    for _mod, _marker in (("yt_dlp", "boom-yt"), ("pytgcalls", "boom-calls"),
+                          ("imageio_ffmpeg", "boom-ff")):
+        with open(os.path.join(_shadow, _mod + ".py"), "w") as _f:
+            _f.write(f"raise ImportError('{_marker}')\n")
+    _env = dict(os.environ)
+    _env["PYTHONPATH"] = _shadow + os.pathsep + _env.get("PYTHONPATH", "")
+    _botdir = os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot")
+    _res = subprocess.run([sys.executable, "-c", "import bot"], cwd=_botdir, env=_env,
+                          capture_output=True, text=True, timeout=120)
+    _imp_out = _res.stdout
+    check("import failure print yt-dlp", "yt-dlp import failed" in _imp_out and "boom-yt" in _imp_out,
+          _imp_out[:500])
+    check("import failure print pytgcalls", "pytgcalls import failed" in _imp_out and "boom-calls" in _imp_out,
+          _imp_out[:500])
+    check("import failure print ffmpeg", "imageio-ffmpeg import failed" in _imp_out and "boom-ff" in _imp_out,
+          _imp_out[:500])
+    # restore music state
+    B._PyTgCalls = _real_calls
     B.ASSISTANT_SESSION = _real_session
     B._ASSISTANT.update({"client": None, "calls": None, "started": False, "me": None, "init_started": False})
     B.MUSIC.clear()
