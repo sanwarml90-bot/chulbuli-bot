@@ -1,3 +1,10 @@
 pyrogram==2.0.106
 tgcrypto
 chess==1.11.2
+yt-dlp
+imageio-ffmpeg
+# Voice streaming needs PyTgCalls, but its native dep `tgcalls==2.0.0` ships
+# Linux wheels only for Python <= 3.9, and the bot needs Python >= 3.10 —
+# so it is installed only where it can actually work. On modern Python the
+# line is skipped and the music module degrades honestly (no fake playback).
+pytgcalls==2.1.0; python_version < "3.10"
