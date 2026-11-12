@@ -31,6 +31,15 @@ exists in several bots is built ONCE as one shared implementation:
 | Message counter (/toprank) | ChatFight |
 | Owner panel (/owner) | new — Sanji's requirement |
 | Music (/play) | VC music — honest placeholder: voice-chat music needs a userbot assistant, not faked |
+| AI chat (OpenRouter, fallback to rule-based) | Nova-style AI chat, merged into the Hinglish persona |
+| UNO | Nova |
+| Chess (+ Elo) | Nova |
+| Mines / Tap / Crash | Nova |
+| Jumble / Charades / Scribble | Nova |
+| Bingo / Xoxo | Mimi |
+| Mafia lobby + roles | True Mafia |
+| Hack / Bomb / Roulette / Bluff | Baka, Nova |
+| Subway | Nova |
 
 NOT copied: moonlight protection (group's own GroupHelp clone) and
 @Vcttsrobot (Sanji's own TTS bot).
@@ -42,19 +51,22 @@ pip install -r requirements.txt
 BOT_TOKEN=... API_ID=... API_HASH=... python bot.py
 ```
 
-Env vars: `BOT_TOKEN`, `API_ID`, `API_HASH`, `OWNER_ID` (default 7966027018).
+Env vars: `BOT_TOKEN`, `API_ID`, `API_HASH`, `OWNER_ID` (default 7966027018),
+`OPENROUTER_API_KEY` (optional — enables AI chat; when missing, the bot
+silently falls back to the rule-based Hinglish persona).
 Persistence: `data.json` next to `bot.py` (best-effort — the bot-runner wipes
 the bot dir on every restart, so data is not guaranteed across restarts).
 
-## Phase 1 (this version)
+## Phase 1 (v1.0.0)
 
 Economy, actions, powers, Word Guess (spec-exact), Word Grid, Wordchain,
 RPS, Cricket, Math Rush, BBet, Card, Number guess, romance, moderation,
 link filter + blacklist, tagger, counter, chat persona, owner panel
 (stats / users / groups / toggles / broadcast / status+restart).
 
-## Phase 2 (planned)
+## Phase 2 (v2.0.0 — this version)
 
-UNO, Chess, Mines, Tap, Crash, Jumble, Charades, Bingo, Xoxo, Mafia lobby,
-Hack, Bomb, Roulette, Bluff, Subway, Scribble. `/help` already says they are
-coming — do not list them as working before they exist.
+AI chat (OpenRouter, silent fallback) + all remaining games: UNO, Chess
+(+ Elo), Mines, Tap, Crash, Jumble, Charades, Bingo, Xoxo, Mafia lobby,
+Hack, Bomb, Roulette, Bluff, Subway, Scribble. `/help` lists them as live.
+`safe_reply()` now logs reply errors instead of swallowing them silently.
