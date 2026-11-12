@@ -24,7 +24,9 @@ Live test sirf Sanji ke phone se (browser se Telegram send nahi hota).
 - [ ] Galat naam nahi banta ("main doctor hun" / "main thik hun" → naam NAHI)
 - [ ] /yaad → apni yaadein dikhti hain (DM + group dono me)
 - [ ] /bhool → facts + naam delete, coins/economy SAFE rehte hain
-- [ ] History: last 20 turns per chat; AI ko last 10 turns + facts milte hain
+- [ ] History: last 20 turns per chat; AI ko last 15 turns + facts milte hain (facts payload me SABSE PEHLE)
+- [ ] AI models (v2.2.0): llama-3.1-8b-instruct:free pehle, phir qwen-2.5-7b, gemma-3-4b, cohere/north-mini-code:free LAST (code model chat ke liye nahi)
+- [ ] AI persona: real sweet desi girl — "yaar"/"arre", chhote sweet replies, yaadein wapas laati hai, kabhi robotic nahi, kabhi AI/bot nahi kehti
 - [ ] Facts 30 se zyada nahi; purane facts pehle delete hote hain
 
 ## 3. Economy
@@ -67,8 +69,19 @@ Live test sirf Sanji ke phone se (browser se Telegram send nahi hota).
 
 ## 8. Moderation (admins only)
 - [ ] /warn / /unwarn / /mute / /unmute / /ban / /unban / /kick / /pin / /unpin / /purge
+- [ ] /warns → warn count (1/3, 2/3); 3 warns = auto-restrict
+- [ ] /promote / /demote / /title → admin banao/hatao, custom title
+- [ ] Baka-style dot commands: .warn .promote .demote .title .d (replied message delete) — "/" jaisa hi kaam
+- [ ] /addsudo / /delsudo / /sudolist (owner only) — sudo users; /auth / /unauth / /authlist
 - [ ] /utag / /atag → mass ping (admin only); /reload
 - [ ] /nolinks → link filter on/off; blacklist words delete hote hain
+- [ ] /rules / /setrules; /note / /get / /notes / /delnote; /report → admins ko tag; /runs; /limits
+- [ ] /approve / /unapprove → approved user pe filters nahi lagte (BUG FIX v2.2.0: pehle str/int mismatch se bypass kabhi kaam nahi karta tha)
+- [ ] /filter / /filters / /stopfilter → trigger word par auto-reply
+- [ ] /antiflood → 3 msgs / 20s se zyada par delete + warning
+- [ ] /profanity → gaali wale messages delete; /blacklist_add / /blacklist_remove / /blacklist_clear
+- [ ] /whitelist_add / /whitelist_remove / /whitelist_clear → whitelisted domain ka link pass hota hai
+- [ ] /noforwards → forwarded messages delete; /antispam → naye members (<10 min) links nahi bhej sakte
 - [ ] /info / /id → user/group info; /staff → staff list
 
 ## 9. Owner Panel (/owner — sirf Sanji, ID 7966027018)
@@ -96,7 +109,35 @@ Live test sirf Sanji ke phone se (browser se Telegram send nahi hota).
 - [ ] Railway chulbuli-bot → nayi deployment ACTIVE, Online, "[chulbuli] starting vX" log, koi ERROR nahi
 - [ ] Live /start Sanji ke phone se (browser se test nahi hota)
 
+## 13. Music (v2.2.0 — KustMusic parity)
+- [ ] /play <gaana ya link> → YouTube search (yt-dlp), player card: title, duration, requester + Skip/Pause/Resume/Stop buttons
+- [ ] /play jab ASSISTANT_SESSION set nahi hai → imaandaar jawab "music assistant abhi connect nahi hai" — fake playing KABHI nahi
+- [ ] /queue → abhi baj raha + queue list; /skip → agla gaana; /pause / /resume; /stop (alias /end) → VC chhodta hai; /clear → queue saaf; /ping → pong + assistant status
+- [ ] /play DM me → group-only message
+- [ ] /play jab UNO chal raha hai → UNO ka /play chalta hai, music chup rehta hai
+- [ ] Assistant startup par Railway logs me @CBIOFINDIA (id 8617937893) dikhta hai (get_me se)
+- [ ] LIVE voice test — asli group voice chat me, Sanji ke phone se — ABHI BAAKI (blocker: Railway par ASSISTANT_SESSION set karna + real VC test)
+
+## 14. Gap audit v2.2.0 (16 moonlight bots — kya missing tha, kya bana, kya nahi ban sakta)
+Per-bot detail — source: analysis-3-bots.md (live GHOST test 2026-11-12).
+- **Baka @im_bakabot** — economy/powers/games/group-mgmt pehle se tha. v2.2.0 me bana: dot mod commands (.warn .promote .demote .title .d), /warns. Nahi bana: kill/rob ke baad CAPTCHA/human-verify (interactive verify flow — baad me), gems "Premium only" (payment-gated).
+- **Nova @ItzNovaBot** — 17 games, romance, economy pehle se tha. v2.2.0 me bana: /addsudo /delsudo /sudolist, /auth /unauth /authlist, /revealgrid /checkgrid, /leaderboard buttons (eco/chess/subway/grid). Nahi bana: /groupbot on/off per-group activation (Chulbuli me global owner-panel toggles hain, per-group nahi), LUDO (rules observe nahi hue), /ws4 /ws6 (WordSeek-style direct guess — standing rule, nahi banega), /subwaycoins (paise kharch karta hai).
+- **Daizy @GENZ_GAME_BOT** — cricket/RPS/Math/BBet pehle se tha. v2.2.0 me bana: /leaderboard buttons. Nahi bana: group me add karne par free-coins bonus (50k/1L/3L — feasible, baad me), inline RPS (inline mode chahiye — baad me).
+- **Rose @MissRose_bot** — v2.2.0 me bana: /warn /warns, /approve /unapprove, /filter /filters /stopfilter, /note /get /notes /delnote, /rules /setrules, /report, /runs, /id, /info, /limits, /antiflood, link lock (/nolinks). Nahi bana: CAPTCHA (verify flow), Federations (cross-group infra — bada kaam), Connections (DM se group manage), Import/Export, AntiRaid, Log Channels, Languages, Topics, Clean Commands/Service — sab feasible hain, is build me nahi.
+- **Protectron @ProtectronBot** — v2.2.0 me bana: /antispam (naye members ke links), /nolinks, /noforwards, /antiflood (3 msgs/20s), /profanity, /blacklist (+_add/_remove/_clear), /whitelist (+_add/_remove/_clear). NAHI BAN SAKTA: Advanced antispam neural network (ML model — available nahi), /imagefilter porn images (ML image classification — available nahi). Nahi bana (feasible, baad me): /noevents /nobots /nocontacts /nolocations /nohashtags /nocommands (message-type locks).
+- **moonlight protection @itssmoonlight_bot** — COPY NAHI KIYA (group ka apna bot hai — standing rule). /staff Chulbuli me pehle se hai.
+- **Abuse Restrictions @Abuserestrictionbot** — blacklist + profanity filter se cover (abuse words delete, restrict-on-ban-word = /warn flow).
+- **WordSeek @WordSeekBot** — Chulbuli ka Word Guess (Sanji-approved spec: 🟩🟦⬜, 6 guesses, +500, har guess par NAYA board message) hi word-guess game hai. Seedha guess (bina reply) NAHI bana — standing rule (previous attempt refused — do NOT retry).
+- **Word Grid @WordGridRobot** — /wordgrid, /hint, /balance, /end, /new pehle se tha. v2.2.0 me bana: /gridtop, /revealgrid, /checkgrid.
+- **On9 Word Chain @on9wordchainbot** — v2.2.0 me bana: 8 modes (/startclassic /starthard /startchaos /startcfl /startrfl /startbl /startrl /startelim /startmelim), /flee, /runinfo, /wcstats. Nahi bana: /groupstats /globalstats (cross-group data — baad me), /addvp /remvp, wordchain /extend, /exists (dictionary check — baad me).
+- **True Mafia @TrueMafiaBot** — /mafia game + /profile pehle se tha; v2.2.0 me /profile me money/gems/protection dikhta hai. Nahi bana: poora 16-role roster 1:1 map (subset implemented), gender choice prompt (irreversible — skip).
+- **Mimi @im_mimibot** — v2.2.0 me bana: /acc alias, /alive, /vault, /shop, /inv, /guide, /free (+500, 6h cooldown), gift codes (/gencode owner /redeem /delcode /cinfo), +actions (+hug/+kiss/+pat/+slap/+bite/+punch/+murder), /ship /st. Nahi bana: /pro /tokens /exc /boost /binfo /equip /bh /seticon /reveal /locker /present /rh (token/premium economy — detail observe nahi hua).
+- **User Tagger @UserTagger1Bot** — /utag /atag /cancel /reload pehle se tha.
+- **ChatFight @ChatFightBot** — /mystats pehle se tha; v2.2.0 me aaj ka count + group rank dikhta hai. Nahi bana: global rank-entry announcements (cross-group counting — baad me).
+- **VC music @vcmusiclubot (KUST MUSIC)** — v2.2.0 me bana: /play /queue /skip /pause /resume /stop (/end) /clear /ping + player card buttons (YouTube via yt-dlp; assistant @CBIOFINDIA via ASSISTANT_SESSION env). NAHI BAN SAKTA abhi: voice backend — pytgcalls 2.1.0 ka native dep `tgcalls` ke Linux wheels sirf Python ≤3.9 ke liye hain; Railway Python 3.12 par voice inactive rehta hai (module honestly degrade karta hai, fake playback nahi). Nahi bana: /mute /unmute /tmute /kick /ban in VC, /playlist (baad me), Spotify/SoundCloud/Apple/Resso sources (sirf YouTube), 24×7 mode, /clone (skip).
+- **Vctts @Vcttsrobot** — COPY NAHI KIYA (Sanji ka apna bot hai — standing rule).
+
 ## Pending / Known gaps
-- Word Guess: seedha guess (bina reply) — WordSeek style — ABHI NAHI bana (ek attempt refuse hua; Sanji dobara bole to phir try)
-- Music /play → placeholder hai (voice ke liye userbot assistant chahiye, fake nahi kiya)
+- Word Guess: seedha guess (bina reply) — WordSeek style — NAHI banega (previous attempt refused — do NOT retry, rephrase, ya route around)
+- Music: module bana hua hai, par LIVE voice test baaki — Railway par ASSISTANT_SESSION set karna hai (parent karega), phir asli group VC me test; pytgcalls Python 3.12 par install nahi hota isliye voice tabhi chalega jab compatible release aaye ya Python ≤3.9 runtime mile
 - Live test hamesha Sanji ke phone se (browser ka Telegram send kaam nahi karta)
