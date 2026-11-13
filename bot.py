@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.9"
+VERSION = "2.6.10"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5324,6 +5324,16 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
         return content or None
     except Exception as exc:  # noqa: BLE001
         s = str(exc)
+        # v2.6.10: the error BODY tells a real key rejection apart from a
+        # network/edge block. Cloudflare "error code: 1010" means the
+        # request never reached the provider at all — a FAKE key gets the
+        # same 1010, so the key was never checked and is NOT the problem.
+        err_body = ""
+        if hasattr(exc, "read"):
+            try:
+                err_body = exc.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                err_body = ""
         if "429" in s:
             # v2.6.1: remember the rate-limit so the next chat skips this
             # model instead of burning another call on it.
@@ -5332,12 +5342,15 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
         elif "401" in s:
             _AI_LAST_POST_ERROR = "401 (galat key?)"
         elif "403" in s:
-            _AI_LAST_POST_ERROR = "403"
+            if "1010" in err_body:
+                _AI_LAST_POST_ERROR = "403 Cloudflare-1010 (key check nahi hui)"
+            else:
+                _AI_LAST_POST_ERROR = "403"
         elif "timed out" in s.lower() or "timeout" in s.lower():
             _AI_LAST_POST_ERROR = "timeout"
         else:
             _AI_LAST_POST_ERROR = "error"
-        print(f"[chulbuli] AI call failed ({provider}/{model}): {exc!r}")
+        print(f"[chulbuli] AI call failed ({provider}/{model}): {exc!r} body={err_body[:120]!r}")
         return None
 
 
