@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.3"
+VERSION = "2.6.4"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -178,6 +178,8 @@ def load_data() -> dict:
         data.setdefault("recent", {})
         data.setdefault("ai_model", "auto")
         data.setdefault("ai_system", "")
+        data.setdefault("ai_provider", "openrouter")
+        data.setdefault("ai_keys", {})
         data.setdefault("chess_matches", {})
         return data
     except FileNotFoundError:
@@ -5036,7 +5038,75 @@ async def welcome_new(client: Client, message: Message):
 # replies when the key is missing or any call fails. Never crashes, never
 # replies with an error message to users.
 # ---------------------------------------------------------------------------
-AI_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# v2.6.4 — AI providers (Sanji: "provider change karo, provider ke hisab
+# se model aa jaye"). All three speak the OpenAI chat-completions shape,
+# so one _ai_post serves them all. OpenRouter is the default (current
+# behaviour); Groq + Gemini are free-tier fallbacks — when OpenRouter's
+# free limit is hit (69x 429s on 2026-11-13, ALL models at once), the
+# chain falls through to a provider that has a key instead of answering
+# with scripted lines. Keys: the owner's panel-set key first, else the
+# Railway env var. Groq free list verified 2026-11-13: Llama models left
+# the free tier on 2026-08-16 — only gpt-oss-120b/20b + qwen3.8-27b
+# (preview) remain. Gemini OpenAI-compat endpoint verified 2026-11-13.
+AI_PROVIDERS = {
+    "openrouter": {
+        "label": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "key_env": "OPENROUTER_API_KEY",
+        "models": None,  # filled below, after AI_MODELS is defined
+    },
+    "groq": {
+        "label": "Groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key_env": "GROQ_API_KEY",
+        "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+    },
+    "gemini": {
+        "label": "Gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "key_env": "GEMINI_API_KEY",
+        "models": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"],
+    },
+}
+AI_PROVIDER_ORDER = ["openrouter", "groq", "gemini"]
+
+
+def _ai_key_for(provider: str) -> str:
+    """API key for a provider: the owner's panel-set key first (DATA),
+    else the Railway env var. The value is NEVER logged or echoed back."""
+    cfg = AI_PROVIDERS.get(provider)
+    if not cfg:
+        return ""
+    keys = DATA.get("ai_keys") or {}
+    return (keys.get(provider) or "").strip() or os.environ.get(cfg["key_env"], "")
+
+
+def ai_provider() -> str:
+    """Selected provider (Owner Panel), default openrouter."""
+    p = DATA.get("ai_provider") or "openrouter"
+    return p if p in AI_PROVIDERS else "openrouter"
+
+
+def ai_provider_order() -> list:
+    """Providers to try, in order: the selected one first, then the others
+    that have a usable key. Providers without a key are skipped entirely
+    (no HTTP call, no wasted time)."""
+    selected = ai_provider()
+    order = [selected]
+    for p in AI_PROVIDER_ORDER:
+        if p != selected and _ai_key_for(p):
+            order.append(p)
+    return order
+
+
+def _ai_key_masked(provider: str) -> str:
+    """Key status for the Owner Panel — masked, never the full key."""
+    key = _ai_key_for(provider)
+    if not key:
+        return "❌ not set"
+    keys = DATA.get("ai_keys") or {}
+    src = "panel" if keys.get(provider) else "env var"
+    return f"✅ set ({src}, ****{key[-4:]})"
 # Chat models first (natural chat), the code model + rate-limited gemma-4
 # models late, openrouter/free LAST as an auto-route fallback.
 # 2026-11-12 live logs proved the old list dead: llama-3.1-8b-instruct:free,
@@ -5086,6 +5156,7 @@ AI_MODELS = [
     "cohere/north-mini-code:free",
     "openrouter/free",
 ]
+AI_PROVIDERS["openrouter"]["models"] = AI_MODELS
 AI_SYSTEM = (
     "You are Chulbuli, a real sweet desi girl chatting on Telegram — playful, warm, "
     "a little teasing, just like Daizy from your friends group. "
@@ -5132,14 +5203,17 @@ def ai_on() -> bool:
     return bool(DATA.get("toggles", {}).get("ai", True))
 
 
-def ai_model_order() -> list:
-    """AI model try-order (v2.5.6): the owner's pick first when set via
-    the Owner Panel, then the default list. 'auto' (or a bogus value)
-    means the plain list order."""
+def ai_model_order(provider: str | None = None) -> list:
+    """Model try-order for a provider (v2.6.4): the owner's pick first when
+    it belongs to THAT provider's list, then the provider's default list.
+    'auto' (or a bogus value) means the plain list order. No-arg call =
+    the selected provider's order (old behaviour)."""
+    provider = provider or ai_provider()
+    models = AI_PROVIDERS[provider]["models"]
     chosen = DATA.get("ai_model") or "auto"
-    if chosen != "auto" and chosen in AI_MODELS:
-        return [chosen] + [m for m in AI_MODELS if m != chosen]
-    return list(AI_MODELS)
+    if chosen != "auto" and chosen in models:
+        return [chosen] + [m for m in models if m != chosen]
+    return list(models)
 
 
 def ai_system_prompt() -> str:
@@ -5149,11 +5223,16 @@ def ai_system_prompt() -> str:
     return custom if custom else AI_SYSTEM
 
 
-def _ai_post(model: str, messages: list) -> str | None:
-    """Synchronous OpenRouter call (runs in a thread). Returns reply or None."""
+def _ai_post(provider: str, model: str, messages: list) -> str | None:
+    """Synchronous chat-completions call (runs in a thread). One function
+    serves all providers — they all speak the OpenAI shape. Returns reply
+    or None. The key is never logged."""
     import urllib.request
 
-    key = os.environ.get("OPENROUTER_API_KEY", "")
+    cfg = AI_PROVIDERS.get(provider)
+    if not cfg:
+        return None
+    key = _ai_key_for(provider)
     if not key:
         return None
     body = json.dumps({
@@ -5162,14 +5241,15 @@ def _ai_post(model: str, messages: list) -> str | None:
         "max_tokens": 250,
         "temperature": 0.7,
     }).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json",
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://t.me/ChulbuliGameBot"
+        headers["X-Title"] = "Chulbuli"
     req = urllib.request.Request(
-        AI_API_URL, data=body, method="POST",
-        headers={
-            "Authorization": "Bearer " + key,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://t.me/ChulbuliGameBot",
-            "X-Title": "Chulbuli",
-        },
+        cfg["url"], data=body, method="POST", headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -5182,7 +5262,7 @@ def _ai_post(model: str, messages: list) -> str | None:
             # v2.6.1: remember the rate-limit so the next chat skips this
             # model instead of burning another call on it.
             _AI_LAST_429[model] = time.time()
-        print(f"[chulbuli] AI call failed ({model}): {exc!r}")
+        print(f"[chulbuli] AI call failed ({provider}/{model}): {exc!r}")
         return None
 
 
@@ -5255,7 +5335,7 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     """
     if not ai_on():
         return None
-    if not os.environ.get("OPENROUTER_API_KEY", ""):
+    if not any(_ai_key_for(p) for p in AI_PROVIDER_ORDER):
         return None
     system = ai_system_prompt()
     facts = memory_facts(user_id) if user_id is not None else []
@@ -5280,19 +5360,23 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
             messages.append({"role": "user" if turn.get("c") == 0 else "assistant",
                              "content": turn.get("t", "") or ""})
     messages.append({"role": "user", "content": text})
-    for model in ai_model_order():
-        if time.time() - _AI_LAST_429.get(model, 0) < _AI_COOLDOWN_SECS:
-            print(f"[chulbuli] AI model skipped (429 cooldown): {model}")
-            continue
-        try:
-            out = await asyncio.to_thread(_ai_post, model, messages)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chulbuli] AI thread failed ({model}): {exc!r}")
-            out = None
-        if _ai_reply_ok(out, text):
-            return out[:500]
-        if out:
-            print(f"[chulbuli] AI reply rejected ({model}): {(out or '')[:80]!r}")
+    # v2.6.4: try the selected provider's models, then any other provider
+    # that has a key — when one provider's free limit is hit, the next one
+    # answers instead of falling back to scripted lines.
+    for provider in ai_provider_order():
+        for model in ai_model_order(provider):
+            if time.time() - _AI_LAST_429.get(model, 0) < _AI_COOLDOWN_SECS:
+                print(f"[chulbuli] AI model skipped (429 cooldown): {model}")
+                continue
+            try:
+                out = await asyncio.to_thread(_ai_post, provider, model, messages)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[chulbuli] AI thread failed ({provider}/{model}): {exc!r}")
+                out = None
+            if _ai_reply_ok(out, text):
+                return out[:500]
+            if out:
+                print(f"[chulbuli] AI reply rejected ({provider}/{model}): {(out or '')[:80]!r}")
     return None
 
 
@@ -9588,12 +9672,15 @@ def owner_panel_text() -> str:
     t = DATA.get("toggles", {})
     model = DATA.get("ai_model") or "auto"
     custom_prompt = bool((DATA.get("ai_system") or "").strip())
+    provider = ai_provider()
     return (
         f"👑 **OWNER PANEL — Chulbuli**\n\n"
         f"👥 Users: {users} | 👥 Groups: {groups}\n"
         f"💰 Total coins: {fmt_coins(total_coins)}\n"
         f"⏱️ Uptime: {hrs}h {mins}m | v{VERSION}\n\n"
+        f"🔌 Provider: {AI_PROVIDERS[provider]['label']}\n"
         f"🤖 AI Model: {model}\n"
+        f"🔑 API Key: {_ai_key_masked(provider)}\n"
         f"✏️ System Prompt: {'custom ✅' if custom_prompt else 'default'}\n\n"
         f"🎮 Games: {'ON ✅' if t.get('games') else 'OFF ❌'}\n"
         f"💰 Economy: {'ON ✅' if t.get('economy') else 'OFF ❌'}\n"
@@ -9611,6 +9698,8 @@ def owner_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎛️ Toggles", callback_data="own:toggles")],
         [InlineKeyboardButton("🤖 AI Model", callback_data="own:model"),
          InlineKeyboardButton("✏️ System Prompt", callback_data="own:prompt")],
+        [InlineKeyboardButton("🔌 Provider", callback_data="own:provider"),
+         InlineKeyboardButton("🔑 API Key", callback_data="own:key")],
         [InlineKeyboardButton("💰 Coins do", callback_data="own:give"),
          InlineKeyboardButton("🎵 Music", callback_data="own:music")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="own:broadcast"),
@@ -9639,11 +9728,18 @@ async def do_broadcast(text: str) -> tuple[int, int, int, int]:
     return u_ok, u_fail, g_ok, g_fail
 
 
+def _owner_provider_models() -> list:
+    """Models of the selected provider (v2.6.4) — the model picker shows
+    only these, so the list always matches the provider."""
+    return AI_PROVIDERS[ai_provider()]["models"]
+
+
 def _owner_model_text() -> str:
     current = DATA.get("ai_model") or "auto"
-    lines = ["🤖 **AI Model — Chulbuli kis model se baat kare**\n",
+    label = AI_PROVIDERS[ai_provider()]["label"]
+    lines = [f"🤖 **AI Model — {label}**\n",
              f"Abhi: `{current}`\n"]
-    for i, m in enumerate(AI_MODELS):
+    for i, m in enumerate(_owner_provider_models()):
         mark = " ✅" if m == current else ""
         lines.append(f"{i + 1}. `{m}`{mark}")
     lines.append("\nDabao to badal jayega — bada model = samajhdar jawab 🙂")
@@ -9652,13 +9748,57 @@ def _owner_model_text() -> str:
 
 def _owner_model_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    for i, m in enumerate(AI_MODELS):
-        short = m.split("/", 1)[1].replace(":free", "") if "/" in m else m
+    for i, m in enumerate(_owner_provider_models()):
+        short = m.split("/", 1)[1] if "/" in m else m
         mark = " ✅" if m == (DATA.get("ai_model") or "auto") else ""
         rows.append([InlineKeyboardButton(f"{short}{mark}", callback_data=f"own:pick:{i}")])
     rows.append([InlineKeyboardButton("🔄 Auto (list order)", callback_data="own:pick:auto")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="own:back")])
     return InlineKeyboardMarkup(rows)
+
+
+def _owner_provider_text() -> str:
+    lines = ["🔌 **AI Provider — kahan se jawab aaye**\n",
+             f"Abhi: **{AI_PROVIDERS[ai_provider()]['label']}**\n"]
+    for p in AI_PROVIDER_ORDER:
+        cfg = AI_PROVIDERS[p]
+        mark = " ✅" if p == ai_provider() else ""
+        key = _ai_key_for(p)
+        lines.append(f"• {cfg['label']}{mark} — key {'✅' if key else '❌'} ({len(cfg['models'])} models)")
+    lines.append("\nDabao to badal jayega. Provider badalte hi uske models dikhenge 🙂\n"
+                 "Jis provider ki key nahi hai, wo backup me bhi nahi chalega — key '🔑 API Key' se daalo.")
+    return "\n".join(lines)
+
+
+def _owner_provider_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for p in AI_PROVIDER_ORDER:
+        cfg = AI_PROVIDERS[p]
+        mark = " ✅" if p == ai_provider() else ""
+        rows.append([InlineKeyboardButton(f"{cfg['label']}{mark}", callback_data=f"own:pickprov:{p}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="own:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _owner_key_text() -> str:
+    provider = ai_provider()
+    label = AI_PROVIDERS[provider]["label"]
+    lines = [f"🔑 **API Key — {label}**\n",
+             f"Status: {_ai_key_masked(provider)}\n"]
+    for p in AI_PROVIDER_ORDER:
+        if p != provider:
+            lines.append(f"• {AI_PROVIDERS[p]['label']}: {_ai_key_masked(p)}")
+    lines.append("\nKey yahan se badlo — nayi key bhejte hi purani badal jayegi.\n"
+                 "Key kabhi poori dikhai nahi jati, sirf aakhri 4 akshar 🙂")
+    return "\n".join(lines)
+
+
+def _owner_key_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Key badlo", callback_data="own:key_edit"),
+         InlineKeyboardButton("❌ Key hatao", callback_data="own:key_clear")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="own:back")],
+    ])
 
 
 def _owner_prompt_text() -> str:
@@ -9799,13 +9939,43 @@ async def owner_callbacks(client: Client, query):
                 DATA["ai_model"] = "auto"
             else:
                 try:
-                    DATA["ai_model"] = AI_MODELS[int(pick)]
+                    DATA["ai_model"] = _owner_provider_models()[int(pick)]
                 except (ValueError, IndexError):
                     DATA["ai_model"] = "auto"
             save_data()
             await query.answer(f"AI model: {DATA.get('ai_model')} ✅")
             await query.message.edit_text(_owner_model_text(),
                                           reply_markup=_owner_model_keyboard())
+        elif action == "provider":
+            await query.message.edit_text(_owner_provider_text(),
+                                          reply_markup=_owner_provider_keyboard())
+        elif action.startswith("pickprov:"):
+            prov = action.split(":", 1)[1]
+            if prov in AI_PROVIDERS:
+                DATA["ai_provider"] = prov
+                # The old model pick may not exist in the new provider.
+                DATA["ai_model"] = "auto"
+                save_data()
+                await query.answer(f"Provider: {AI_PROVIDERS[prov]['label']} ✅")
+            await query.message.edit_text(_owner_provider_text(),
+                                          reply_markup=_owner_provider_keyboard())
+        elif action == "key":
+            await query.message.edit_text(_owner_key_text(),
+                                          reply_markup=_owner_key_keyboard())
+        elif action == "key_edit":
+            OWNER_PENDING[OWNER_ID] = "key"
+            await query.message.edit_text(
+                f"🔑 **{AI_PROVIDERS[ai_provider()]['label']} ki API key bhejo** — poori key ek message me.\n"
+                "Key save hote hi tumhara ye message delete kar dungi, aur key kabhi poori dikhai nahi jayegi 🙂\n/cancel se rok sakte ho.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="own:back")]]),
+            )
+        elif action == "key_clear":
+            provider = ai_provider()
+            (DATA.get("ai_keys") or {}).pop(provider, None)
+            save_data()
+            await query.answer("Key hata di ✅ (env var hoga to wahi chalega)")
+            await query.message.edit_text(_owner_key_text(),
+                                          reply_markup=_owner_key_keyboard())
         elif action == "prompt":
             await query.message.edit_text(_owner_prompt_text(),
                                           reply_markup=_owner_prompt_keyboard())
@@ -9892,6 +10062,21 @@ async def handle_owner_pending(message: Message) -> bool:
         DATA["ai_system"] = text
         save_data()
         await safe_reply(message, f"✏️ System prompt badal diya 🙂\n\n{text[:200]}")
+        return True
+    if pending == "key":
+        if len(text) < 10:
+            await safe_reply(message, "Key bahut chhoti hai — poori API key bhejo 🙂\n/cancel se rok sakte ho.")
+            return True
+        OWNER_PENDING.pop(OWNER_ID, None)
+        provider = ai_provider()
+        DATA.setdefault("ai_keys", {})[provider] = text
+        save_data()
+        try:
+            # The key must not sit in the chat history — delete the message.
+            await message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await safe_reply(message, f"🔑 {AI_PROVIDERS[provider]['label']} ki key save ho gayi (****{text[-4:]}) 🙂")
         return True
     if pending == "give":
         parts = text.split()
