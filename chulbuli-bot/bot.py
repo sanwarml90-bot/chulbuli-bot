@@ -55,6 +55,8 @@ from pyrogram.types import (
     ChatPrivileges,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
     WebAppInfo,
 )
@@ -88,7 +90,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.14"
+VERSION = "2.6.15"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -911,6 +913,7 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 **💬 Mujhse baat karo**
 Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
 /secretmsg @user <msg> — secret message, sirf wahi user dekh payega
+Inline: @ChulbuliGameBot @user <msg> — secret group me bina dikhe bhejo (tumhara likha kabhi group me nahi jayega)
 /yaad — main tumhare baare me kya yaad rakhti hun
 /bhool — sab kuch bhool jao
 
@@ -3243,6 +3246,92 @@ async def secret_callbacks(client: Client, query):
             await query.message.edit_text(f"🔒 Secret message — {sec['to_name']} ne dekh liya 🙂")
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.on_inline_query()
+async def secret_inline(client: Client, query):
+    """Inline secret (v2.6.15) — the ONLY way a secret NEVER enters the
+    group at all (Sanji: "real msg wala hisa group me jaye hi na sidha
+    bot wala jaye"). The user types "@ChulbuliGameBot @target <secret>"
+    in the message box and picks the bot's result: Telegram posts ONLY
+    that result (placeholder + button) — the typed query is never sent
+    to the group as a message. The /secretmsg command can only delete
+    after the fact (group messages reach everyone instantly), so inline
+    is the real fix. Needs Inline Mode ON in BotFather (/setinline) —
+    without it Telegram never delivers inline queries to the bot."""
+    sender = query.from_user
+    if sender is None or is_banned(sender.id):
+        return
+    parts = (query.query or "").strip().split()
+    target = None
+    gave_target = bool(parts) and parts[0].startswith("@")
+    secret = ""
+    if gave_target:
+        raw = parts[0].lstrip("@")
+        try:
+            target = await client.get_users(int(raw) if raw.isdigit() else raw)
+        except Exception:  # noqa: BLE001
+            target = None
+        secret = " ".join(parts[1:]).strip()
+    if gave_target and target is None:
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title="❌ user nahi mila",
+            description="sahi username likho: @ChulbuliGameBot @username <secret>",
+            input_message_content=InputTextMessageContent(
+                "secret bhejne ke liye sahi username likho 🙂"))]
+    elif target is None:
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title="🔒 Secret bhejo",
+            description="@ChulbuliGameBot @username <secret> — secret sirf wahi user dekh payega",
+            input_message_content=InputTextMessageContent(
+                "🔒 secret bhejne ke liye @ChulbuliGameBot @username <secret> likho 🙂"))]
+    elif not secret:
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title="✍️ secret to likho",
+            description="uske baad secret likho: @ChulbuliGameBot @username <secret>",
+            input_message_content=InputTextMessageContent(
+                "secret bhejne ke liye pehle secret likho 🙂"))]
+    elif len(secret) > SECRET_MAX_LEN:
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title=f"📏 secret {SECRET_MAX_LEN} characters se zyada hai",
+            description="chhota secret likho",
+            input_message_content=InputTextMessageContent(
+                "secret bahut lamba hai — chhota likho 🙂"))]
+    elif target.id == sender.id:
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title="😄 khud ko secret?",
+            description="khud se baat kar lo",
+            input_message_content=InputTextMessageContent("khud ko secret? 😄"))]
+    elif getattr(target, "is_bot", False):
+        results = [InlineQueryResultArticle(
+            id="sec-help",
+            title="😌 bot ko secret?",
+            description="main to sab jaanti hun",
+            input_message_content=InputTextMessageContent("bot ko secret? 😌"))]
+    else:
+        sid = "%08x" % random.getrandbits(32)
+        SECRETS[sid] = {"to": target.id, "to_name": display_name(target),
+                        "from": sender.id, "from_name": display_name(sender),
+                        "text": secret, "ts": time.time(), "seen": False}
+        results = [InlineQueryResultArticle(
+            id=f"sec-{sid}",
+            title=f"🔒 Secret for {display_name(target)}",
+            description="sirf wahi user dekh payega — tumhara likha hua group me nahi jayega",
+            input_message_content=InputTextMessageContent(
+                f"🔒 {display_name(target)}, tumhare liye ek secret message hai!\n"
+                f"{display_name(sender)} ne bheja hai — sirf tum dekh sakte ho 🙂"),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("👀 Secret dekho", callback_data=f"sec:{sid}")]]))]
+    try:
+        await client.answer_inline_query(query.id, results=results,
+                                         cache_time=0, is_personal=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.on_message(filters.command(["warn"]))
