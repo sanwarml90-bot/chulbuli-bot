@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.12"
+VERSION = "2.6.13"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -902,7 +902,7 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 /end — active game khatam karo
 
 **🎵 Music (group voice chat)**
-/play <gaane ka naam ya link> — gaana bajao
+/play <gaane ka naam ya link> — gaana bajao + MP3 file bhi milegi (download kar lo)
 /queue — queue dekho
 /skip /pause /resume /stop — player controls
 /clear — queue clear karo
@@ -4207,6 +4207,84 @@ def _music_transcode_to_raw(src_path: str) -> str | None:
     return raw_path
 
 
+_MUSIC_MP3_MAX_BYTES = 45 * 1024 * 1024  # Bot API audio upload limit is 50 MB
+
+
+def _music_to_mp3(path: str) -> str | None:
+    """Convert a downloaded track (raw PCM from _music_transcode_to_raw,
+    or the native container when transcode failed) to an MP3 file for
+    download — ffmpeg alone, no ffprobe needed (v2.6.13: Sanji — "/play
+    par kare to play bhi ho or mp3 bhi aaye jse users can download").
+    Returns the mp3 path, or None when conversion is impossible (the
+    caller keeps playing; a missing mp3 never breaks playback).
+    imageio-ffmpeg's static build ships libmp3lame (verified 2026-11-14).
+    """
+    import subprocess
+    if not path or not os.path.isfile(path):
+        return None
+    if path.endswith(".mp3"):
+        # Already an MP3 (e.g. SoundCloud serves mp3, or the yt-dlp mp3
+        # postprocessor ran) — nothing to convert. NOTE: the output path
+        # below would equal the input here, and ffmpeg truncates its
+        # output before reading the input, so this early return also
+        # protects the playing file from being destroyed.
+        return path
+    ffmpeg = music_ffmpeg_setup()
+    if not ffmpeg:
+        print("[chulbuli] music: no ffmpeg — cannot make mp3")
+        return None
+    mp3_path = os.path.splitext(path)[0] + ".mp3"
+    if path.endswith(".raw"):
+        args = [ffmpeg, "-y", "-v", "error", "-f", "s16le", "-ar", "48000",
+                "-ac", "2", "-i", path, "-vn", "-codec:a", "libmp3lame",
+                "-q:a", "4", mp3_path]
+    else:
+        args = [ffmpeg, "-y", "-v", "error", "-i", path, "-vn",
+                "-codec:a", "libmp3lame", "-q:a", "4", mp3_path]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=180)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music: mp3 convert failed: {exc!r}")
+        return None
+    if proc.returncode != 0 or not os.path.isfile(mp3_path) \
+            or os.path.getsize(mp3_path) == 0:
+        print(f"[chulbuli] music: mp3 convert failed rc={proc.returncode}: "
+              f"{(proc.stderr or '')[:200]}")
+        _music_delete_file(mp3_path)
+        return None
+    return mp3_path
+
+
+async def _music_send_mp3(chat_id: int, track: dict, path: str | None) -> None:
+    """Send the playing track as an MP3 audio message so users can
+    download it (v2.6.13). Best-effort: any failure (no ffmpeg, too big,
+    upload error) just skips the mp3 — playback is never affected. The
+    temp mp3 is deleted after sending; Telegram keeps its own copy."""
+    if not path or not os.path.isfile(path):
+        return
+    mp3 = await asyncio.to_thread(_music_to_mp3, path)
+    if mp3 is None:
+        return
+    try:
+        if os.path.getsize(mp3) > _MUSIC_MP3_MAX_BYTES:
+            print(f"[chulbuli] music: mp3 too big to send "
+                  f"({os.path.getsize(mp3)} bytes)")
+            return
+        title = (track or {}).get("title") or "gaana"
+        duration = int((track or {}).get("duration") or 0) or None
+        await app.send_audio(chat_id, audio=mp3, title=title,
+                             duration=duration,
+                             caption=f"🎵 {title} — download kar lo 💕")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music: mp3 send failed: {exc!r}")
+    finally:
+        # Only delete a CONVERTED temp file — when the source was already
+        # an mp3, mp3 IS the playing file; its lifecycle belongs to the
+        # player (deleted on skip/leave), never to this sender.
+        if mp3 != path:
+            _music_delete_file(mp3)
+
+
 def _music_download_sync(track: dict) -> str:
     """Blocking yt-dlp audio download -> local file path. Raises MusicError.
 
@@ -4829,6 +4907,8 @@ async def _music_play_next(chat_id: int) -> None:
                     sc = None
                 else:
                     await _music_send_player(chat_id)
+                    await _music_send_mp3(chat_id, sc,
+                                          music_state(chat_id).get("file"))
                     return
         st["current"] = None
         st["playing"] = False
@@ -4843,6 +4923,7 @@ async def _music_play_next(chat_id: int) -> None:
             pass
         return
     await _music_send_player(chat_id)
+    await _music_send_mp3(chat_id, nxt, music_state(chat_id).get("file"))
 
 
 @app.on_message(filters.command(["play", "queue", "skip", "pause", "resume", "stop", "clear", "ping", "end"]))
