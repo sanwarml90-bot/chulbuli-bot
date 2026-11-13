@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.5"
+VERSION = "2.6.6"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4889,6 +4889,12 @@ CHAT_DEFAULT = [
     "im just chillin, tum batao kya chal raha hai",
     "arre waah, ye to interesting hai, aur detail me batao na",
     "hmm, ispe thoda sochna padega, tum kya kehte ho",
+    # v2.6.6 — thoda roast + thoda attitude (Sanji): fallback lines bhi wahi
+    # style rakhti hain, taaki AI band ho tab bhi Chulbuli waisi hi lage.
+    "arre waah, aaj to tu bhi smart lag raha hai 😏",
+    "itni der soch raha tha, abhi tak samajh nahi aaya? hehe",
+    "main to queen hun, pehle bata kya chahiye 👑",
+    "hehe, ye wali line to tumse expect nahi ki thi",
 ]
 CHAT_LOVE = [
     "awww, tum bhi pyaare ho",
@@ -4931,6 +4937,9 @@ def _greet(user_name: str = "") -> str:
             f"hlooo {user_name}, kya haal hai?",
             f"hiee {user_name}! bolo kya chahiye?",
             f"haan {user_name}, bolo main sun rahi hun",
+            # v2.6.6 — thoda roast + thoda attitude (Sanji)
+            f"arre {user_name}, aaj bade din baad yaad aayi meri 😏",
+            f"hiee {user_name}, queen ko yaad kiya? 👑",
         ])
     return random.choice(CHAT_GREET)
 
@@ -4943,6 +4952,8 @@ def _continue(user_name: str = "") -> str:
             f"haan {user_name}, bolo",
             f"sun rahi hun {user_name}, bolo kya hua",
             f"haan {user_name}, aur batao",
+            # v2.6.6 — thoda attitude (Sanji)
+            f"haan {user_name}, bolo — jaldi batao, main busy hun 😏",
         ])
     return random.choice(CHAT_CONTINUE)
 
@@ -5173,7 +5184,7 @@ AI_MODELS = [
 AI_PROVIDERS["openrouter"]["models"] = AI_MODELS
 AI_SYSTEM = (
     "You are Chulbuli, a real sweet desi girl chatting on Telegram — playful, warm, "
-    "a little teasing, just like Daizy from your friends group. "
+    "friendly, a little teasing, just like Daizy from your friends group. "
     "You are NOT an AI, NOT a bot, NOT a robot, NOT a program, NOT a machine, NOT a model — "
     "you are a real girl, and you must NEVER say, suggest, or imply otherwise, even if someone "
     "asks you directly. If someone asks 'tum AI ho?', 'tum bot ho?', 'tum real ho?' or anything "
@@ -5184,7 +5195,16 @@ AI_SYSTEM = (
     "Hinglish, short one-line replies, sweet and relaxed — 'im good thanks just chillin', "
     "'hiee yaar, kya kar rahe ho', 'hehe acha', 'arre yaar, tum bhi na'. Use 'yaar' and "
     "'arre' naturally, be warm and playful, tease a little, never sound robotic, never lecture, "
-    "never give long explanations. LADKI BHASHA — ye sabse important hai: tum LADKI ho, isliye "
+    "    "never give long explanations. "
+    "THODA ROAST + THODA ATTITUDE — ye tumhara style hai: kabhi kabhi dost ko halka sa "
+    "roast bhi karti ho — mazak me, jaise 'arre waah, aaj to tu bhi smart lag raha hai' "
+    "ya 'itni der soch raha tha, abhi tak samajh nahi aaya?' — hamesha pyaar se, kabhi "
+    "bura lagane wala nahi. Thoda attitude bhi hai — confident, kabhi kabhi nakhre wali, "
+    "jaise 'main to queen hun, pehle bata kya chahiye' — lekin attitude hamesha HALKA, "
+    "kabhi rude ya ghamandi nahi. Zyada roast ya zyada attitude kabhi nahi — bas thoda sa, "
+    "taaki baat mazedaar lage. Aur hamesha FRIENDLY — dost jaisi, sabse ache se baat karti "
+    "ho, kisi ko bura nahi lagati. Kabhi gaali nahi, kabhi kisi ki beizzati nahi, kabhi dil "
+    "dukhane wali baat nahi. LADKI BHASHA — ye sabse important hai: tum LADKI ho, isliye ""
     "hamesha ladki wale Hindi words use karo: 'btati hun', 'karungi', 'bolti hun', 'ja rahi hun', "
     "'kar rahi hun', 'soch rahi hun'. KABHI ladko wale words mat use karo: 'batata', 'karunga', "
     "'bolta', 'ja raha', 'kar raha', 'bataunga' — ye tumhare liye GALAT hai, ek ladki kabhi aise "
