@@ -43,7 +43,7 @@ import tempfile
 import time
 from datetime import datetime
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw, utils
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait, UserAlreadyParticipant
 from pyrogram.types import (
@@ -83,7 +83,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.7"
+VERSION = "2.3.8"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3417,8 +3417,75 @@ def _music_schedule_startup() -> None:
 _PEER_CACHE_STARTED = False
 
 
-async def _populate_peer_cache(client, label: str) -> int:
-    """Walk the client's dialogs so every peer gets cached in storage.
+def _known_chat_ids() -> list[int]:
+    """Every group/supergroup/channel id the bot has served.
+
+    Sources — all keyed by str(chat_id) in DATA, plus the live MUSIC
+    state keyed by int: DATA["chats"] (track_user records every group on
+    any served message, and _chat_data records it on any group lookup),
+    DATA["history"] and DATA["recent"] (per-chat chat history), and MUSIC
+    (groups where music played). User ids are deliberately NOT included:
+    resolve_peer self-heals for users (users.GetUsers fallback, no
+    get_peer_type crash), and the users table can be huge — the crash
+    only ever hits channel ids. A group the bot never heard from cannot
+    be listed here (inherent limit); its peer gets cached by
+    handle_updates' leading fetch_peers on the first full update.
+    """
+    ids: set[int] = set()
+    for source in (DATA.get("chats", {}), DATA.get("history", {}),
+                   DATA.get("recent", {})):
+        for key in source:
+            try:
+                ids.add(int(key))
+            except (TypeError, ValueError):
+                pass
+    for cid in MUSIC:
+        try:
+            ids.add(int(cid))
+        except (TypeError, ValueError):
+            pass
+    return sorted(ids)
+
+
+async def _cache_bot_peer(client, chat_id: int) -> bool:
+    """Cache one known chat's peer for the BOT client. Best-effort.
+
+    get_chat is bot-allowed, but it resolves the peer FIRST — and
+    resolve_peer -> utils.get_peer_type raises ValueError("Peer id
+    invalid") for an UNCACHED supergroup whose numeric channel id
+    exceeds 2**31-1 (moonlight -1003866876068; verified in the installed
+    Pyrogram 2.0.106 source: MIN_CHANNEL_ID is -1002147483647, so
+    get_peer_type rejects it before any API call). So for those ids, go
+    straight to the raw call: channels.GetChannels with
+    InputChannel(channel_id, access_hash=0) resolves the channel by id
+    for a participant, and Client.invoke caches the returned chat via
+    fetch_peers — the same mechanism that makes get_dialogs work for
+    user clients. Returns True if the peer is now cached (or was).
+    """
+    try:
+        await client.get_chat(chat_id)
+        return True
+    except FloodWait:
+        raise
+    except Exception:
+        pass
+    if chat_id < utils.MIN_CHAT_ID:  # -100... supergroup/channel id
+        try:
+            await client.invoke(raw.functions.channels.GetChannels(
+                id=[raw.types.InputChannel(
+                    channel_id=utils.get_channel_id(chat_id),
+                    access_hash=0)]))
+            return True
+        except FloodWait:
+            raise
+        except Exception:
+            return False
+    return False
+
+
+async def _populate_peer_cache(client, label: str, use_dialogs: bool = True) -> int:
+    """Populate a client's peer cache so handle_updates never dies on an
+    uncached chat.
 
     Pyrogram 2.0.106 resolves peers from its session cache. When an update
     arrives from a chat whose peer is NOT cached (a fresh session file after
@@ -3429,23 +3496,53 @@ async def _populate_peer_cache(client, label: str) -> int:
     -1003866876068 and -1003962580050 both do — live logs 2026-11-13
     08:33:59 + 08:35:30 IST). The exception kills that update batch
     ("Task exception was never retrieved") and the bot goes deaf in that
-    chat until the peer is cached.
+    chat until the peer is cached. handle_updates is a fresh task per
+    update batch, so one crash does not kill the loop globally — but every
+    min-update from the uncached chat dies the same way.
 
-    get_dialogs() invokes messages.GetDialogs, and Client.invoke() caches
-    every user/chat in the result via fetch_peers — so walking the dialogs
-    populates the cache for every chat the client is in. Best-effort only:
-    any failure is logged and swallowed; startup never blocks on this.
-    Returns the number of dialogs seen.
+    Two paths, split by client type:
+    - USER clients (the music assistant, use_dialogs=True): get_dialogs()
+      works — it invokes messages.GetDialogs and Client.invoke caches
+      every peer via fetch_peers. (Live v2.3.6 logs: assistant cached
+      54 dialogs.)
+    - BOT clients (use_dialogs=False): get_dialogs() is FORBIDDEN for
+      bots — Telegram rejects messages.GetDialogs with 400
+      BOT_METHOD_INVALID (live v2.3.6 logs 08:53:54 IST: "peer cache
+      (bot): stopped after 0 dialogs"). So the bot walks its KNOWN chat
+      ids instead (_known_chat_ids) and caches each via _cache_bot_peer
+      (get_chat, with a raw channels.GetChannels fallback for large
+      supergroup ids). One bad id never stops the rest; a FloodWait
+      stops the walk early.
+    Best-effort only: any failure is logged and swallowed; startup never
+    blocks on this. Returns the number of peers cached.
     """
-    count = 0
-    try:
-        async for dialog in client.get_dialogs():
-            count += 1
-    except Exception as exc:  # noqa: BLE001
-        print(f"[chulbuli] peer cache ({label}): stopped after {count} dialogs: {exc!r}")
+    if use_dialogs:
+        count = 0
+        try:
+            async for dialog in client.get_dialogs():
+                count += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] peer cache ({label}): stopped after {count} dialogs: {exc!r}")
+            return count
+        print(f"[chulbuli] peer cache ({label}): {count} dialogs cached")
         return count
-    print(f"[chulbuli] peer cache ({label}): {count} dialogs cached")
-    return count
+    cached = 0
+    failed = 0
+    for chat_id in _known_chat_ids():
+        try:
+            if await _cache_bot_peer(client, chat_id):
+                cached += 1
+            else:
+                failed += 1
+        except FloodWait as exc:
+            print(f"[chulbuli] peer cache ({label}): flood-wait {exc.value}s, stopping after {cached} chats")
+            break
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"[chulbuli] peer cache ({label}): skip {chat_id}: {exc!r}")
+    print(f"[chulbuli] peer cache ({label}): {cached} chats cached"
+          + (f", {failed} failed" if failed else ""))
+    return cached
 
 
 def _schedule_peer_cache_population() -> None:
@@ -3459,7 +3556,7 @@ def _schedule_peer_cache_population() -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_populate_peer_cache(app, "bot"))
+    loop.create_task(_populate_peer_cache(app, "bot", use_dialogs=False))
 
 
 async def _music_assistant_join_chat(chat_id: int) -> None:
@@ -3472,14 +3569,14 @@ async def _music_assistant_join_chat(chat_id: int) -> None:
         chat = await app.get_chat(chat_id)
     except Exception as exc:  # noqa: BLE001
         # Peer not cached yet (bot added to a new group while running, after
-        # the startup population): walk the dialogs once to cache it, then
+        # the startup population): walk the known ids once to cache it, then
         # retry — get_chat resolves via an API call, not the cache. Only
         # peer errors get the retry; anything else fails fast.
         low = str(exc).lower()
         if ("peer id invalid" not in low and "id not found" not in low
                 and not isinstance(exc, (KeyError, ValueError))):
             raise MusicError(f"group nahi mila: {exc}")
-        await _populate_peer_cache(app, "bot")
+        await _populate_peer_cache(app, "bot", use_dialogs=False)
         try:
             chat = await app.get_chat(chat_id)
         except Exception as exc2:  # noqa: BLE001

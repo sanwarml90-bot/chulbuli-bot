@@ -19,6 +19,8 @@ import urllib.request
 sys.path.insert(0, os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
 os.chdir(os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
 
+from pyrogram.errors import BotMethodInvalid, FloodWait
+
 import bot as B
 
 PASS = []
@@ -276,7 +278,20 @@ class FakeApp:
     async def export_chat_invite_link(self, chat_id):
         return "https://t.me/+fakeinvite"
 
+    get_chat_calls = []
+    get_chat_fail = {}  # chat_id -> exception instance to raise
+    invoke_calls = []
+    dialogs_called = False
+
+    async def invoke(self, query, *args, **kwargs):
+        FakeApp.invoke_calls.append(query)
+        return None
+
     async def get_chat(self, chat_id):
+        FakeApp.get_chat_calls.append(chat_id)
+        if chat_id in FakeApp.get_chat_fail:
+            raise FakeApp.get_chat_fail[chat_id]
+
         class _C:
             username = None
             invite_link = None
@@ -284,12 +299,16 @@ class FakeApp:
 
     # Dialogs the bot is in (incl. moonlight's large-id supergroup, whose
     # numeric channel id exceeds 2**31-1 — the "Peer id invalid" case).
+    # NOTE: only the ASSISTANT (a user client) may walk these — the real
+    # Telegram API rejects messages.GetDialogs for BOTS with 400
+    # BOT_METHOD_INVALID, so the bot peer-cache path must never call it.
     dialogs = [-1003866876068, -100502, 111]
 
     async def get_dialogs(self, limit=0):
-        # Mirror real Pyrogram: an async generator walking the dialogs.
-        for cid in FakeApp.dialogs:
-            yield FakeDialog(cid)
+        # Mirror real Telegram: bots CANNOT call messages.GetDialogs.
+        # If the bot population ever calls this, the test fails loudly.
+        FakeApp.dialogs_called = True
+        raise BotMethodInvalid("The method can't be used by bots")
 
 
 class DummyClient:
@@ -2368,13 +2387,10 @@ async def main():
     _real_factory6 = B._GroupCallFactory
     _real_mkc6 = B._music_make_client
     _real_session6 = B.ASSISTANT_SESSION
-    _buf_pc = io.StringIO()
-    with contextlib.redirect_stdout(_buf_pc):
-        _n = await B._populate_peer_cache(B.app, "bot")
-    check("peer cache population counts dialogs", _n == 3
-          and "peer cache (bot): 3 dialogs cached" in _buf_pc.getvalue(), _buf_pc.getvalue())
-    # failure mid-walk is swallowed, partial count returned, bot still starts
-
+    # (v2.3.8) the BOT path no longer walks dialogs at all — it walks the
+    # known chat ids from DATA/MUSIC (see the v2.3.8 section below). The
+    # dialogs walk stays for USER clients (the assistant) only.
+    # failure mid-walk is swallowed, partial count returned (dialogs path)
     class _BoomDialogsClient:
         async def get_dialogs(self, limit=0):
             yield FakeDialog(-100502)
@@ -2382,7 +2398,7 @@ async def main():
 
     _buf_pc2 = io.StringIO()
     with contextlib.redirect_stdout(_buf_pc2):
-        _n2 = await B._populate_peer_cache(_BoomDialogsClient(), "bot")
+        _n2 = await B._populate_peer_cache(_BoomDialogsClient(), "assistant")
     check("peer cache failure swallowed", _n2 == 1 and "boom-dialogs" in _buf_pc2.getvalue(),
           _buf_pc2.getvalue())
     # scheduler fires once only (first-update pattern, like _music_schedule_startup)
@@ -2394,7 +2410,7 @@ async def main():
         await asyncio.sleep(0.05)
     check("peer cache scheduler once only",
           B._PEER_CACHE_STARTED is True
-          and _buf_pc3.getvalue().count("peer cache (bot): 3 dialogs cached") == 1,
+          and _buf_pc3.getvalue().count("chats cached") == 1,
           _buf_pc3.getvalue())
     # assistant client gets its own population after a successful start
 
@@ -2450,7 +2466,7 @@ async def main():
 
     _real_populate = B._populate_peer_cache
 
-    async def _rec_populate(client, label):
+    async def _rec_populate(client, label, **kwargs):
         _pop_calls.append(label)
         return 0
 
@@ -2463,6 +2479,88 @@ async def main():
     finally:
         B.app.get_chat = _real_get_chat
         B._populate_peer_cache = _real_populate
+    # ---- v2.3.8: bot peer cache must NOT use get_dialogs ----
+    # Live v2.3.6 logs (2026-11-13 08:53:54 IST): the bot population died
+    # with BotMethodInvalid — Telegram rejects messages.GetDialogs for
+    # bots ("peer cache (bot): stopped after 0 dialogs"). Only the
+    # assistant (a user client) can walk dialogs (54 cached live). The bot
+    # now walks its KNOWN chat ids instead: get_chat per id, with a raw
+    # channels.GetChannels fallback for supergroups whose numeric id
+    # exceeds 2**31-1 — get_chat's resolve_peer raises ValueError("Peer id
+    # invalid") for those when uncached (verified in the installed
+    # Pyrogram 2.0.106 source: get_peer_type rejects ids below
+    # MIN_CHANNEL_ID -1002147483647; get_chat resolves the peer first).
+    # Save/restore DATA + MUSIC so the fixture is hermetic.
+    _saved_chats8 = dict(B.DATA.get("chats", {}))
+    _saved_hist8 = dict(B.DATA.get("history", {}))
+    _saved_recent8 = dict(B.DATA.get("recent", {}))
+    _saved_music8 = dict(B.MUSIC)
+    _saved_gcc8 = list(FakeApp.get_chat_calls)
+    _saved_inv8 = list(FakeApp.invoke_calls)
+    _saved_gcf8 = dict(FakeApp.get_chat_fail)
+    try:
+        B.DATA["chats"] = {"-1003866876068": {"title": "moonlight"},
+                           "-100502": {"title": "small group"},
+                           "-100999": {"title": "dead group"}}
+        B.DATA["history"] = {"222": []}
+        B.DATA["recent"] = {}
+        B.MUSIC.clear()
+        B.MUSIC[-100777] = {"queue": [], "current": None}
+        FakeApp.get_chat_calls.clear()
+        FakeApp.invoke_calls.clear()
+        FakeApp.dialogs_called = False
+        # get_chat simulates the real resolve_peer failure for the
+        # uncached large id, and a dead id that fails everywhere.
+        # (Class attributes — the methods read FakeApp.*, not the instance.)
+        FakeApp.get_chat_fail = {
+            -1003866876068: ValueError("Peer id invalid: -1003866876068"),
+            -100999: RuntimeError("boom-chat"),
+        }
+        _buf8 = io.StringIO()
+        with contextlib.redirect_stdout(_buf8):
+            _n8 = await B._populate_peer_cache(B.app, "bot", use_dialogs=False)
+        _out8 = _buf8.getvalue()
+        # moonlight + small group + history DM + music group = 4 cached;
+        # the dead id is skipped, not fatal.
+        check("v238 bot never calls get_dialogs",
+              FakeApp.dialogs_called is False, str(FakeApp.dialogs_called))
+        check("v238 bot get_chat per known id",
+              sorted(FakeApp.get_chat_calls) == [-1003866876068, -100999, -100777, -100502, 222],
+              str(FakeApp.get_chat_calls))
+        check("v238 bot large id falls back to GetChannels",
+              len(FakeApp.invoke_calls) == 1
+              and isinstance(FakeApp.invoke_calls[0], B.raw.functions.channels.GetChannels)
+              and FakeApp.invoke_calls[0].id[0].channel_id == 3866876068
+              and FakeApp.invoke_calls[0].id[0].access_hash == 0,
+              str(FakeApp.invoke_calls))
+        check("v238 bot bad id skipped",
+              _n8 == 4 and "peer cache (bot): 4 chats cached, 1 failed" in _out8, _out8)
+        check("v238 bot known ids cover history+music",
+              -100777 in FakeApp.get_chat_calls and 222 in FakeApp.get_chat_calls,
+              str(FakeApp.get_chat_calls))
+        # FloodWait stops the walk early instead of hammering every id.
+        FakeApp.get_chat_calls.clear()
+        FakeApp.invoke_calls.clear()
+        FakeApp.get_chat_fail = {-1003866876068: FloodWait(5)}
+        _buf8b = io.StringIO()
+        with contextlib.redirect_stdout(_buf8b):
+            _n8b = await B._populate_peer_cache(B.app, "bot", use_dialogs=False)
+        check("v238 floodwait stops walk",
+              _n8b == 0 and FakeApp.get_chat_calls == [-1003866876068]
+              and "flood-wait 5s, stopping after 0 chats" in _buf8b.getvalue(),
+              _buf8b.getvalue())
+    finally:
+        B.DATA["chats"] = _saved_chats8
+        B.DATA["history"] = _saved_hist8
+        B.DATA["recent"] = _saved_recent8
+        B.MUSIC.clear()
+        B.MUSIC.update(_saved_music8)
+        FakeApp.get_chat_calls.clear()
+        FakeApp.get_chat_calls.extend(_saved_gcc8)
+        FakeApp.invoke_calls.clear()
+        FakeApp.invoke_calls.extend(_saved_inv8)
+        FakeApp.get_chat_fail = _saved_gcf8
+        FakeApp.dialogs_called = False
     # ---- v2.3.7: USER_ALREADY_PARTICIPANT is a success, not a failure ----
     # Live /play report 2026-11-13 08:55 IST: the assistant was ALREADY a
     # member, Telegram returned 400 USER_ALREADY_PARTICIPANT, and the old
