@@ -83,7 +83,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.5"
+VERSION = "2.3.6"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3391,6 +3391,11 @@ async def _music_ensure_assistant() -> bool:
             factory = _GroupCallFactory(user_client)
             _ASSISTANT.update({"client": user_client, "factory": factory,
                                "started": True, "me": me})
+            # The assistant is a user account with its own session cache —
+            # populate its peers too, so its own handle_updates never dies
+            # on an uncached chat (same "Peer id invalid" crash as the bot).
+            asyncio.get_running_loop().create_task(
+                _populate_peer_cache(user_client, "assistant"))
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"[chulbuli] music assistant failed to start: {exc!r}")
@@ -3409,6 +3414,54 @@ def _music_schedule_startup() -> None:
         pass
 
 
+_PEER_CACHE_STARTED = False
+
+
+async def _populate_peer_cache(client, label: str) -> int:
+    """Walk the client's dialogs so every peer gets cached in storage.
+
+    Pyrogram 2.0.106 resolves peers from its session cache. When an update
+    arrives from a chat whose peer is NOT cached (a fresh session file after
+    a deploy — Railway's filesystem is ephemeral, so EVERY deploy starts
+    with an empty cache), handle_updates' is_min path calls resolve_peer ->
+    utils.get_peer_type, which raises ValueError("Peer id invalid") for
+    supergroups whose numeric channel id exceeds 2**31-1 (moonlight
+    -1003866876068 and -1003962580050 both do — live logs 2026-11-13
+    08:33:59 + 08:35:30 IST). The exception kills that update batch
+    ("Task exception was never retrieved") and the bot goes deaf in that
+    chat until the peer is cached.
+
+    get_dialogs() invokes messages.GetDialogs, and Client.invoke() caches
+    every user/chat in the result via fetch_peers — so walking the dialogs
+    populates the cache for every chat the client is in. Best-effort only:
+    any failure is logged and swallowed; startup never blocks on this.
+    Returns the number of dialogs seen.
+    """
+    count = 0
+    try:
+        async for dialog in client.get_dialogs():
+            count += 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] peer cache ({label}): stopped after {count} dialogs: {exc!r}")
+        return count
+    print(f"[chulbuli] peer cache ({label}): {count} dialogs cached")
+    return count
+
+
+def _schedule_peer_cache_population() -> None:
+    """Populate the bot client's peer cache once, on first update
+    (app.run() has no startup hook — same pattern as _music_schedule_startup)."""
+    global _PEER_CACHE_STARTED
+    if _PEER_CACHE_STARTED:
+        return
+    _PEER_CACHE_STARTED = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_populate_peer_cache(app, "bot"))
+
+
 async def _music_assistant_join_chat(chat_id: int) -> None:
     """Yukki-style: the assistant joins the group (username, else invite
     link) so it can then join the voice chat."""
@@ -3418,7 +3471,19 @@ async def _music_assistant_join_chat(chat_id: int) -> None:
     try:
         chat = await app.get_chat(chat_id)
     except Exception as exc:  # noqa: BLE001
-        raise MusicError(f"group nahi mila: {exc}")
+        # Peer not cached yet (bot added to a new group while running, after
+        # the startup population): walk the dialogs once to cache it, then
+        # retry — get_chat resolves via an API call, not the cache. Only
+        # peer errors get the retry; anything else fails fast.
+        low = str(exc).lower()
+        if ("peer id invalid" not in low and "id not found" not in low
+                and not isinstance(exc, (KeyError, ValueError))):
+            raise MusicError(f"group nahi mila: {exc}")
+        await _populate_peer_cache(app, "bot")
+        try:
+            chat = await app.get_chat(chat_id)
+        except Exception as exc2:  # noqa: BLE001
+            raise MusicError(f"group nahi mila: {exc2}")
     username = getattr(chat, "username", None)
     try:
         if username:
@@ -3604,6 +3669,7 @@ async def cmd_music(client: Client, message: Message):
     if cmd == "play" and (game_state(message.chat.id) or {}).get("kind") == "uno":
         return
     _music_schedule_startup()
+    _schedule_peer_cache_population()
     if cmd == "ping":
         try:
             ms = int((time.time() - message.date.timestamp()) * 1000)
@@ -8057,6 +8123,7 @@ async def group_text_handler(client: Client, message: Message):
         return
     _music_schedule_startup()
     _schedule_background_tasks()
+    _schedule_peer_cache_population()
     # Baka-style . / ! mod commands
     if text.startswith((".", "!")):
         if await handle_dot_command(client, message):
@@ -8188,6 +8255,7 @@ async def private_text_handler(client: Client, message: Message):
         return
     _music_schedule_startup()
     _schedule_background_tasks()
+    _schedule_peer_cache_population()
     if await handle_owner_pending(message):
         return
     if not chat_on():

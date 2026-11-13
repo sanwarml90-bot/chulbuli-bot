@@ -121,6 +121,12 @@ class FakeChat:
         self.title = title
 
 
+class FakeDialog:
+    """Minimal dialog for the peer-cache walk (only .chat.id is read)."""
+    def __init__(self, chat_id):
+        self.chat = FakeChat(chat_id, "supergroup")
+
+
 class FakeMessage:
     _id = 1000
     outbox = []  # (chat_id, text) of everything the bot "sent"
@@ -275,6 +281,15 @@ class FakeApp:
             username = None
             invite_link = None
         return _C()
+
+    # Dialogs the bot is in (incl. moonlight's large-id supergroup, whose
+    # numeric channel id exceeds 2**31-1 — the "Peer id invalid" case).
+    dialogs = [-1003866876068, -100502, 111]
+
+    async def get_dialogs(self, limit=0):
+        # Mirror real Pyrogram: an async generator walking the dialogs.
+        for cid in FakeApp.dialogs:
+            yield FakeDialog(cid)
 
 
 class DummyClient:
@@ -2334,6 +2349,126 @@ async def main():
         check("chat reply ai blank falls back", isinstance(_r2, str) and _r2.strip() != "", repr(_r2))
     finally:
         B.ai_chat_reply = _orig_ai
+
+    # ---- v2.3.6: peer-cache population ("Peer id invalid" crash) ----
+    # Live logs (v2.3.4, 2026-11-13 08:33:59 + 08:35:30 IST): handle_updates
+    # died twice with KeyError 'ID not found: -1003962580050' / '-1003866876068'
+    # (moonlight) -> ValueError('Peer id invalid'). Root cause, verified in
+    # the installed Pyrogram 2.0.106 source: utils.get_peer_type rejects
+    # channel ids > 2**31-1, and resolve_peer only reaches that code when
+    # the peer is NOT in the session cache (a fresh session file after a
+    # deploy starts empty). Walking get_dialogs() caches every peer, because
+    # Client.invoke() runs fetch_peers on every result's users/chats.
+    # handle_updates is a fresh task per update batch (session.py:255), so
+    # one crash does not kill the loop globally — but every min-update from
+    # the uncached chat dies the same way, so the bot goes deaf there until
+    # the peer is cached. There is no supported hook for handle_updates
+    # failures (the Dispatcher only guards handlers), so the population
+    # is the fix — no monkey-patching.
+    _real_factory6 = B._GroupCallFactory
+    _real_mkc6 = B._music_make_client
+    _real_session6 = B.ASSISTANT_SESSION
+    _buf_pc = io.StringIO()
+    with contextlib.redirect_stdout(_buf_pc):
+        _n = await B._populate_peer_cache(B.app, "bot")
+    check("peer cache population counts dialogs", _n == 3
+          and "peer cache (bot): 3 dialogs cached" in _buf_pc.getvalue(), _buf_pc.getvalue())
+    # failure mid-walk is swallowed, partial count returned, bot still starts
+
+    class _BoomDialogsClient:
+        async def get_dialogs(self, limit=0):
+            yield FakeDialog(-100502)
+            raise RuntimeError("boom-dialogs")
+
+    _buf_pc2 = io.StringIO()
+    with contextlib.redirect_stdout(_buf_pc2):
+        _n2 = await B._populate_peer_cache(_BoomDialogsClient(), "bot")
+    check("peer cache failure swallowed", _n2 == 1 and "boom-dialogs" in _buf_pc2.getvalue(),
+          _buf_pc2.getvalue())
+    # scheduler fires once only (first-update pattern, like _music_schedule_startup)
+    B._PEER_CACHE_STARTED = False
+    _buf_pc3 = io.StringIO()
+    with contextlib.redirect_stdout(_buf_pc3):
+        B._schedule_peer_cache_population()
+        B._schedule_peer_cache_population()
+        await asyncio.sleep(0.05)
+    check("peer cache scheduler once only",
+          B._PEER_CACHE_STARTED is True
+          and _buf_pc3.getvalue().count("peer cache (bot): 3 dialogs cached") == 1,
+          _buf_pc3.getvalue())
+    # assistant client gets its own population after a successful start
+
+    class _FakeAssistantClient2:
+        def __init__(self):
+            self.dialogs_walked = False
+            self.joined = []
+
+        async def start(self):
+            return True
+
+        async def get_me(self):
+            class _Me:
+                username = "CBIOFINDIA"
+                id = 8617937893
+            return _Me()
+
+        async def get_dialogs(self, limit=0):
+            self.dialogs_walked = True
+            yield FakeDialog(-100502)
+            yield FakeDialog(222)
+
+        async def join_chat(self, link):
+            self.joined.append(link)
+            return True
+
+    _asst2 = _FakeAssistantClient2()
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _asst2
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    _buf_pc4 = io.StringIO()
+    with contextlib.redirect_stdout(_buf_pc4):
+        _ok = await B._music_ensure_assistant()
+        await asyncio.sleep(0.05)
+    check("peer cache covers assistant", _ok is True and _asst2.dialogs_walked is True
+          and "peer cache (assistant): 2 dialogs cached" in _buf_pc4.getvalue(),
+          _buf_pc4.getvalue())
+    # assistant join: get_chat fails on an uncached peer -> populate -> retry
+    _real_get_chat = B.app.get_chat
+    _join_calls = {"n": 0}
+    _pop_calls = []
+
+    async def _flaky_get_chat(chat_id):
+        _join_calls["n"] += 1
+        if _join_calls["n"] == 1:
+            raise ValueError("Peer id invalid: -1003866876068")
+
+        class _C:
+            username = "testgroup"
+            invite_link = None
+        return _C()
+
+    _real_populate = B._populate_peer_cache
+
+    async def _rec_populate(client, label):
+        _pop_calls.append(label)
+        return 0
+
+    B.app.get_chat = _flaky_get_chat
+    B._populate_peer_cache = _rec_populate
+    try:
+        await B._music_assistant_join_chat(-1003866876068)
+        check("assistant join retries after populate", _pop_calls == ["bot"]
+              and _asst2.joined == ["testgroup"], str((_pop_calls, _asst2.joined)))
+    finally:
+        B.app.get_chat = _real_get_chat
+        B._populate_peer_cache = _real_populate
+    # restore music state
+    B._GroupCallFactory = _real_factory6
+    B._music_make_client = _real_mkc6
+    B.ASSISTANT_SESSION = _real_session6
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
