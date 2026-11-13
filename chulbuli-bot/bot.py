@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -178,6 +178,7 @@ def load_data() -> dict:
         data.setdefault("recent", {})
         data.setdefault("ai_model", "auto")
         data.setdefault("ai_system", "")
+        data.setdefault("chess_matches", {})
         return data
     except FileNotFoundError:
         return _blank_data()
@@ -5077,8 +5078,6 @@ AI_MODELS = [
     "particle-ai/particle-1:free",
     "recursive/flint-v1.0:free",
     "dots-studio/dots-3-note-preview:free",
-    "apodex/apodex-1.1-mini:free",
-    "liquid/lfm-2.5-2.6b:free",
     "liquid/lfm-3-1.7b:free",
     "cohere/north-mini-code:free",
     "openrouter/free",
@@ -5605,6 +5604,7 @@ def _schedule_background_tasks() -> None:
         return
     loop.create_task(_proactive_loop())
     loop.create_task(_math_poster_loop())
+    _chess_restore()  # v2.6.2: live chess matches survive a restart
 
 
 # ---------------------------------------------------------------------------
@@ -6100,6 +6100,7 @@ def _chess_new_match(chat_id: int, host_uid: int, amount: int) -> dict:
              "started": False, "amount": amount, "pot": 0,
              "board": _chess.Board(), "created": time.time()}
     _CHESS_MATCHES[match_id] = match
+    _chess_save()
     return match
 
 
@@ -6107,6 +6108,61 @@ def _chess_matches_in_chat(chat_id: int) -> list[dict]:
     """All chess matches in a chat, oldest first."""
     return sorted((m for m in _CHESS_MATCHES.values() if m["chat_id"] == chat_id),
                   key=lambda m: m["created"])
+
+
+def _chess_save() -> None:
+    """Persist chess matches to data.json (v2.6.2). _CHESS_MATCHES is RAM
+    only, so every Railway redeploy used to wipe live games: after a
+    restart /move went silent, /end found nothing, and a match could not
+    be finished. The board is stored as FEN; players, names and pot
+    survive with it. Called after every mutation of a match."""
+    try:
+        DATA["chess_matches"] = {
+            mid: {"match_id": m["match_id"], "chat_id": m["chat_id"],
+                  "players": list(m["players"]), "names": dict(m["names"]),
+                  "started": bool(m.get("started")), "amount": m.get("amount", 0),
+                  "pot": m.get("pot", 0), "created": m.get("created", 0),
+                  "fen": m["board"].fen()}
+            for mid, m in _CHESS_MATCHES.items()
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    save_data()
+
+
+_CHESS_RESTORED = False
+
+
+def _chess_restore() -> None:
+    """Rebuild _CHESS_MATCHES from DATA["chess_matches"] once, on the first
+    update after a (re)start (v2.6.2). Boards come back from FEN. Waiting
+    lobbies older than the timeout are dropped (they would have expired);
+    fresh ones get their timeout task re-armed. Started matches come back
+    exactly where they were — both players can keep playing, and /end
+    finds them again."""
+    global _CHESS_RESTORED
+    if _CHESS_RESTORED or _chess is None:
+        return
+    _CHESS_RESTORED = True
+    saved = DATA.get("chess_matches") or {}
+    now = time.time()
+    for mid, s in list(saved.items()):
+        try:
+            if not s.get("started") and now - float(s.get("created", 0)) > LOBBY_TIMEOUT_SECONDS:
+                continue
+            board = _chess.Board(str(s.get("fen") or ""))
+            m = {"kind": "chess", "match_id": s["match_id"], "chat_id": int(s["chat_id"]),
+                 "players": [int(p) for p in s["players"]],
+                 "names": {str(k): v for k, v in (s.get("names") or {}).items()},
+                 "started": bool(s.get("started")), "amount": s.get("amount", 0),
+                 "pot": s.get("pot", 0), "board": board, "created": float(s.get("created", 0))}
+            _CHESS_MATCHES[mid] = m
+            if not m["started"]:
+                asyncio.create_task(_chess_lobby_timeout(
+                    mid, seconds=max(1, int(LOBBY_TIMEOUT_SECONDS - (now - m["created"])))))
+        except Exception:  # noqa: BLE001
+            continue
+    _chess_save()
 
 
 def _chess_user_match(uid: int) -> dict | None:
@@ -6164,6 +6220,7 @@ async def _chess_lobby_timeout(match_id: str, seconds: int = LOBBY_TIMEOUT_SECON
         return
     _refund_lobby(match)
     _CHESS_MATCHES.pop(match_id, None)
+    _chess_save()
     try:
         await app.send_message(match["chat_id"],
               "⏰ 2 minute me koi join nahi hua — Chess match khatam kar diya 🙂 "
@@ -6173,16 +6230,18 @@ async def _chess_lobby_timeout(match_id: str, seconds: int = LOBBY_TIMEOUT_SECON
 
 
 async def _chess_start(match: dict):
-    """Second player joined — start the match and post the board with the
-    Mini App buttons (one per color)."""
+    """Second player joined — start the match. The group message is SHORT
+    (v2.6.2: Sanji — the ASCII board was spamming the group after every
+    move); the board lives in the Mini App (buttons below) and /board
+    still shows it as text on demand."""
     match["started"] = True
     white, black = match["players"][0], match["players"][1]
     wn = match["names"].get(str(white), "")
     bn = match["names"].get(str(black), "")
     await safe_send_text(match["chat_id"], f"♟️ **CHESS SHURU!**\n🤍 White: {wn}\n🖤 Black: {bn}\n"
-          f"White ki pehli chaal — Mini App me khelo ya /move e2e4 likho. /board se board dekho, /resign se haar maano.\n"
-          f"{chess_board_text(match['board'])}",
+          f"White ki pehli chaal — apna button dabao, Mini App me board khulega 🙂 /move e2e4 se chaal likho, /board se board dekho, /resign se haar maano.",
           reply_markup=_chess_miniapp_markup(match))
+    _chess_save()
 
 
 async def _chess_join(match: dict, uid: int, name: str) -> str | None:
@@ -6245,6 +6304,7 @@ def _chess_do_move(match: dict, uid: int, uci: str) -> dict:
         prize = _pay_winner(match["chat_id"], winner, pot, 500, "")
         save_data()
         _CHESS_MATCHES.pop(match["match_id"], None)
+        _chess_save()
         return {"ok": True, "san": san, "over": True, "winner": winner,
                 "draw": False, "prize": prize, "elo": wu["elo"], "me": me}
     if board.is_stalemate() or board.is_insufficient_material() or board.is_seventyfive_moves():
@@ -6253,22 +6313,24 @@ def _chess_do_move(match: dict, uid: int, uci: str) -> dict:
             add_coins(get_user(p), 100)  # draw bonus, +100 each
         save_data()
         _CHESS_MATCHES.pop(match["match_id"], None)
+        _chess_save()
         return {"ok": True, "san": san, "over": True, "winner": None,
                 "draw": True, "prize": 100, "me": me}
     nxt = players[0] if board.turn == _chess.WHITE else players[1]
+    _chess_save()
     return {"ok": True, "san": san, "check": board.is_check(), "over": False,
             "next_uid": nxt, "me": me}
 
 
 def _chess_turn_text(match: dict, san: str, check: bool, mover: str) -> str:
-    """Group message after a chess move: what was played, whose turn it is
-    (the opponent is tagged), and the board."""
+    """Group message after a chess move: what was played and whose turn it
+    is (the opponent is tagged). NO board here (v2.6.2) — the board lives
+    in the Mini App; /board shows it as text."""
     board = match["board"]
     nxt = match["players"][0] if board.turn == _chess.WHITE else match["players"][1]
     nxt_name = match["names"].get(str(nxt), "")
     return (f"♟️ {mover}: **{san}**" + (" — **CHECK!** ⚠️" if check else "") +
-            f"\nAb [{nxt_name}](tg://user?id={nxt}) ki baari — Mini App me khelo ya /move likho 🙂\n"
-            f"{chess_board_text(board)}")
+            f"\nAb [{nxt_name}](tg://user?id={nxt}) ki baari — Mini App me khelo ya /move likho 🙂")
 
 
 async def _chess_announce_move(message, match: dict, res: dict):
@@ -6445,6 +6507,7 @@ async def cmd_chess_resign(client: Client, message: Message):
     prize = _pay_winner(message.chat.id, winner, pot, 500, "")
     save_data()
     _CHESS_MATCHES.pop(match["match_id"], None)
+    _chess_save()
     await safe_reply(message, f"🏳️ {display_name(message.from_user)} ne resign kar diya — "
           f"**{match['names'].get(str(winner), '')}** jeet gaya! +{fmt_coins(prize)} coins!")
 
@@ -8302,6 +8365,7 @@ def _clear_all_game_state(chat_id: int) -> str | None:
             _refund_lobby(m)
         if cleared is None:
             cleared = "game"
+    _chess_save()
     if chat_id in MAFIA:
         st = MAFIA[chat_id]
         if not st.get("started"):
