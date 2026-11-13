@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.7"
+VERSION = "2.6.8"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5263,6 +5263,7 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
     """Synchronous chat-completions call (runs in a thread). One function
     serves all providers — they all speak the OpenAI shape. Returns reply
     or None. The key is never logged."""
+    global _AI_LAST_POST_ERROR
     import urllib.request
 
     cfg = AI_PROVIDERS.get(provider)
@@ -5270,6 +5271,7 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
         return None
     key = _ai_key_for(provider)
     if not key:
+        _AI_LAST_POST_ERROR = "no key"
         return None
     body = json.dumps({
         "model": model,
@@ -5294,10 +5296,20 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
         content = content.strip()
         return content or None
     except Exception as exc:  # noqa: BLE001
-        if "429" in str(exc):
+        s = str(exc)
+        if "429" in s:
             # v2.6.1: remember the rate-limit so the next chat skips this
             # model instead of burning another call on it.
             _AI_LAST_429[model] = time.time()
+            _AI_LAST_POST_ERROR = "429 (free limit)"
+        elif "401" in s:
+            _AI_LAST_POST_ERROR = "401 (galat key?)"
+        elif "403" in s:
+            _AI_LAST_POST_ERROR = "403"
+        elif "timed out" in s.lower() or "timeout" in s.lower():
+            _AI_LAST_POST_ERROR = "timeout"
+        else:
+            _AI_LAST_POST_ERROR = "error"
         print(f"[chulbuli] AI call failed ({provider}/{model}): {exc!r}")
         return None
 
@@ -5308,6 +5320,13 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
 # model that answers. A 429'd model is now skipped for 60 s.
 _AI_LAST_429: dict[str, float] = {}
 _AI_COOLDOWN_SECS = 60
+# v2.6.8 — owner ko asli error (Sanji: "owner ko real reply de yani error
+# de or users ko scripted de jab bhi koi error ho"). _AI_LAST_ERROR is the
+# last chain failure, shown to the owner only; _AI_LAST_POST_ERROR is the
+# last single-call failure, e.g. "429 (free limit)" / "401 (galat key?)"
+# / "no key" / "timeout". Never a key value.
+_AI_LAST_ERROR = ""
+_AI_LAST_POST_ERROR = ""
 
 
 def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
@@ -5369,9 +5388,11 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     The call is fed what Chulbuli remembers about this user (facts) and the
     recent chat history, so she talks like someone who actually knows them.
     """
+    global _AI_LAST_ERROR
     if not ai_on():
         return None
     if not any(_ai_key_for(p) for p in AI_PROVIDER_ORDER):
+        _AI_LAST_ERROR = "koi AI key nahi hai — Owner Panel → 🔑 API Key se key daalo"
         return None
     system = ai_system_prompt()
     facts = memory_facts(user_id) if user_id is not None else []
@@ -5399,20 +5420,31 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     # v2.6.4: try the selected provider's models, then any other provider
     # that has a key — when one provider's free limit is hit, the next one
     # answers instead of falling back to scripted lines.
+    # v2.6.8: track what failed, per provider, for the owner's error reply.
+    failed: dict[str, str] = {}
     for provider in ai_provider_order():
         for model in ai_model_order(provider):
             if time.time() - _AI_LAST_429.get(model, 0) < _AI_COOLDOWN_SECS:
                 print(f"[chulbuli] AI model skipped (429 cooldown): {model}")
+                failed.setdefault(provider, "sab 429 cooldown")
                 continue
             try:
                 out = await asyncio.to_thread(_ai_post, provider, model, messages)
             except Exception as exc:  # noqa: BLE001
                 print(f"[chulbuli] AI thread failed ({provider}/{model}): {exc!r}")
+                failed[provider] = "thread fail"
                 out = None
             if _ai_reply_ok(out, text):
+                _AI_LAST_ERROR = ""
                 return out[:500]
             if out:
                 print(f"[chulbuli] AI reply rejected ({provider}/{model}): {(out or '')[:80]!r}")
+                failed[provider] = "reply reject hua (quality gate)"
+            elif out is None:
+                failed[provider] = _AI_LAST_POST_ERROR or "fail"
+    _AI_LAST_ERROR = " | ".join(
+        f"{AI_PROVIDERS[p]['label']}: {e}" for p, e in failed.items()
+    ) or "AI fail — wajah pata nahi"
     return None
 
 
@@ -5426,7 +5458,11 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
     NEVER raises and NEVER returns an empty reply: if anything goes wrong
     (or the reply comes back blank), a short rule-based line is used so a
     chat message never goes unanswered (live bug, 2026-11-12).
+
+    v2.6.8 (Sanji): the OWNER gets the real AI error instead of the
+    scripted line — users still get the scripted fallback.
     """
+    global _AI_LAST_ERROR
     try:
         if user_id is not None:
             extract_facts(user_id, text)
@@ -5443,9 +5479,16 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
                 ai = await ai_chat_reply(text, user_name, chat_id, user_id)
             except Exception as exc:  # noqa: BLE001
                 print(f"[chulbuli] AI reply error: {exc!r}")
+                _AI_LAST_ERROR = f"crash: {type(exc).__name__}"
                 ai = None
             facts = memory_facts(user_id) if user_id is not None else []
-            reply = ai if ai else chat_reply_text(text, user_name, facts, ongoing=ongoing)
+            if ai:
+                reply = ai
+            elif user_id == OWNER_ID and _AI_LAST_ERROR:
+                # v2.6.8 (Sanji): owner ko asli error, users ko scripted.
+                reply = f"⚠️ AI error: {_AI_LAST_ERROR}"
+            else:
+                reply = chat_reply_text(text, user_name, facts, ongoing=ongoing)
         reply = (reply or "").strip()
         if not reply:
             reply = random.choice(CHAT_DEFAULT)
@@ -9709,7 +9752,7 @@ def owner_panel_text() -> str:
     model = DATA.get("ai_model") or "auto"
     custom_prompt = bool((DATA.get("ai_system") or "").strip())
     provider = ai_provider()
-    return (
+    panel = (
         f"👑 **OWNER PANEL — Chulbuli**\n\n"
         f"👥 Users: {users} | 👥 Groups: {groups}\n"
         f"💰 Total coins: {fmt_coins(total_coins)}\n"
@@ -9717,13 +9760,20 @@ def owner_panel_text() -> str:
         f"🔌 Provider: {AI_PROVIDERS[provider]['label']}\n"
         f"🤖 AI Model: {model}\n"
         f"🔑 API Key: {_ai_key_masked(provider)}\n"
-        f"✏️ System Prompt: {'custom ✅' if custom_prompt else 'default'}\n\n"
+        f"✏️ System Prompt: {'custom ✅' if custom_prompt else 'default'}\n"
+    )
+    if _AI_LAST_ERROR:
+        # v2.6.8: last AI error is visible in the panel too.
+        panel += f"⚠️ Last AI error: {_AI_LAST_ERROR}\n"
+    panel += (
+        f"\n"
         f"🎮 Games: {'ON ✅' if t.get('games') else 'OFF ❌'}\n"
         f"💰 Economy: {'ON ✅' if t.get('economy') else 'OFF ❌'}\n"
         f"💬 Chat: {'ON ✅' if t.get('chat') else 'OFF ❌'}\n"
         f"💬 Baatein: {'ON ✅' if t.get('ai') else 'OFF ❌'}\n\n"
         f"Neeche se option chuno 👇"
     )
+    return panel
 
 
 def owner_keyboard() -> InlineKeyboardMarkup:
