@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.10"
+VERSION = "2.6.11"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5309,6 +5309,11 @@ def _ai_post(provider: str, model: str, messages: list) -> str | None:
     headers = {
         "Authorization": "Bearer " + key,
         "Content-Type": "application/json",
+        # v2.6.11: Groq sits behind Cloudflare, which 403s (error code
+        # 1010) requests carrying urllib's default "Python-urllib/3.x"
+        # signature BEFORE the key is even read — every Groq call looked
+        # like an auth failure. Identify the client honestly instead.
+        "User-Agent": f"Chulbuli/{VERSION}",
     }
     if provider == "openrouter":
         headers["HTTP-Referer"] = "https://t.me/ChulbuliGameBot"
