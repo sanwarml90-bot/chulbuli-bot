@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.13"
+VERSION = "2.6.14"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -910,6 +910,7 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 
 **💬 Mujhse baat karo**
 Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
+/secretmsg @user <msg> — secret message, sirf wahi user dekh payega
 /yaad — main tumhare baare me kya yaad rakhti hun
 /bhool — sab kuch bhool jao
 
@@ -3119,6 +3120,129 @@ def _target_user(message: Message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
     return None
+
+
+# SECRET MESSAGE (v2.6.14) — /secretmsg @user <msg> ya kisi ke message
+# par reply karke /secretmsg <msg>. Secret kabhi group me TEXT ke roop
+# me nahi aata: bot pehle command message delete karta hai (admin +
+# delete rights chahiye — warna sender ko warn karta hai), phir sirf ek
+# placeholder + "Secret dekho" button bhejta hai. Button dabane par
+# secret sirf TARGET ko ek alert popup me dikhta hai (Telegram alert
+# sirf dabane wale ko dikhta hai) — koi aur dabaye to use mana kar diya
+# jata hai. Secrets sirf RAM me rehte hain (data.json me kabhi nahi —
+# ye secret hain), 24 ghante me expire ho jate hain, aur redeploy par
+# khatam ho jate hain. Alert popup max ~200 chars dikhata hai, isliye
+# secret 190 chars tak limited hai.
+SECRETS: dict[str, dict] = {}
+SECRET_TTL = 24 * 3600
+SECRET_MAX_LEN = 190
+
+
+@app.on_message(filters.command(["secretmsg"]))
+async def cmd_secretmsg(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        await safe_reply(message, "yahan to sirf tum aur main hain — secret ki kya zarurat 😌 group me /secretmsg use karo 🙂")
+        return
+    parts = message.command or []
+    target = _target_user(message)
+    _not_found = False
+    if target is not None:
+        text = " ".join(parts[1:]).strip()
+    elif len(parts) >= 3:
+        raw = parts[1].lstrip("@")
+        try:
+            target = await client.get_users(int(raw) if raw.isdigit() else raw)
+        except Exception:  # noqa: BLE001
+            target = None
+            _not_found = True
+        text = " ".join(parts[2:]).strip()
+    else:
+        target = None
+        text = ""
+    if target is None or not text:
+        if _not_found:
+            await safe_reply(message, "us naam ka user nahi mila 🙂 sahi username likho")
+            return
+        await safe_reply(message, "/secretmsg @username <msg> likho, ya kisi ke message par reply karke /secretmsg <msg> likho 🙂")
+        return
+    if len(text) > SECRET_MAX_LEN:
+        await safe_reply(message, f"secret {SECRET_MAX_LEN} characters se zyada lamba hai — chhota likho 🙂")
+        return
+    if target.id == message.from_user.id:
+        await safe_reply(message, "khud ko secret? 😄 khud se baat kar lo")
+        return
+    if getattr(target, "is_bot", False):
+        await safe_reply(message, "bot ko secret bhej rahe ho? main to sab jaanti hun 😌")
+        return
+    # Command delete karo taaki secret group me kisi ko na dikhe.
+    deleted = True
+    try:
+        await client.delete_messages(message.chat.id, [message.id])
+    except Exception:  # noqa: BLE001
+        deleted = False
+    sid = "%08x" % random.getrandbits(32)
+    SECRETS[sid] = {"to": target.id, "to_name": display_name(target),
+                    "from": message.from_user.id,
+                    "from_name": display_name(message.from_user),
+                    "text": text, "ts": time.time(), "seen": False}
+    try:
+        await app.send_message(
+            message.chat.id,
+            f"🔒 {display_name(target)}, tumhare liye ek secret message hai!\n"
+            f"{display_name(message.from_user)} ne bheja hai — sirf tum dekh sakte ho 🙂",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("👀 Secret dekho", callback_data=f"sec:{sid}")]]))
+    except Exception:  # noqa: BLE001
+        SECRETS.pop(sid, None)
+        await safe_reply(message, "secret bhej nahi payi — dobara try karo 🙂")
+        return
+    if not deleted:
+        await safe_reply(message, "⚠️ main tumhara /secretmsg delete nahi kar payi — secret abhi bhi group me dikh raha hai! mujhe admin (delete rights) banao 🙂")
+
+
+@app.on_callback_query(filters.regex(r"^sec:"))
+async def secret_callbacks(client: Client, query):
+    sid = (query.data or "")[4:]
+    sec = SECRETS.get(sid)
+    if sec is None:
+        try:
+            await query.answer("ye secret ab nahi raha (expire ho gaya) 🙂", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if time.time() - sec.get("ts", 0) > SECRET_TTL:
+        SECRETS.pop(sid, None)
+        try:
+            await query.answer("ye secret expire ho gaya 🙂", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    tapper = query.from_user.id if query.from_user else 0
+    if tapper != sec["to"]:
+        try:
+            await query.answer(f"ye secret sirf {sec['to_name']} ke liye hai 🙂", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if sec.get("seen"):
+        try:
+            await query.answer("tum ye secret pehle hi dekh chuke ho 🙂", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    sec["seen"] = True
+    try:
+        await query.answer(sec["text"], show_alert=True)
+    except Exception:  # noqa: BLE001
+        pass
+    if query.message is not None:
+        try:
+            await query.message.edit_text(f"🔒 Secret message — {sec['to_name']} ne dekh liya 🙂")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.on_message(filters.command(["warn"]))
