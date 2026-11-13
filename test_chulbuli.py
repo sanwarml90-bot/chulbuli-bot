@@ -515,11 +515,12 @@ async def main():
     check("uno win", B.game_state(-100201) is None and any("UNO jeet liya" in t for _, t in FakeMessage.outbox))
     check("uno win coins", B.get_user(111)["coins"] == _before + 5000)
 
-    # ---- Chess: fool's mate, illegal move, elo ----
+    # ---- Chess: fool's mate, illegal move, elo (v2.5.0 match store) ----
+    B._botapi_call_sync = _fake_botapi_ok  # _chess_announce_move sends Mini App buttons via Bot API
     await B.cmd_chess(client, FakeMessage("/chess", uid=111, name="Chess1", chat_id=-100202))
     await B.cmd_join_generic(client, FakeMessage("/join", uid=222, name="Chess2", chat_id=-100202))
-    st = B.game_state(-100202)
-    check("chess started", st is not None and st.get("started"))
+    _cm = B._chess_matches_in_chat(-100202)
+    check("chess started", len(_cm) == 1 and _cm[0].get("started") and _cm[0]["players"] == [111, 222])
     await B.cmd_chess_move(client, FakeMessage("/move f2f3", uid=111, name="Chess1", chat_id=-100202))
     await B.cmd_chess_move(client, FakeMessage("/move e7e5", uid=222, name="Chess2", chat_id=-100202))
     FakeMessage.outbox.clear()
@@ -528,7 +529,7 @@ async def main():
     await B.cmd_chess_move(client, FakeMessage("/move g2g4", uid=111, name="Chess1", chat_id=-100202))
     FakeMessage.outbox.clear()
     await B.cmd_chess_move(client, FakeMessage("/move d8h4", uid=222, name="Chess2", chat_id=-100202))
-    check("chess checkmate", B.game_state(-100202) is None and any("CHECKMATE" in t for _, t in FakeMessage.outbox))
+    check("chess checkmate", not B._chess_matches_in_chat(-100202) and any("CHECKMATE" in t for _, t in FakeMessage.outbox))
     check("chess elo changed", B.get_user(222)["elo"] > 1200 and B.get_user(111)["elo"] < 1200)
     FakeMessage.outbox.clear()
     await B.cmd_elo(client, FakeMessage("/elo", uid=111, name="Chess1", chat_id=111, ctype="private"))
@@ -536,6 +537,7 @@ async def main():
     FakeMessage.outbox.clear()
     await B.cmd_chesstop(client, FakeMessage("/chesstop", uid=111, name="Chess1", chat_id=111, ctype="private"))
     check("/chesstop", any("Chess" in t for _, t in FakeMessage.outbox))
+    B._botapi_call_sync = _orig_botapi
 
     # ---- Mines: safe pick + cashout, and boom ----
     B.get_user(111)["coins"] = 5000
@@ -3212,6 +3214,211 @@ async def main():
           str([t[:40] for _, t, _ in FakeMessage.edits]))
     check("v241 callback send via pyrogram", any("WORD GRID" in t for _, t in FakeMessage.outbox),
           str([t[:40] for _, t in FakeMessage.outbox]))
+
+    # ================= v2.5.0: 2-player chess in the Mini App =================
+    # /chess lobby carries a Join button; a second player joins (button,
+    # /joinchess or /join) and both play in the Mini App (turn-based, the bot
+    # relays moves). Matches live in _CHESS_MATCHES so several pairs can
+    # play in one group at once; one user at most one match.
+    B._botapi_call_sync = _fake_botapi_ok  # Mini App buttons go via Bot API
+
+    def _botapi_weburls(calls):
+        urls = []
+        for _m, _p in calls:
+            for _row in (_p.get("reply_markup") or {}).get("inline_keyboard", []):
+                for _b in _row:
+                    if _b.get("web_app", {}).get("url"):
+                        urls.append(_b["web_app"]["url"])
+        return urls
+
+    def _kb_cbs(kb):
+        return [b.callback_data for row in (kb.inline_keyboard if kb else []) for b in row]
+
+    # (a) lobby shows Join button; Join-button click pairs White/Black and
+    # posts Mini App buttons (one per color, current FEN in the URL)
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); _botapi_calls.clear()
+    await B.cmd_chess(client, FakeMessage("/chess", uid=411, name="ChessA", chat_id=-100301))
+    _lob = FakeMessage.outbox_full[-1]
+    _mid_a = B._chess_matches_in_chat(-100301)[0]["match_id"]
+    check("v250 lobby join button", _lob[1].startswith("♟️ **CHESS**")
+          and f"chess:join:{_mid_a}" in _kb_cbs(_lob[2].get("reply_markup")), str(_lob[2]))
+    check("v250 lobby waiting", len(B._chess_matches_in_chat(-100301)) == 1
+          and not B._chess_matches_in_chat(-100301)[0].get("started"))
+    _cbq = FakeCallbackQuery(f"chess:join:{_mid_a}", uid=422, name="ChessB",
+                             message=FakeMessage("/chess", uid=411, name="ChessA", chat_id=-100301))
+    _botapi_calls.clear()
+    await B.chess_join_callbacks(client, _cbq)
+    _m_a = B._chess_matches_in_chat(-100301)[0]
+    check("v250 join button pairs white/black", _m_a.get("started") and _m_a["players"] == [411, 422],
+          str(_m_a["players"]))
+    check("v250 join button answers", _cbq.answers and _cbq.answers[0][0] == "Join ho gaya! 🎉",
+          str(_cbq.answers))
+    _start_urls = _botapi_weburls(_botapi_calls)
+    check("v250 start posts miniapp buttons", len(_start_urls) == 2
+          and all(u.startswith(B.MINIAPP_URL + "?match=" + _mid_a) and "fen=" in u for u in _start_urls)
+          and any("you=white" in u and "w=411" in u and "b=422" in u for u in _start_urls)
+          and any("you=black" in u for u in _start_urls)
+          and any("fen=rnbqkbnr%2Fpppppppp" in u for u in _start_urls), str(_start_urls))
+    # (b) /joinchess and /join do the same thing
+    await B.cmd_chess(client, FakeMessage("/chess", uid=433, name="ChessC", chat_id=-100302))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=444, name="ChessD", chat_id=-100302))
+    check("v250 joinchess pairs", B._chess_matches_in_chat(-100302)[0].get("started")
+          and B._chess_matches_in_chat(-100302)[0]["players"] == [433, 444])
+    await B.cmd_chess(client, FakeMessage("/chess", uid=455, name="ChessE", chat_id=-100303))
+    await B.cmd_join_generic(client, FakeMessage("/join", uid=466, name="ChessF", chat_id=-100303))
+    check("v250 /join joins chess lobby", B._chess_matches_in_chat(-100303)[0].get("started"))
+    # (c) move validation on match A (411 White, 422 Black): wrong turn,
+    # illegal move, valid move notifies the opponent with the new FEN
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e7e5", uid=422, name="ChessB", chat_id=-100301))
+    check("v250 wrong turn rejected", any("tumhari baari nahi" in t for _, t in FakeMessage.outbox)
+          and B._chess_matches_in_chat(-100301)[0]["board"].fen().startswith("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w"))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e2e5", uid=411, name="ChessA", chat_id=-100301))
+    check("v250 illegal move rejected", any("legal nahi" in t for _, t in FakeMessage.outbox))
+    _botapi_calls.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e2e4", uid=411, name="ChessA", chat_id=-100301))
+    _fen_a = B._chess_matches_in_chat(-100301)[0]["board"].fen()
+    check("v250 valid move updates board", _fen_a.startswith("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b"),
+          _fen_a)
+    _after_urls = _botapi_weburls(_botapi_calls)
+    check("v250 opponent notified with new fen", len(_after_urls) == 2
+          and any("4P3" in u for u in _after_urls), str(_after_urls))
+    # (d) Mini App move via web_app_data: Black e7e5, then wrong-turn and
+    # non-player moves are rejected with the exact reason
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "match_id": _mid_a, "move": "e7e5"}), uid=422, chat_id=-100301))
+    _fen_a = B._chess_matches_in_chat(-100301)[0]["board"].fen()
+    check("v250 webapp move updates board", _fen_a.startswith("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w"),
+          _fen_a)
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "match_id": _mid_a, "move": "e7e6"}), uid=422, chat_id=-100301))
+    check("v250 webapp wrong turn rejected", any("tumhari baari nahi" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "match_id": _mid_a, "move": "e2e4"}), uid=499, chat_id=-100301))
+    check("v250 webapp non-player rejected", any("tumhara nahi hai" in t for _, t in FakeMessage.outbox))
+    # (e) checkmate (fool's mate, fresh match) credits +500 and removes it
+    B.get_user(522, "ChessBlack")["coins"] = 1000
+    B.get_user(511, "ChessWhite")["coins"] = 1000
+    await B.cmd_chess(client, FakeMessage("/chess", uid=511, name="ChessW", chat_id=-100304))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=522, name="ChessB", chat_id=-100304))
+    await B.cmd_chess_move(client, FakeMessage("/move f2f3", uid=511, name="ChessW", chat_id=-100304))
+    await B.cmd_chess_move(client, FakeMessage("/move e7e5", uid=522, name="ChessB", chat_id=-100304))
+    await B.cmd_chess_move(client, FakeMessage("/move g2g4", uid=511, name="ChessW", chat_id=-100304))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move d8h4", uid=522, name="ChessB", chat_id=-100304))
+    check("v250 checkmate ends match", not B._chess_matches_in_chat(-100304)
+          and any("CHECKMATE" in t for _, t in FakeMessage.outbox))
+    check("v250 checkmate winner +500", B.get_user(522)["coins"] == 1500
+          and B.get_user(511)["coins"] == 1000,
+          f"w={B.get_user(522)['coins']} l={B.get_user(511)['coins']}")
+    check("v250 checkmate elo", B.get_user(522)["elo"] > 1200 and B.get_user(511)["elo"] < 1200)
+    # (f) draw (bare kings, one move) refunds + pays +100 each
+    B.get_user(611, "DrawW")["coins"] = 1000
+    B.get_user(622, "DrawB")["coins"] = 1000
+    await B.cmd_chess(client, FakeMessage("/chess", uid=611, name="DrawW", chat_id=-100305))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=622, name="DrawB", chat_id=-100305))
+    _m_d = B._chess_matches_in_chat(-100305)[0]
+    _m_d["board"] = B._chess.Board("8/8/4k3/8/8/8/4K3/8 w - - 0 1")
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e2e3", uid=611, name="DrawW", chat_id=-100305))
+    check("v250 draw ends match", not B._chess_matches_in_chat(-100305)
+          and any("Draw" in t for _, t in FakeMessage.outbox))
+    check("v250 draw +100 each", B.get_user(611)["coins"] == 1100 and B.get_user(622)["coins"] == 1100,
+          f"w={B.get_user(611)['coins']} b={B.get_user(622)['coins']}")
+    # (g) resign: opponent wins +500
+    B.get_user(711, "ResW")["coins"] = 1000
+    B.get_user(722, "ResB")["coins"] = 1000
+    await B.cmd_chess(client, FakeMessage("/chess", uid=711, name="ResW", chat_id=-100306))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=722, name="ResB", chat_id=-100306))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_resign(client, FakeMessage("/resign", uid=711, name="ResW", chat_id=-100306))
+    check("v250 resign ends match", not B._chess_matches_in_chat(-100306)
+          and any("resign" in t for _, t in FakeMessage.outbox))
+    check("v250 resign winner +500", B.get_user(722)["coins"] == 1500
+          and B.get_user(711)["coins"] == 1000)
+    # (h) 2-min lobby timeout refunds the bet; a started match is untouched
+    B.get_user(811, "TimeW")["coins"] = 5000
+    await B.cmd_chess(client, FakeMessage("/chess 100", uid=811, name="TimeW", chat_id=-100307))
+    _mid_t = B._chess_matches_in_chat(-100307)[0]["match_id"]
+    check("v250 bet taken at lobby", B.get_user(811)["coins"] == 4900)
+    FakeMessage.outbox.clear()
+    await B._chess_lobby_timeout(_mid_t, seconds=0)
+    check("v250 lobby timeout refunds bet", not B._chess_matches_in_chat(-100307)
+          and B.get_user(811)["coins"] == 5000
+          and any("2 minute" in t for _, t in FakeMessage.outbox))
+    await B._chess_lobby_timeout(_mid_a, seconds=0)
+    check("v250 timeout ignores started match", len(B._chess_matches_in_chat(-100301)) == 1)
+    # (i) /end clears chess matches (waiting lobby + started match)
+    await B.cmd_chess(client, FakeMessage("/chess", uid=911, name="EndW", chat_id=-100308))
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=911, name="EndW", chat_id=-100308))
+    check("v250 /end clears waiting lobby", not B._chess_matches_in_chat(-100308)
+          and any("khatam" in t for _, t in FakeMessage.outbox))
+    await B.cmd_end_game(client, FakeMessage("/end", uid=411, name="ChessA", chat_id=-100301))
+    check("v250 /end clears started match", not B._chess_matches_in_chat(-100301))
+    # (j) two concurrent matches in ONE group stay independent
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1011, name="Pair1W", chat_id=-100310))
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1033, name="Pair2W", chat_id=-100310))
+    _two = B._chess_matches_in_chat(-100310)
+    check("v250 two lobbies same group", len(_two) == 2, str(len(_two)))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=1022, name="Pair1B", chat_id=-100310))
+    check("v250 two lobbies need button", len(B._chess_matches_in_chat(-100310)) == 2
+          and sum(1 for m in B._chess_matches_in_chat(-100310) if m.get("started")) == 0)
+    # join the second lobby via its own Join button, then the first one
+    _mid2 = [m for m in B._chess_matches_in_chat(-100310) if m["players"][0] == 1033][0]["match_id"]
+    _cbq2 = FakeCallbackQuery(f"chess:join:{_mid2}", uid=1044, name="Pair2B",
+                              message=FakeMessage("/chess", uid=1033, name="Pair2W", chat_id=-100310))
+    await B.chess_join_callbacks(client, _cbq2)
+    _mid1 = [m for m in B._chess_matches_in_chat(-100310) if m["players"][0] == 1011][0]["match_id"]
+    _cbq1 = FakeCallbackQuery(f"chess:join:{_mid1}", uid=1022, name="Pair1B",
+                              message=FakeMessage("/chess", uid=1011, name="Pair1W", chat_id=-100310))
+    await B.chess_join_callbacks(client, _cbq1)
+    _two = B._chess_matches_in_chat(-100310)
+    check("v250 both matches started", len(_two) == 2 and all(m.get("started") for m in _two))
+    _m1 = [m for m in _two if m["players"][0] == 1011][0]
+    _m2 = [m for m in _two if m["players"][0] == 1033][0]
+    await B.cmd_chess_move(client, FakeMessage("/move e2e4", uid=1011, name="Pair1W", chat_id=-100310))
+    check("v250 concurrent matches independent",
+          _m1["board"].fen().startswith("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b")
+          and _m2["board"].fen().startswith("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w"),
+          f"m1={_m1['board'].fen()} m2={_m2['board'].fen()}")
+    # (k) one user, one match: cannot start or join a second one
+    FakeMessage.outbox.clear()
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1011, name="Pair1W", chat_id=-100310))
+    check("v250 one match per user (start)", any("pehle wala khatam karo" in t for _, t in FakeMessage.outbox))
+    # a fresh waiting lobby — 1011 is already in a match, so Join is refused
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1055, name="Pair3W", chat_id=-100310))
+    _mid3 = [m for m in B._chess_matches_in_chat(-100310) if m["players"][0] == 1055][0]["match_id"]
+    _cbq3 = FakeCallbackQuery(f"chess:join:{_mid3}", uid=1011, name="Pair1W",
+                              message=FakeMessage("/chess", uid=1055, name="Pair3W", chat_id=-100310))
+    await B.chess_join_callbacks(client, _cbq3)
+    check("v250 one match per user (join)", _cbq3.answers and "pehle se ek chess match" in (_cbq3.answers[0][0] or ""),
+          str(_cbq3.answers))
+    check("v250 one match per user (lobby stays waiting)",
+          len([m for m in B._chess_matches_in_chat(-100310) if m["players"][0] == 1055]) == 1
+          and not B._chess_matches_in_chat(-100310)[-1].get("started"))
+    # (l) solo Mini App chess unchanged: a solo win result still credits
+    # (the v2.5.0 web_app_data gate only reroutes payloads WITH a match_id)
+    _u999 = B.get_user(999, "SoloChess")
+    _u999["coins"] = 2000
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "chess", "result": "win", "coins": 100}', uid=999))
+    check("v250 solo chess win still credits", B.get_user(999)["coins"] == 2100,
+          f"coins={B.get_user(999)['coins']}")
+    # (m) web_app_data chess moves with bad payloads are ignored silently
+    _before = B.get_user(999)["coins"]
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        '{"game": "chess", "move": "e2e4"}', uid=999))  # no match_id
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "match_id": "chess-nope-1", "move": "e2e4"}), uid=999))  # unknown match
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "match_id": _mid2, "move": "e2e4"}), uid=1033, chat_id=-100999))  # wrong chat
+    check("v250 bad chess webapp payloads ignored", B.get_user(999)["coins"] == _before
+          and not FakeMessage.outbox)
+    B._botapi_call_sync = _orig_botapi
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

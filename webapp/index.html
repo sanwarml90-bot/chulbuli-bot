@@ -171,7 +171,7 @@
   <button class="back" onclick="show('menu')">← Wapas</button>
   <h2>♟️ Chess</h2>
   <p class="sub">Piece pe tap karo, phir uski chaal wali jagah pe tap karo. Promotion auto-queen.</p>
-  <div style="text-align:center;margin-bottom:10px">
+  <div id="chessModeRow" style="text-align:center;margin-bottom:10px">
     <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessMode('2p')">👥 2 Player</button>
     <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessMode('bot')">🤖 Bot se khelo</button>
     <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessReset()">🔄 Naya game</button>
@@ -329,11 +329,13 @@ function chessReset() {
     document.getElementById("chessStatus").textContent = "Chess engine load nahi hua — dobara kholo 🙂";
     return;
   }
+  if (chessModeV === "online") { toast("Online match chal raha hai — naya game yahan se nahi 🙂"); return; }
   chess = new Chess(); chessSel = null; chessLast = null; chessRewarded = false;
   document.getElementById("chessResult").className = "result";
   renderChess();
 }
 function chessMode(m) {
+  if (chessModeV === "online") { toast("Online match chal raha hai — mode nahi badal sakte 🙂"); return; }
   chessModeV = m; chessReset();
   toast(m === "bot" ? "Bot se khelo — tum Safed ho 🙂" : "2 Player — dono ek hi phone pe khelo 🙂");
 }
@@ -358,10 +360,25 @@ function renderChess() {
     board.appendChild(sq);
   }
   let status;
-  if (chess.in_checkmate()) status = (chess.turn() === "w" ? "Kaala" : "Safed") + " jeet gaya — CHECKMATE! 🏆";
+  if (chessModeV === "online") {
+    const youName = onlineYou === "w" ? "Safed (tum)" : "Kaala (tum)";
+    if (chess.in_checkmate()) status = (chess.turn() === "w" ? "Kaala" : "Safed") + " jeet gaya — CHECKMATE! 🏆";
+    else if (chess.in_draw() || chess.in_stalemate()) status = "Draw ho gaya 🤝";
+    else status = "Online match • Tum " + youName + " ho • " + (chess.turn() === onlineYou ? "TUMHARI baari hai ♟️ — chaal chalo!" : "Opponent ki baari hai — uski chaal ka wait karo 🙂") + (chess.in_check() ? " — CHECK! ⚠️" : "");
+  } else if (chess.in_checkmate()) status = (chess.turn() === "w" ? "Kaala" : "Safed") + " jeet gaya — CHECKMATE! 🏆";
   else if (chess.in_draw() || chess.in_stalemate()) status = "Draw ho gaya 🤝";
   else status = (chess.turn() === "w" ? "Safed" : "Kaala") + " ki baari" + (chess.in_check() ? " — CHECK! ⚠️" : "");
   document.getElementById("chessStatus").textContent = status;
+  if (chessModeV === "online") {
+    // Online: the bot is authoritative (coins + result are announced in the
+    // group) — the board only shows the outcome, no local coin claim.
+    if (chess.game_over()) {
+      const el = document.getElementById("chessResult");
+      el.className = "result show";
+      el.innerHTML = "<div class='big'>" + status + "</div>";
+    }
+    return;
+  }
   if (chess.game_over() && !chessRewarded) {
     chessRewarded = true;
     if (chess.in_checkmate()) {
@@ -378,6 +395,30 @@ function renderChess() {
 }
 function chessTap(sq) {
   if (!chess || chess.game_over()) return;
+  if (chessModeV === "online") {
+    // Online match: only your own pieces, only on your turn. The move is
+    // validated against the legal list WITHOUT applying it locally — the
+    // bot is the only authority. A legal move is sent to the bot (sendData
+    // closes the WebApp); the bot validates it and posts the updated board
+    // in the group. Promotion is auto-queen.
+    if (chess.turn() !== onlineYou) { toast("Abhi tumhari baari nahi hai 🙂"); return; }
+    if (chessSel) {
+      const cands = chess.moves({ verbose: true }).filter(m => m.from === chessSel && m.to === sq);
+      const legal = cands.find(m => m.promotion === "q") || cands[0];
+      if (legal) {
+        const uci = legal.from + legal.to + (legal.promotion ? legal.promotion : "");
+        if (tg && tg.sendData) tg.sendData(JSON.stringify({ game: "chess", match_id: onlineMatch, move: uci }));
+        else toast("Chaal tabhi jayegi jab Mini App Telegram ke andar kholo 🙂");
+        chessSel = null; renderChess();
+        return;
+      }
+      chessSel = null;
+    }
+    const piece = chess.get(sq);
+    if (piece && piece.color === onlineYou) { chessSel = sq; renderChess(); }
+    else renderChess();
+    return;
+  }
   if (chessModeV === "bot" && chess.turn() === "b") return;
   if (chessSel) {
     const mv = chess.move({ from: chessSel, to: sq, promotion: "q" });
@@ -399,6 +440,38 @@ function botChessMove() {
   chessLast = chess.move(moves[Math.floor(Math.random() * moves.length)]);
   renderChess();
 }
+
+// ================= Online chess (v2.5.0) =================
+// The bot's Mini App buttons open this page with ?match=<id>&fen=<FEN>&you=
+// <white|black>&w=<white uid>&b=<black uid>. The board loads from the FEN
+// (the bot is the only authority on the game state); a tap sends the move
+// back with Telegram.WebApp.sendData and the bot validates + reposts the
+// board in the group. No auto-refresh here — the new board arrives via the
+// group's next Mini App button.
+const _qp = new URLSearchParams(window.location.search);
+const onlineMatch = _qp.get("match") || null;
+const onlineFen = _qp.get("fen") || null;
+let onlineYou = (_qp.get("you") === "black") ? "b" : "w";
+const onlineW = _qp.get("w") || null, onlineB = _qp.get("b") || null;
+(function initOnlineChess() {
+  if (!onlineMatch || typeof Chess === "undefined") return;
+  // Prefer the real Telegram user id over the URL hint (a player tapping
+  // the other color's button still gets their own color).
+  try {
+    const me = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? String(tg.initDataUnsafe.user.id) : null;
+    if (me && onlineW && me === onlineW) onlineYou = "w";
+    else if (me && onlineB && me === onlineB) onlineYou = "b";
+  } catch (e) {}
+  chessModeV = "online";
+  try { chess = new Chess(onlineFen || undefined); }
+  catch (e) { chess = new Chess(); }
+  chessSel = null; chessLast = null; chessRewarded = false;
+  const row = document.getElementById("chessModeRow");
+  if (row) row.style.display = "none";
+  document.getElementById("chessResult").className = "result";
+  show("chess");
+  renderChess();
+})();
 
 // ================= UNO (simplified, bot ke saath) =================
 const UNO_COLORS = ["red", "green", "blue", "yellow"];

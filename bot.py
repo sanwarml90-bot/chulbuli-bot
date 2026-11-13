@@ -43,6 +43,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -87,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -1086,6 +1087,11 @@ async def web_app_data_handler(client: Client, message: Message):
         payload = json.loads(data.data)
     except Exception:  # noqa: BLE001
         return
+    if str(payload.get("game", "")) == "chess" and payload.get("match_id"):
+        # v2.5.0 — a move sent from the Mini App online chess board. A solo
+        # chess result (no match_id) falls through to the coin logic below.
+        await _chess_webapp_move(message, payload)
+        return
     game = str(payload.get("game", "game"))
     result = str(payload.get("result", ""))
     try:
@@ -2005,7 +2011,18 @@ async def do_join(chat_id: int, uid: int, name: str) -> str | None:
         mstate["names"][str(uid)] = name
         return f"🎭 {name} mafia me join ho gaya! Players: {len(mstate['players'])}/12 — /forcestart se shuru karo 🙂"
     state = game_state(chat_id)
-    if not state or state.get("started"):
+    if not state:
+        # v2.5.0 — chess matches live in _CHESS_MATCHES, not GAMES. /join
+        # joins the single waiting chess lobby in this chat (if there is
+        # exactly one); several lobbies need the Join button on the lobby.
+        waiting = [m for m in _chess_matches_in_chat(chat_id) if not m.get("started")]
+        if len(waiting) == 1:
+            err = await _chess_join(waiting[0], uid, name)
+            return "" if err is None else err
+        if len(waiting) > 1:
+            return "Is group me kai chess match khule hain — jis me khelna hai uska Join button dabao 🙂"
+        return None
+    if state.get("started"):
         return None
     kind = state.get("kind")
     if kind == "wordchain":
@@ -2043,18 +2060,6 @@ async def do_join(chat_id: int, uid: int, name: str) -> str | None:
         return f"🎮 {name} join ho gaya! Players: {len(state['players'])} — /forcestart se shuru karo 🙂"
     if kind == "card":
         return _card_join(chat_id, uid, name)
-    if kind == "chess":
-        if len(state["players"]) >= 2:
-            return None
-        if uid == state["players"][0]:
-            return None
-        err = _join_fee(state, user)
-        if err:
-            return err
-        state["players"].append(uid)
-        state["names"][str(uid)] = name
-        await _chess_start(chat_id)
-        return ""
     return None
 
 
@@ -5195,6 +5200,30 @@ async def safe_reply_text(chat_id: int, text: str, **kwargs):
         print(f"[chulbuli] send to {chat_id} failed: {exc!r}")
 
 
+async def safe_send_text(chat_id: int, text: str, **kwargs):
+    """v2.5.0 — app.send_message with the v2.4.1 web_app routing: a markup
+    with a web_app button goes via the Bot API (Pyrogram MTProto rejects it
+    with 400 BUTTON_TYPE_INVALID); on Bot API failure fall back to the same
+    text via Pyrogram without the web_app row."""
+    markup = kwargs.get("reply_markup")
+    if _markup_has_web_app(markup):
+        try:
+            await _botapi_send_message(chat_id, text, reply_markup=markup)
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] Bot API send failed, falling back to Pyrogram: {exc!r}")
+            kwargs = dict(kwargs)
+            stripped = _strip_web_app(markup)
+            if stripped is None:
+                kwargs.pop("reply_markup", None)
+            else:
+                kwargs["reply_markup"] = stripped
+    try:
+        await app.send_message(chat_id, text, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] send to {chat_id} failed: {exc!r}")
+
+
 def _uno_advance(state: dict, skip: bool = False) -> int:
     n = len(state["players"])
     step = state["dir"] * (2 if skip else 1)
@@ -5382,6 +5411,12 @@ async def cmd_pass(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 # Chess — one implementation (Nova). /chess [amount], /joinchess (or /join),
 # /move e2e4, /board, /resign, /elo, /chesstop. Uses python-chess.
+# v2.5.0 — 2-player chess in the Mini App with group matchmaking (Sanji):
+# a /chess lobby carries a Join button; when a second user joins, both play
+# in the Mini App (turn-based, the bot relays moves). Matches live in
+# _CHESS_MATCHES (NOT in GAMES) so several pairs can play their own match
+# in the same group at the same time; a user may be in at most ONE active
+# chess match at a time. Chat /move and the Mini App move the SAME board.
 # ---------------------------------------------------------------------------
 def elo_update(winner_elo: int, loser_elo: int, k: int = 32) -> tuple[int, int]:
     import math as _math
@@ -5402,17 +5437,226 @@ def chess_board_text(board) -> str:
     return "\n".join(rows)
 
 
-async def _chess_start(chat_id: int):
-    state = game_state(chat_id)
-    if not state or state.get("kind") != "chess":
+_CHESS_MATCHES: dict[str, dict] = {}  # match_id -> chess match (v2.5.0)
+_CHESS_SEQ = 0                        # match-id counter (same-ms uniqueness)
+
+
+def _chess_new_match(chat_id: int, host_uid: int, amount: int) -> dict:
+    """Create a chess match in _CHESS_MATCHES (NOT in GAMES — several
+    matches may run in one group at the same time)."""
+    global _CHESS_SEQ
+    _CHESS_SEQ += 1
+    match_id = f"chess-{int(time.time() * 1000)}-{_CHESS_SEQ}"
+    match = {"kind": "chess", "match_id": match_id, "chat_id": chat_id,
+             "players": [host_uid], "names": {str(host_uid): ""},
+             "started": False, "amount": amount, "pot": 0,
+             "board": _chess.Board(), "created": time.time()}
+    _CHESS_MATCHES[match_id] = match
+    return match
+
+
+def _chess_matches_in_chat(chat_id: int) -> list[dict]:
+    """All chess matches in a chat, oldest first."""
+    return sorted((m for m in _CHESS_MATCHES.values() if m["chat_id"] == chat_id),
+                  key=lambda m: m["created"])
+
+
+def _chess_user_match(uid: int) -> dict | None:
+    """The active chess match a user is in (any chat), or None."""
+    for m in _CHESS_MATCHES.values():
+        if uid in m["players"]:
+            return m
+    return None
+
+
+def _chess_match_for_user(chat_id: int, uid: int) -> dict | None:
+    """The chess match a user is playing in this chat, or None."""
+    for m in _chess_matches_in_chat(chat_id):
+        if uid in m["players"]:
+            return m
+    return None
+
+
+def _chess_miniapp_url(match: dict, color: str) -> str:
+    """Mini App URL for one player: match id + current FEN + color + both
+    player ids (the Mini App auto-detects the color from the Telegram user
+    id when it can, and falls back to the `you` param)."""
+    fen = match["board"].fen()
+    w, b = match["players"][0], match["players"][1]
+    qs = (f"match={match['match_id']}&fen={urllib.parse.quote(fen, safe='')}"
+          f"&you={color}&w={w}&b={b}")
+    return MINIAPP_URL + "?" + qs
+
+
+def _chess_miniapp_markup(match: dict) -> InlineKeyboardMarkup:
+    """Two web_app buttons — one per color — so each player opens the Mini
+    App as themselves. (safe_reply/safe_send_text route web_app markups via
+    the Bot API, v2.4.1 — Pyrogram MTProto rejects them.)"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤍 White — Mini App me khelo",
+                              web_app=WebAppInfo(url=_chess_miniapp_url(match, "white")))],
+        [InlineKeyboardButton("🖤 Black — Mini App me khelo",
+                              web_app=WebAppInfo(url=_chess_miniapp_url(match, "black")))],
+    ])
+
+
+def chess_join_keyboard(match_id: str) -> InlineKeyboardMarkup:
+    """v2.5.0 — Join button on a chess lobby message. The match_id is in the
+    callback so several chess lobbies can wait in one group at once."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Join karo", callback_data=f"chess:join:{match_id}")]])
+
+
+async def _chess_lobby_timeout(match_id: str, seconds: int = LOBBY_TIMEOUT_SECONDS) -> None:
+    """v2.5.0 — 2-minute lobby rule for chess matches (same as v2.4.0):
+    if nobody joined within `seconds`, cancel the lobby (refund the host's
+    bet) with a message. A started match is never touched."""
+    await asyncio.sleep(seconds)
+    match = _CHESS_MATCHES.get(match_id)
+    if not match or match.get("started"):
         return
-    state["started"] = True
-    white, black = state["players"][0], state["players"][1]
-    wn = state["names"].get(str(white), "")
-    bn = state["names"].get(str(black), "")
-    await safe_reply_text(chat_id, f"♟️ **CHESS SHURU!**\n🤍 White: {wn}\n🖤 Black: {bn}\n"
-          f"White ki pehli chaal — /move e2e4 jaise bhejo. /board se board dekho, /resign se haar maano.\n"
-          f"{chess_board_text(state['board'])}")
+    _refund_lobby(match)
+    _CHESS_MATCHES.pop(match_id, None)
+    try:
+        await app.send_message(match["chat_id"],
+              "⏰ 2 minute me koi join nahi hua — Chess match khatam kar diya 🙂 "
+              "dobara shuru karna ho to /chess likho")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _chess_start(match: dict):
+    """Second player joined — start the match and post the board with the
+    Mini App buttons (one per color)."""
+    match["started"] = True
+    white, black = match["players"][0], match["players"][1]
+    wn = match["names"].get(str(white), "")
+    bn = match["names"].get(str(black), "")
+    await safe_send_text(match["chat_id"], f"♟️ **CHESS SHURU!**\n🤍 White: {wn}\n🖤 Black: {bn}\n"
+          f"White ki pehli chaal — Mini App me khelo ya /move e2e4 likho. /board se board dekho, /resign se haar maano.\n"
+          f"{chess_board_text(match['board'])}",
+          reply_markup=_chess_miniapp_markup(match))
+
+
+async def _chess_join(match: dict, uid: int, name: str) -> str | None:
+    """Join a waiting chess match as Black. Returns None on success (the
+    start message is sent internally) or an error text."""
+    if match.get("started") or len(match["players"]) >= 2:
+        return "Match full hai ya shuru ho chuka hai 🙂"
+    if uid == match["players"][0]:
+        return "Khud se nahi khel sakte 😂"
+    if _chess_user_match(uid) is not None:
+        return "Tum pehle se ek chess match me ho — pehle wala khatam karo 🙂"
+    user = get_user(uid, name)
+    err = _join_fee(match, user)
+    if err:
+        return err
+    match["players"].append(uid)
+    match["names"][str(uid)] = name
+    await _chess_start(match)
+    return None
+
+
+def _chess_do_move(match: dict, uid: int, uci: str) -> dict:
+    """Validate + apply ONE chess move (shared by /move and the Mini App).
+    Returns {"ok": False, "error": "..."} or a success dict. On success the
+    board is updated in the match; on game-over the match is settled (coins
+    + Elo) and removed from _CHESS_MATCHES. Promotion is auto-queen when the
+    move text has no promotion piece (v2.5.0 — no picker in the Mini App)."""
+    board = match["board"]
+    players = match["players"]
+    if uid not in players:
+        return {"ok": False, "error": "Ye match tumhara nahi hai 🙂"}
+    if not match.get("started"):
+        return {"ok": False, "error": "Match abhi shuru nahi hua — pehle dusra player join kare 🙂"}
+    turn_uid = players[0] if board.turn == _chess.WHITE else players[1]
+    if uid != turn_uid:
+        return {"ok": False, "error": "Abhi tumhari baari nahi hai 🙂"}
+    try:
+        mv = _chess.Move.from_uci(uci)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "Chaal aise likho: e2e4 (promotion: e7e8q) 🙂"}
+    if mv not in board.legal_moves and len(uci) == 4:
+        # Auto-queen: a pawn reaching the last rank with no promotion piece
+        # given is played as a queen.
+        try:
+            mvq = _chess.Move.from_uci(uci + "q")
+        except Exception:  # noqa: BLE001
+            mvq = None
+        if mvq is not None and mvq in board.legal_moves:
+            mv = mvq
+    if mv not in board.legal_moves:
+        return {"ok": False, "error": "Ye chaal legal nahi hai — /board dekh ke dobara try karo 🙂"}
+    san = board.san(mv)
+    board.push(mv)
+    me = match["names"].get(str(uid), "")
+    if board.is_checkmate():
+        winner, loser = uid, players[1] if uid == players[0] else players[0]
+        wu, lu = get_user(winner), get_user(loser)
+        wu["elo"], lu["elo"] = elo_update(wu.get("elo", 1200), lu.get("elo", 1200))
+        pot = match.get("pot", 0)
+        prize = _pay_winner(match["chat_id"], winner, pot, 500, "")
+        save_data()
+        _CHESS_MATCHES.pop(match["match_id"], None)
+        return {"ok": True, "san": san, "over": True, "winner": winner,
+                "draw": False, "prize": prize, "elo": wu["elo"], "me": me}
+    if board.is_stalemate() or board.is_insufficient_material() or board.is_seventyfive_moves():
+        _refund_lobby(match)
+        for p in players:
+            add_coins(get_user(p), 100)  # draw bonus, +100 each
+        save_data()
+        _CHESS_MATCHES.pop(match["match_id"], None)
+        return {"ok": True, "san": san, "over": True, "winner": None,
+                "draw": True, "prize": 100, "me": me}
+    nxt = players[0] if board.turn == _chess.WHITE else players[1]
+    return {"ok": True, "san": san, "check": board.is_check(), "over": False,
+            "next_uid": nxt, "me": me}
+
+
+def _chess_turn_text(match: dict, san: str, check: bool, mover: str) -> str:
+    """Group message after a chess move: what was played, whose turn it is
+    (the opponent is tagged), and the board."""
+    board = match["board"]
+    nxt = match["players"][0] if board.turn == _chess.WHITE else match["players"][1]
+    nxt_name = match["names"].get(str(nxt), "")
+    return (f"♟️ {mover}: **{san}**" + (" — **CHECK!** ⚠️" if check else "") +
+            f"\nAb [{nxt_name}](tg://user?id={nxt}) ki baari — Mini App me khelo ya /move likho 🙂\n"
+            f"{chess_board_text(board)}")
+
+
+async def _chess_announce_move(message, match: dict, res: dict):
+    """Post the result of a successful chess move (chat /move or Mini App)."""
+    if res["over"]:
+        if res["draw"]:
+            await safe_reply(message, f"♟️ {res['me']}: **{res['san']}**\n"
+                  f"🤝 Draw ho gaya! Bets wapas + dono ko +{fmt_coins(100)} coins 🙂")
+        else:
+            wname = match["names"].get(str(res["winner"]), "")
+            await safe_reply(message, f"♟️ {res['me']} ne **{res['san']}** chala — **CHECKMATE!** 🏆\n"
+                  f"{wname} jeet gaya! +{fmt_coins(res['prize'])} coins, Elo ab {res['elo']}!")
+        return
+    await safe_send_text(match["chat_id"],
+                         _chess_turn_text(match, res["san"], res["check"], res["me"]),
+                         reply_markup=_chess_miniapp_markup(match))
+
+
+async def _chess_webapp_move(message, payload: dict):
+    """v2.5.0 — a chess move sent from the Mini App online board
+    ({game: "chess", match_id, move: "e2e4"}). Bad payloads (bad JSON is
+    already dropped by the caller, missing match/move, unknown or finished
+    match, wrong chat) are ignored silently; a bad move gets the exact
+    reason as a group reply."""
+    match_id = str(payload.get("match_id") or "")
+    uci = str(payload.get("move") or "").lower().strip()
+    if not match_id or not uci:
+        return
+    match = _CHESS_MATCHES.get(match_id)
+    if not match or match["chat_id"] != message.chat.id:
+        return
+    res = _chess_do_move(match, message.from_user.id, uci)
+    if not res["ok"]:
+        await safe_reply(message, res["error"])
+        return
+    await _chess_announce_move(message, match, res)
 
 
 @app.on_message(filters.command(["chess"]))
@@ -5425,6 +5669,9 @@ async def cmd_chess(client: Client, message: Message):
         return
     if _chess is None:
         await safe_reply(message, "Chess engine abhi available nahi hai 🙂")
+        return
+    if _chess_user_match(message.from_user.id) is not None:
+        await safe_reply(message, "Tum pehle se ek chess match me ho — pehle wala khatam karo 🙂")
         return
     amount = 0
     if len(message.command) > 1:
@@ -5439,18 +5686,17 @@ async def cmd_chess(client: Client, message: Message):
     if game_state(message.chat.id):
         await safe_reply(message, "Is group me pehle se ek game chal raha hai 🙂")
         return
-    state = _lobby_new(message.chat.id, "chess", message.from_user.id, amount)
-    state["names"][str(message.from_user.id)] = display_name(message.from_user)
-    state["board"] = _chess.Board()
-    asyncio.create_task(_lobby_timeout(message.chat.id, "chess"))
+    match = _chess_new_match(message.chat.id, message.from_user.id, amount)
+    match["names"][str(message.from_user.id)] = display_name(message.from_user)
+    asyncio.create_task(_chess_lobby_timeout(match["match_id"]))
     if amount > 0:
         add_coins(user, -amount)
-        state["pot"] = amount
+        match["pot"] = amount
         save_data()
     await safe_reply(message, "♟️ **CHESS** — challenge khula!\n"
-          "Koi /joinchess ya /join se Black banke aao. Winner ko "
+          "Join button dabao ya /joinchess likho — dusra player Black banke aayega. Winner ko "
           + (f"{fmt_coins(amount * 2)} ka pot + Elo points!" if amount else "Elo points!"),
-                     reply_markup=join_keyboard())
+                     reply_markup=chess_join_keyboard(match["match_id"]))
 
 
 @app.on_message(filters.command(["joinchess"]))
@@ -5458,19 +5704,51 @@ async def cmd_joinchess(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    state = game_state(message.chat.id)
-    if not state or state.get("kind") != "chess" or state.get("started"):
+    waiting = [m for m in _chess_matches_in_chat(message.chat.id) if not m.get("started")]
+    if not waiting:
         return
-    if message.from_user.id == state["players"][0]:
-        await safe_reply(message, "Khud se nahi khel sakte 😂")
+    if len(waiting) > 1:
+        await safe_reply(message, "Is group me kai chess match khule hain — jis me khelna hai uska Join button dabao 🙂")
         return
-    err = _join_fee(state, user)
+    err = await _chess_join(waiting[0], message.from_user.id, display_name(message.from_user))
     if err:
         await safe_reply(message, err)
+
+
+@app.on_callback_query(filters.regex(r"^chess:join:"))
+async def chess_join_callbacks(client: Client, query):
+    """v2.5.0 — Join button on a chess lobby message (same as /joinchess)."""
+    if query.from_user is None or is_banned(query.from_user.id):
+        try:
+            await query.answer("🚫", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
         return
-    state["players"].append(message.from_user.id)
-    state["names"][str(message.from_user.id)] = display_name(message.from_user)
-    await _chess_start(message.chat.id)
+    try:
+        match_id = query.data.split(":", 2)[2]
+        match = _CHESS_MATCHES.get(match_id)
+        if not match or match.get("started"):
+            await query.answer("Ye match ab nahi khula 🙂", show_alert=True)
+            return
+        err = await _chess_join(match, query.from_user.id, display_name(query.from_user))
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await query.answer("Join ho gaya! 🎉")
+        # Drop the Join button from the lobby message (the match started;
+        # the start message with the Mini App buttons is posted already).
+        try:
+            await _safe_edit(query.message, (query.message.text or "") +
+                  f"\n👥 Players: {match['names'].get(str(match['players'][0]), '')}, "
+                  f"{match['names'].get(str(match['players'][1]), '')}")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] chess join callback failed: {exc!r}")
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.on_message(filters.command(["move"]))
@@ -5478,47 +5756,15 @@ async def cmd_chess_move(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    state = game_state(message.chat.id)
-    if not state or state.get("kind") != "chess" or not state.get("started"):
-        return
-    uid = message.from_user.id
-    players = state["players"]
-    turn_uid = players[0] if state["board"].turn == _chess.WHITE else players[1]
-    if uid != turn_uid:
-        await safe_reply(message, "Abhi tumhari baari nahi hai 🙂")
+    match = _chess_match_for_user(message.chat.id, message.from_user.id)
+    if not match:
         return
     uci = (message.command[1].lower() if len(message.command) > 1 else "")
-    try:
-        mv = _chess.Move.from_uci(uci)
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Chaal aise likho: /move e2e4 (promotion: /move e7e8q) 🙂")
+    res = _chess_do_move(match, message.from_user.id, uci)
+    if not res["ok"]:
+        await safe_reply(message, res["error"])
         return
-    if mv not in state["board"].legal_moves:
-        await safe_reply(message, "Ye chaal legal nahi hai — /board dekh ke dobara try karo 🙂")
-        return
-    san = state["board"].san(mv)
-    state["board"].push(mv)
-    board = state["board"]
-    me = state["names"].get(str(uid), "")
-    if board.is_checkmate():
-        winner, loser = uid, players[1] if uid == players[0] else players[0]
-        wu, lu = get_user(winner), get_user(loser)
-        wu["elo"], lu["elo"] = elo_update(wu.get("elo", 1200), lu.get("elo", 1200))
-        pot = state.get("pot", 0)
-        prize = _pay_winner(message.chat.id, winner, pot, 500, "")
-        save_data()
-        set_game(message.chat.id, None)
-        await safe_reply(message, f"♟️ {me} ne **{san}** chala — **CHECKMATE!** 🏆\n"
-              f"{me} jeet gaya! +{fmt_coins(prize)} coins, Elo ab {wu['elo']}!")
-        return
-    if board.is_stalemate() or board.is_insufficient_material() or board.is_seventyfive_moves():
-        _refund_lobby(state)
-        set_game(message.chat.id, None)
-        await safe_reply(message, "♟️ Draw ho gaya! Bets wapas mil gaye 🙂")
-        return
-    nxt = players[0] if board.turn == _chess.WHITE else players[1]
-    check = " — **CHECK!** ⚠️" if board.is_check() else ""
-    await safe_reply(message, f"♟️ {me}: **{san}**{check}\nAb {state['names'].get(str(nxt), '')} ki baari.\n{chess_board_text(board)}")
+    await _chess_announce_move(message, match, res)
 
 
 @app.on_message(filters.command(["board"]))
@@ -5526,10 +5772,13 @@ async def cmd_chess_board(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    state = game_state(message.chat.id)
-    if not state or state.get("kind") != "chess":
+    match = _chess_match_for_user(message.chat.id, message.from_user.id)
+    if not match:
+        matches = _chess_matches_in_chat(message.chat.id)
+        match = matches[-1] if matches else None
+    if not match:
         return
-    await safe_reply(message, chess_board_text(state["board"]))
+    await safe_reply(message, chess_board_text(match["board"]))
 
 
 @app.on_message(filters.command(["resign"]))
@@ -5537,21 +5786,19 @@ async def cmd_chess_resign(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    state = game_state(message.chat.id)
-    if not state or state.get("kind") != "chess" or not state.get("started"):
+    match = _chess_match_for_user(message.chat.id, message.from_user.id)
+    if not match or not match.get("started"):
         return
     uid = message.from_user.id
-    if uid not in state["players"]:
-        return
-    winner = state["players"][1] if uid == state["players"][0] else state["players"][0]
+    winner = match["players"][1] if uid == match["players"][0] else match["players"][0]
     wu, lu = get_user(winner), get_user(uid)
     wu["elo"], lu["elo"] = elo_update(wu.get("elo", 1200), lu.get("elo", 1200))
-    pot = state.get("pot", 0)
+    pot = match.get("pot", 0)
     prize = _pay_winner(message.chat.id, winner, pot, 500, "")
     save_data()
-    set_game(message.chat.id, None)
+    _CHESS_MATCHES.pop(match["match_id"], None)
     await safe_reply(message, f"🏳️ {display_name(message.from_user)} ne resign kar diya — "
-          f"**{state['names'].get(str(winner), '')}** jeet gaya! +{fmt_coins(prize)} coins!")
+          f"**{match['names'].get(str(winner), '')}** jeet gaya! +{fmt_coins(prize)} coins!")
 
 
 @app.on_message(filters.command(["elo"]))
@@ -5575,8 +5822,6 @@ async def cmd_chesstop(client: Client, message: Message):
         lines.append(f"{i}. {u.get('name') or k} — {u.get('elo', 1200)}")
     await safe_reply(message, "\n".join(lines))
 
-
-# ---------------------------------------------------------------------------
 # Mines — one implementation (Nova). /mines <amount>, /pick <row> <col>,
 # /cashout. 5x5 grid, 3 mines.
 # ---------------------------------------------------------------------------
@@ -7391,10 +7636,11 @@ def _clear_all_game_state(chat_id: int) -> str | None:
     lobby bets where applicable. Returns "mafia" / "math" / "game" for what
     was cleared, or None when no game state existed. GAMES holds every
     set_game game (wordguess, wordgrid, wordchain, rps, cricket, math, card,
-    number, uno, chess, mines, tap, crash, jumble, charades, bingo, xoxo,
+    number, uno, mines, tap, crash, jumble, charades, bingo, xoxo,
     hack, bomb, roulette, bluff, subway, scribble); MAFIA holds mafia;
     _MATH_SINGLE holds the periodic math-poster question (the state the old
-    /end missed — it lives outside GAMES/MAFIA)."""
+    /end missed — it lives outside GAMES/MAFIA); _CHESS_MATCHES holds chess
+    matches (v2.5.0 — several pairs may play in one group at once)."""
     cleared = None
     state = game_state(chat_id)
     if state:
@@ -7402,6 +7648,12 @@ def _clear_all_game_state(chat_id: int) -> str | None:
             _refund_lobby(state)
         set_game(chat_id, None)
         cleared = "game"
+    for mid in [m["match_id"] for m in _chess_matches_in_chat(chat_id)]:
+        m = _CHESS_MATCHES.pop(mid)
+        if not m.get("started"):
+            _refund_lobby(m)
+        if cleared is None:
+            cleared = "game"
     if chat_id in MAFIA:
         st = MAFIA[chat_id]
         if not st.get("started"):
