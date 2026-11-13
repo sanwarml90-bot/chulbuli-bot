@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1087,6 +1088,14 @@ async def main():
 
         def extract_info(self, src, download=False):
             if download:
+                # mirror real yt-dlp: the FFmpegExtractAudio postprocessor
+                # needs BOTH ffmpeg and ffprobe; with the postprocessor on
+                # but ffprobe missing, real yt-dlp fails the whole download
+                # with "ffprobe and ffmpeg not found" (v2.3.5 root cause —
+                # Railway has the imageio-ffmpeg binary only, no ffprobe).
+                if self.opts.get("postprocessors") and shutil.which("ffprobe") is None:
+                    raise Exception("ERROR: Postprocessing: ffprobe and ffmpeg not found. "
+                                    "Please install or provide the path using ffmpeg-location")
                 # simulate a real download: write a dummy audio file where
                 # outtmpl points — mp3 when the ffmpeg postprocessor is on
                 # (as _music_download_sync requests), else the native ext
@@ -1445,6 +1454,59 @@ async def main():
     except B.MusicError as _e:
         check("download sync youtube blocked", str(_e) == "youtube_blocked", str(_e))
     B._yt_dlp = _real_ytdlp2
+    # ---- v2.3.5: ffprobe missing -> no mp3 extract, native file kept ----
+    # (Sanji's live /play report, 2026-11-13: "download failed: ERROR:
+    # Postprocessing: ffprobe and ffmpeg not found". Root cause: the old
+    # code added FFmpegExtractAudio whenever ffmpeg was findable, but the
+    # postprocessor needs BOTH ffmpeg and ffprobe — imageio-ffmpeg ships
+    # ffmpeg only, so on Railway the whole download failed even though
+    # the audio itself downloaded fine. Now the postprocessor is added
+    # only when both binaries are findable; else the native container is
+    # kept, which tgcalls decodes itself.)
+    _real_which = shutil.which
+
+    def _which_no_ffprobe(name):
+        if name == "ffprobe":
+            return None
+        return _real_which(name)
+
+    def _which_both(name):
+        if name in ("ffmpeg", "ffprobe"):
+            return f"/usr/bin/{name}"
+        return _real_which(name)
+
+    _buf235 = io.StringIO()
+    shutil.which = _which_no_ffprobe
+    try:
+        with contextlib.redirect_stdout(_buf235):
+            _dl_path235 = B._music_download_sync(_dl_track)
+    finally:
+        shutil.which = _real_which
+    check("v235 ffprobe missing download succeeds", os.path.isfile(_dl_path235), str(_dl_path235))
+    check("v235 ffprobe missing native ext", _dl_path235.endswith((".m4a", ".webm", ".opus")),
+          str(_dl_path235))
+    check("v235 ffprobe missing skip logged", "ffprobe missing" in _buf235.getvalue(),
+          _buf235.getvalue())
+    B._music_delete_file(_dl_path235)
+    shutil.which = _which_both
+    try:
+        _dl_path235b = B._music_download_sync(_dl_track)
+    finally:
+        shutil.which = _real_which
+    check("v235 both present mp3", _dl_path235b.endswith(".mp3"), str(_dl_path235b))
+    B._music_delete_file(_dl_path235b)
+    # the fake mirrors real yt-dlp: postprocessor on + ffprobe missing fails
+    _forced235 = _FakeYDL({"outtmpl": os.path.join(B._MUSIC_TMPDIR, "forced235.%(ext)s"),
+                           "postprocessors": [{"key": "FFmpegExtractAudio"}]})
+    shutil.which = _which_no_ffprobe
+    try:
+        _forced235.extract_info("https://youtube.com/watch?v=test", download=True)
+        check("v235 fake postprocessor fails without ffprobe", False)
+    except Exception as _e235:
+        check("v235 fake postprocessor fails without ffprobe",
+              "ffprobe and ffmpeg not found" in str(_e235), str(_e235))
+    finally:
+        shutil.which = _real_which
     # full mocked flow on the 2.1.0 API: play -> skip -> playout-end advance -> stop
     B._GroupCallFactory = _FakeGroupCallFactory
     B._music_make_client = lambda: _FakeAssistantClient()

@@ -10,13 +10,21 @@ shared implementation — e.g. one economy (Baka+Nova+Daizy+Mimi), one
 moderation stack (Rose+Baka+GroupHelp clone), one link filter
 (Protectron+Rose), Sanji's Word Guess as the one word-guess game (replaces
 WordSeek), one wordchain (On9+Mimi+Nova), one RPS, one card game, one bbet.
-Music (VC music bot) is a real module (v2.2.0): YouTube search/resolve via
-yt-dlp, per-chat queue, player card with buttons, and voice streaming through
-a Pyrogram user-client assistant (env ASSISTANT_SESSION) + PyTgCalls —
-structure follows the YukkiMusicBot pattern (queue dict, join/skip/change
-stream, on-stream-end plays next, assistant auto-joins the group). When the
-assistant or the voice library is missing, /play says so honestly and never
-fakes playback.
+Music (VC music bot) is a real module (v2.2.0, voice rewritten v2.3.4):
+YouTube search/resolve via yt-dlp, per-chat queue, player card with buttons,
+and voice streaming through a Pyrogram user-client assistant
+(env ASSISTANT_SESSION) + pytgcalls 2.1.0's GroupCallFactory — one
+GroupCallFile per chat, audio downloaded to a temp file first (GroupCallFile
+plays local files, not URLs), setting input_filename switches tracks, and
+the on_playout_ended hook plays the next queued track. The assistant
+auto-joins the group when needed. When the assistant or the voice library
+is missing, /play says so honestly and never fakes playback.
+
+NOTE (v2.3.3 logs, 2026-11-12): the 3.x-style voice class the old code
+imported does NOT exist in any released pytgcalls — 2.1.0 is the latest on
+PyPI and its real API is GroupCallFactory. The v2.2.0 music code was written
+against an API that was never shipped; v2.3.4 uses the real 2.1.0 API
+(verified against the wheel source).
 
 Tech: Python + Pyrogram 2.0.106, JSON persistence (data.json next to bot.py),
 polling via the built-in app.run() runner. Env: BOT_TOKEN, API_ID, API_HASH,
@@ -31,6 +39,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -52,28 +61,29 @@ except Exception:  # noqa: BLE001
 
 # Music deps — all optional/guarded: the bot must keep running (and keep
 # passing tests) when the voice stack is not installed. yt-dlp gives the
-# YouTube search/resolve layer; PyTgCalls is the voice layer (its native
-# dep `tgcalls` ships Linux wheels only for Python <= 3.9, so on modern
-# Python it is usually absent — the module then degrades honestly).
+# YouTube search/resolve layer; pytgcalls 2.1.0 is the voice layer — its
+# real API is GroupCallFactory (no 3.x-style voice class exists in any
+# released pytgcalls; 2.1.0 is the latest on PyPI, proven by the v2.3.3
+# logs + the wheel source). Its native dep `tgcalls` ships Linux wheels
+# only for Python <= 3.9, so on modern Python the import is usually absent
+# — the module then degrades honestly.
 try:
     import yt_dlp as _yt_dlp
 except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: yt-dlp import failed: {exc!r}")
     _yt_dlp = None
 try:
-    from pytgcalls import PyTgCalls as _PyTgCalls
-    from pytgcalls.types.input_stream import AudioPiped as _AudioPiped
+    from pytgcalls import GroupCallFactory as _GroupCallFactory
 except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: pytgcalls import failed: {exc!r}")
-    _PyTgCalls = None
-    _AudioPiped = None
+    _GroupCallFactory = None
 try:
     import imageio_ffmpeg as _imageio_ffmpeg
 except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.3"
+VERSION = "2.3.5"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3036,23 +3046,27 @@ async def cmd_reload(client: Client, message: Message):
 
 
 # ===========================================================================
-# MUSIC (v2.2.0) — KustMusic/Yukki parity: /play /queue /skip /pause /resume
-# /stop /clear /ping + player card. Structure follows YukkiMusicBot:
-# per-chat queue dict, one assistant user-client wrapped in PyTgCalls,
-# join_group_call(AudioPiped) to start, change_stream to skip, and the
-# stream-end event plays the next queued track. The assistant auto-joins
-# the group first (username, else invite link) when it is not a member.
-# Honest degradation: no ASSISTANT_SESSION or no pytgcalls -> /play says
-# so plainly and never fakes a playing state. No network/voice in tests:
-# every external piece (yt_dlp, PyTgCalls, the assistant client) is a
-# module attribute that tests monkeypatch.
+# MUSIC (v2.2.0, voice rewritten v2.3.4) — KustMusic/Yukki parity: /play
+# /queue /skip /pause /resume /stop /clear /ping + player card. Voice layer
+# is pytgcalls 2.1.0's GroupCallFactory (verified against the real wheel):
+# one shared factory from the assistant user-client, one GroupCallFile per
+# chat (created with the downloaded audio file — GroupCallFile plays local
+# files, not URLs), gc.start(chat_id) joins, setting gc.input_filename
+# switches tracks (restarts playout when connected), pause_playout /
+# resume_playout pause and resume, gc.stop() leaves, and the
+# on_playout_ended hook plays the next queued track. The assistant
+# auto-joins the group first (username, else invite link) when it is not a
+# member. Honest degradation: no ASSISTANT_SESSION or no pytgcalls -> /play
+# says so plainly and never fakes a playing state. No network/voice in
+# tests: every external piece (yt_dlp, GroupCallFactory, the assistant
+# client, the audio download) is a module attribute that tests monkeypatch.
 # ===========================================================================
 class MusicError(Exception):
     pass
 
 
-MUSIC: dict[int, dict] = {}  # chat_id -> {queue, current, paused, playing, in_call, player_msg}
-_ASSISTANT = {"client": None, "calls": None, "started": False, "me": None, "init_started": False}
+MUSIC: dict[int, dict] = {}  # chat_id -> {queue, current, paused, playing, in_call, player_msg, gc, file}
+_ASSISTANT = {"client": None, "factory": None, "started": False, "me": None, "init_started": False}
 _ASSISTANT_LOCK = asyncio.Lock()
 
 
@@ -3062,7 +3076,7 @@ def music_search_available() -> bool:
 
 def music_voice_available() -> bool:
     """True only when the voice stack can actually run (lib + session)."""
-    return _PyTgCalls is not None and bool(ASSISTANT_SESSION)
+    return _GroupCallFactory is not None and bool(ASSISTANT_SESSION)
 
 
 def music_ffmpeg_setup() -> str | None:
@@ -3090,8 +3104,8 @@ def voice_unavailable_reason() -> str:
 
     Never includes the session string, only whether it is set.
     """
-    if _PyTgCalls is None:
-        return "pytgcalls missing"
+    if _GroupCallFactory is None:
+        return "GroupCallFactory missing"
     if not ASSISTANT_SESSION:
         return "ASSISTANT_SESSION missing"
     return "voice ok"
@@ -3106,7 +3120,7 @@ def print_startup_diagnostics() -> None:
     """
     ffmpeg = music_ffmpeg_setup()
     print(f"[chulbuli] python: {sys.version.split()[0]} ({sys.platform})")
-    print(f"[chulbuli] voice: pytgcalls={_PyTgCalls is not None} "
+    print(f"[chulbuli] voice: pytgcalls={_GroupCallFactory is not None} "
           f"session={'set' if ASSISTANT_SESSION else 'MISSING'} "
           f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'}")
 
@@ -3122,7 +3136,7 @@ def music_state(chat_id: int) -> dict:
     st = MUSIC.get(chat_id)
     if st is None:
         st = {"queue": [], "current": None, "paused": False, "playing": False,
-              "in_call": False, "player_msg": None}
+              "in_call": False, "player_msg": None, "gc": None, "file": None}
         MUSIC[chat_id] = st
     return st
 
@@ -3260,15 +3274,109 @@ def _music_make_client():
                   session_string=ASSISTANT_SESSION, in_memory=True)
 
 
+_MUSIC_TMPDIR = os.path.join(tempfile.gettempdir(), "chulbuli-music")
+
+
+def _music_delete_file(path: str | None) -> None:
+    """Best-effort delete of a downloaded temp audio file."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _music_download_sync(track: dict) -> str:
+    """Blocking yt-dlp audio download -> local file path. Raises MusicError.
+
+    Same mobile player clients as _yt_extract, so the YouTube bot-check
+    workaround applies to the download too (one retry with the tv/web
+    clients on a YouTube block). Extracts to mp3 only when BOTH ffmpeg
+    and ffprobe are findable; else keeps yt-dlp's native audio container
+    (imageio-ffmpeg ships ffmpeg only — no ffprobe — so on Railway the
+    extract is skipped). GroupCallFile (pytgcalls 2.1.0) plays local
+    files only, so /play must download before streaming.
+    """
+    if _yt_dlp is None:
+        raise MusicError("search unavailable")
+    url = (track or {}).get("url") or ""
+    if not url:
+        raise MusicError("no audio")
+    os.makedirs(_MUSIC_TMPDIR, exist_ok=True)
+    stem = f"{int(time.time())}-{random.randint(1000, 9999)}"
+    opts = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
+            "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}}
+    if music_ffmpeg_setup():
+        # yt-dlp's FFmpegExtractAudio needs BOTH ffmpeg and ffprobe.
+        # imageio-ffmpeg ships only the ffmpeg binary (no ffprobe), so on
+        # Railway the postprocessor would fail the whole download with
+        # "ffprobe and ffmpeg not found" even though the audio itself
+        # downloaded fine. Skip the mp3 extract then and keep yt-dlp's
+        # native container — tgcalls decodes webm/m4a itself.
+        import shutil
+        if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                       "preferredcodec": "mp3", "preferredquality": "192"}]
+        else:
+            print("[chulbuli] music: ffprobe missing — keeping native audio, no mp3 extract")
+    info = None
+    last = None
+    for attempt, clients in enumerate((["android", "ios", "web"], ["tv", "web"])):
+        opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+        try:
+            with _yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            last = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt == 0 and _is_youtube_blocked(str(exc)):
+                continue  # retry once with the alternate player clients
+            break
+    if last is not None:
+        msg = str(last)
+        if _is_youtube_blocked(msg):
+            raise MusicError("youtube_blocked")
+        raise MusicError(f"download failed: {msg[:120]}")
+    if info:
+        for req in info.get("requested_downloads") or []:
+            path = req.get("filepath")
+            if path and os.path.isfile(path):
+                return path
+    for name in os.listdir(_MUSIC_TMPDIR):
+        if name.startswith(stem + "."):
+            path = os.path.join(_MUSIC_TMPDIR, name)
+            if os.path.isfile(path):
+                return path
+    raise MusicError("download failed")
+
+
+async def _music_download_audio(track: dict) -> str:
+    """Download the track's audio to a temp file (worker thread, so a whole
+    song download never blocks the event loop). Returns the file path."""
+    return await asyncio.to_thread(_music_download_sync, track)
+
+
+def _music_start_error_text(exc: BaseException) -> str:
+    """Human-readable reason a GroupCallFile failed to start."""
+    name = type(exc).__name__
+    low = str(exc).lower()
+    if "GroupCallNotFound" in name or "without a voice chat" in low:
+        return "group me koi voice chat nahi hai — pehle VC start karo 🙂"
+    return str(exc) or name
+
+
 async def _music_ensure_assistant() -> bool:
-    """Start the assistant client + PyTgCalls once; log its identity via
-    get_me so a live deploy proves which account is connected."""
+    """Start the assistant client + GroupCallFactory once; log its identity
+    via get_me so a live deploy proves which account is connected."""
     if _ASSISTANT["started"]:
         return True
     if not ASSISTANT_SESSION:
         print("[chulbuli] music: ASSISTANT_SESSION missing — voice disabled")
         return False
-    if _PyTgCalls is None:
+    if _GroupCallFactory is None:
         print("[chulbuli] music: pytgcalls not installed — voice disabled")
         return False
     async with _ASSISTANT_LOCK:
@@ -3280,18 +3388,8 @@ async def _music_ensure_assistant() -> bool:
             await user_client.start()
             me = await user_client.get_me()
             print(f"[chulbuli] music assistant: @{me.username} ({me.id})")
-            calls = _PyTgCalls(user_client)
-            try:
-                @calls.on_stream_end()
-                async def _on_stream_end(_c, update):
-                    try:
-                        await _music_play_next(update.chat_id)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[chulbuli] music stream-end error: {exc!r}")
-            except Exception as exc:  # noqa: BLE001
-                print(f"[chulbuli] music stream-end hook failed: {exc!r}")
-            await calls.start()
-            _ASSISTANT.update({"client": user_client, "calls": calls,
+            factory = _GroupCallFactory(user_client)
+            _ASSISTANT.update({"client": user_client, "factory": factory,
                                "started": True, "me": me})
             return True
         except Exception as exc:  # noqa: BLE001
@@ -3302,7 +3400,7 @@ async def _music_ensure_assistant() -> bool:
 def _music_schedule_startup() -> None:
     """Fire-and-forget assistant init shortly after the bot starts serving
     (app.run() has no startup hook; the first update triggers this once)."""
-    if _ASSISTANT.get("init_started") or not ASSISTANT_SESSION or _PyTgCalls is None:
+    if _ASSISTANT.get("init_started") or not ASSISTANT_SESSION or _GroupCallFactory is None:
         return
     _ASSISTANT["init_started"] = True
     try:
@@ -3336,37 +3434,107 @@ async def _music_assistant_join_chat(chat_id: int) -> None:
 
 
 async def _music_stream_track(chat_id: int, track: dict) -> None:
-    """Join the group call (or switch stream) to this track."""
-    calls = _ASSISTANT.get("calls")
-    if calls is None:
+    """Download the track and play it in the group call (pytgcalls 2.1.0).
+
+    GroupCallFile plays a LOCAL FILE, so the audio is downloaded first.
+    First track in a chat: create a GroupCallFile via the shared factory,
+    register its on_playout_ended hook (auto-advance), store it in the
+    per-chat state and start it. Later tracks: switch by setting
+    gc.input_filename — the setter restarts playout when connected.
+    A stored group call that is no longer connected is discarded and a
+    fresh one is created. Raises MusicError (never a raw library error).
+    """
+    factory = _ASSISTANT.get("factory")
+    if factory is None:
         raise MusicError("assistant not started")
     st = music_state(chat_id)
-    stream = _AudioPiped(track["audio"])
+    path = await _music_download_audio(track)
+    old_file = st.get("file")
+    gc = st.get("gc") if st.get("in_call") else None
+    if gc is not None and not getattr(gc, "is_connected", True):
+        gc = None
+        st["gc"] = None
     try:
-        if st.get("in_call"):
-            await calls.change_stream(chat_id, stream)
-        else:
-            await calls.join_group_call(chat_id, stream)
+        if gc is None:
+            gc = factory.get_file_group_call(input_filename=path, play_on_repeat=False)
+            try:
+                @gc.on_playout_ended
+                async def _on_playout_ended(_gc, _filename):
+                    try:
+                        await _music_play_next(chat_id)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[chulbuli] music playout-end error: {exc!r}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[chulbuli] music playout-end hook failed: {exc!r}")
+            st["gc"] = gc
+            try:
+                await gc.start(chat_id)
+            except Exception as exc:  # noqa: BLE001
+                # assistant group me nahi hai to join karke dobara try karo
+                try:
+                    await _music_assistant_join_chat(chat_id)
+                    await gc.start(chat_id)
+                except Exception as exc2:  # noqa: BLE001
+                    raise MusicError(_music_start_error_text(exc2))
             st["in_call"] = True
+        else:
+            gc.input_filename = path  # restarts playout when connected
+            st["in_call"] = True
+    except MusicError:
+        _music_delete_file(path)
+        raise
     except Exception as exc:  # noqa: BLE001
-        name = type(exc).__name__
-        if "NoActiveGroupCall" in name or "no active group call" in str(exc).lower():
-            await _music_assistant_join_chat(chat_id)
-            await calls.join_group_call(chat_id, stream)
-            st["in_call"] = True
-        else:
-            raise MusicError(str(exc) or name)
+        _music_delete_file(path)
+        raise MusicError(str(exc) or type(exc).__name__)
+    st["file"] = path
+    if old_file and old_file != path:
+        _music_delete_file(old_file)
+
+
+def _music_pause(chat_id: int) -> bool:
+    """Pause playout in this chat (sync 2.1.0 call). False when no call."""
+    gc = music_state(chat_id).get("gc")
+    if gc is None:
+        return False
+    try:
+        gc.pause_playout()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music pause failed: {exc!r}")
+        return False
+
+
+def _music_resume(chat_id: int) -> bool:
+    """Resume playout in this chat (sync 2.1.0 call). False when no call."""
+    gc = music_state(chat_id).get("gc")
+    if gc is None:
+        return False
+    try:
+        gc.resume_playout()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music resume failed: {exc!r}")
+        return False
 
 
 async def _music_leave(chat_id: int) -> None:
-    calls = _ASSISTANT.get("calls")
+    """Leave the group call and clean up: stop the group call, drop the
+    per-chat instance, delete the downloaded temp audio file."""
     st = music_state(chat_id)
     st["in_call"] = False
-    if calls is not None:
+    gc = st.get("gc")
+    st["gc"] = None
+    if gc is not None:
         try:
-            await calls.leave_group_call(chat_id)
+            gc.stop_playout()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            await gc.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    _music_delete_file(st.get("file"))
+    st["file"] = None
 
 
 async def _music_send_player(chat_id: int) -> None:
@@ -3410,8 +3578,13 @@ async def _music_play_next(chat_id: int) -> None:
     except MusicError as exc:
         st["current"] = None
         st["playing"] = False
+        await _music_leave(chat_id)
+        reason = str(exc)
+        text = ("🎵 youtube ne block kar diya (bot-check) — ye gaana baj nahi paya 🙂"
+                if reason == "youtube_blocked"
+                else f"🎵 ye gaana baj nahi paya: {reason} 🙂")
         try:
-            await app.send_message(chat_id, f"🎵 ye gaana baj nahi paya: {exc} 🙂")
+            await app.send_message(chat_id, text)
         except Exception:  # noqa: BLE001
             pass
         return
@@ -3459,24 +3632,20 @@ async def cmd_music(client: Client, message: Message):
         if not st.get("playing") or st.get("paused"):
             await safe_reply(message, "abhi kuch baj nahi raha ya pehle se pause hai 🙂")
             return
-        try:
-            await _ASSISTANT["calls"].pause_stream(message.chat.id)
+        if _music_pause(message.chat.id):
             st["paused"] = True
             await safe_reply(message, "⏸ pause kar diya 🙂 /resume se wapas bajega")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chulbuli] music pause failed: {exc!r}")
+        else:
             await safe_reply(message, "pause nahi kar payi 🙂")
         return
     if cmd == "resume":
         if not st.get("paused"):
             await safe_reply(message, "kuch pause nahi hai 🙂")
             return
-        try:
-            await _ASSISTANT["calls"].resume_stream(message.chat.id)
+        if _music_resume(message.chat.id):
             st["paused"] = False
             await safe_reply(message, "▶️ wapas baj raha hai 🙂")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[chulbuli] music resume failed: {exc!r}")
+        else:
             await safe_reply(message, "resume nahi kar payi 🙂")
         return
     if cmd in ("stop", "end"):
@@ -3548,20 +3717,14 @@ async def music_callbacks(client: Client, query):
     if action == "skip":
         await _music_play_next(chat_id)
     elif action == "pause":
-        if st.get("playing") and not st.get("paused") and _ASSISTANT.get("calls") is not None:
-            try:
-                await _ASSISTANT["calls"].pause_stream(chat_id)
+        if st.get("playing") and not st.get("paused"):
+            if _music_pause(chat_id):
                 st["paused"] = True
-            except Exception:  # noqa: BLE001
-                pass
         await _music_edit_player(chat_id)
     elif action == "resume":
-        if st.get("paused") and _ASSISTANT.get("calls") is not None:
-            try:
-                await _ASSISTANT["calls"].resume_stream(chat_id)
+        if st.get("paused"):
+            if _music_resume(chat_id):
                 st["paused"] = False
-            except Exception:  # noqa: BLE001
-                pass
         await _music_edit_player(chat_id)
     elif action == "stop":
         st["queue"].clear()

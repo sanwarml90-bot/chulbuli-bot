@@ -83,7 +83,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.4"
+VERSION = "2.3.5"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3292,9 +3292,11 @@ def _music_download_sync(track: dict) -> str:
 
     Same mobile player clients as _yt_extract, so the YouTube bot-check
     workaround applies to the download too (one retry with the tv/web
-    clients on a YouTube block). Extracts to mp3 when ffmpeg is available,
-    else keeps yt-dlp's native audio container. GroupCallFile (pytgcalls
-    2.1.0) plays local files only, so /play must download before streaming.
+    clients on a YouTube block). Extracts to mp3 only when BOTH ffmpeg
+    and ffprobe are findable; else keeps yt-dlp's native audio container
+    (imageio-ffmpeg ships ffmpeg only — no ffprobe — so on Railway the
+    extract is skipped). GroupCallFile (pytgcalls 2.1.0) plays local
+    files only, so /play must download before streaming.
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -3307,8 +3309,18 @@ def _music_download_sync(track: dict) -> str:
             "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
             "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}}
     if music_ffmpeg_setup():
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
-                                   "preferredcodec": "mp3", "preferredquality": "192"}]
+        # yt-dlp's FFmpegExtractAudio needs BOTH ffmpeg and ffprobe.
+        # imageio-ffmpeg ships only the ffmpeg binary (no ffprobe), so on
+        # Railway the postprocessor would fail the whole download with
+        # "ffprobe and ffmpeg not found" even though the audio itself
+        # downloaded fine. Skip the mp3 extract then and keep yt-dlp's
+        # native container — tgcalls decodes webm/m4a itself.
+        import shutil
+        if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                       "preferredcodec": "mp3", "preferredquality": "192"}]
+        else:
+            print("[chulbuli] music: ffprobe missing — keeping native audio, no mp3 extract")
     info = None
     last = None
     for attempt, clients in enumerate((["android", "ios", "web"], ["tv", "web"])):
