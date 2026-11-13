@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -3558,7 +3558,8 @@ def music_player_text(chat_id: int) -> str:
         return "🎵 music band hai 🙂"
     status = "⏸ pause hai" if st.get("paused") else "▶️ baj raha hai"
     nxt = st["queue"][0]["title"] if st.get("queue") else "—"
-    return (f"🎵 **{cur['title']}**\n{status} • {fmt_duration(cur.get('duration', 0))}"
+    src_note = " • SoundCloud se 🙂" if cur.get("source") == "soundcloud" else ""
+    return (f"🎵 **{cur['title']}**\n{status} • {fmt_duration(cur.get('duration', 0))}{src_note}"
             f"\n👤 {cur.get('by', '')} ne bajaya\n⏭ agla: {nxt}")
 
 
@@ -3659,15 +3660,8 @@ def _yt_extract(src: str):
     raise MusicError(f"search failed: {msg[:120]}")
 
 
-def resolve_track(query: str) -> dict:
-    """YouTube search (or direct link) -> track dict. Raises MusicError."""
-    if _yt_dlp is None:
-        raise MusicError("search unavailable")
-    q = (query or "").strip()
-    if not q:
-        raise MusicError("empty query")
-    src = q if q.startswith(("http://", "https://")) else f"ytsearch1:{q}"
-    info = _yt_extract(src)
+def _track_from_info(info, q: str, source: str) -> dict:
+    """yt-dlp extract_info dict -> track dict. Raises MusicError."""
     if not info:
         raise MusicError("not found")
     if "entries" in info:
@@ -3685,7 +3679,39 @@ def resolve_track(query: str) -> dict:
         raise MusicError("no audio")
     return {"title": info.get("title") or q, "url": info.get("webpage_url") or q,
             "audio": audio, "duration": int(info.get("duration") or 0),
-            "by": "", "by_id": 0}
+            "source": source, "by": "", "by_id": 0}
+
+
+def resolve_track(query: str) -> dict:
+    """YouTube search (or direct link) -> track dict, SoundCloud fallback.
+
+    YouTube first (direct link or ytsearch1). If YouTube blocks the
+    search with its bot-check ("Sign in to confirm you're not a bot" —
+    live on Railway's IP since 2026-11-12, on two different songs),
+    fall back to SoundCloud (scsearch1) — no login needed, verified
+    live 2026-11-13 ("Tum Hi Ho Meri Ashiqui Ashiqui 2 2013" found
+    via scsearch1 from this VM). Cookies (v2.5.1, YTDLP_COOKIES) stay
+    the primary YouTube fix when set; the fallback only fires when
+    YouTube is actually blocked. A direct SoundCloud link also works.
+    Raises MusicError.
+    """
+    if _yt_dlp is None:
+        raise MusicError("search unavailable")
+    q = (query or "").strip()
+    if not q:
+        raise MusicError("empty query")
+    if q.startswith(("http://", "https://")):
+        source = "soundcloud" if "soundcloud.com" in q else "youtube"
+        return _track_from_info(_yt_extract(q), q, source)
+    try:
+        return _track_from_info(_yt_extract(f"ytsearch1:{q}"), q, "youtube")
+    except MusicError as exc:
+        if str(exc) != "youtube_blocked":
+            raise
+    try:
+        return _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
+    except MusicError:
+        raise MusicError("youtube_blocked")
 
 
 def _music_make_client():
@@ -4333,7 +4359,8 @@ async def cmd_music(client: Client, message: Message):
         return
     pos = music_queue_add(message.chat.id, track)
     if st.get("playing") and st.get("current"):
-        await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}** 🙂")
+        _sc_note = " (SoundCloud se 🙂 youtube block kar raha hai)" if track.get("source") == "soundcloud" else ""
+        await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}**{_sc_note} 🙂")
         return
     await _music_play_next(message.chat.id)
 

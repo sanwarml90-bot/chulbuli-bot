@@ -2427,6 +2427,97 @@ async def main():
     if _saved_cookies is not None:
         os.environ["YTDLP_COOKIES"] = _saved_cookies
 
+    # ---- v2.5.2: SoundCloud fallback when YouTube bot-checks /play ----
+    # Live evidence: YouTube blocks Railway's IP ("Sign in to confirm
+    # you're not a bot", two songs, 2026-11-13 09:24/09:26/09:40), while
+    # SoundCloud search works (scsearch1 "tum hi ho" -> "Tum Hi Ho Meri
+    # Ashiqui Ashiqui 2 2013", verified live from this VM 2026-11-13).
+    # Cookies (v2.5.1) stay the primary YouTube fix; the fallback only
+    # fires when YouTube is actually blocked.
+    class _ScYDL:
+        calls = []
+        mode = "yt_blocked_sc_ok"  # or "both_blocked" / "yt_ok"
+
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            type(self).calls.append(src)
+            if src.startswith("scsearch1:"):
+                if type(self).mode == "both_blocked":
+                    raise Exception("ERROR: [soundcloud] x: Forbidden")
+                return {"title": "SC Gaana",
+                        "webpage_url": "https://soundcloud.com/test/sc-gaana",
+                        "url": "https://audio.example/sc.m4a", "duration": 210}
+            if src.startswith("https://soundcloud.com/"):
+                return {"title": "SC Link Gaana",
+                        "webpage_url": src,
+                        "url": "https://audio.example/sclink.m4a", "duration": 190}
+            if type(self).mode == "yt_ok":
+                return {"title": "YT Gaana", "webpage_url": "https://youtube.com/watch?v=ytok",
+                        "url": "https://audio.example/yt.m4a", "duration": 200}
+            raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+
+    _saved_ydl = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _ScYDL})
+    _ScYDL.calls.clear()
+    _ScYDL.mode = "yt_blocked_sc_ok"
+    _sc_track = B.resolve_track("sc test gaana")
+    check("sc fallback track source", _sc_track.get("source") == "soundcloud", str(_sc_track))
+    check("sc fallback track title", _sc_track["title"] == "SC Gaana", str(_sc_track))
+    check("sc fallback tried youtube first",
+          any(c.startswith("ytsearch1:") for c in _ScYDL.calls), str(_ScYDL.calls))
+    check("sc fallback tried soundcloud",
+          any(c.startswith("scsearch1:") for c in _ScYDL.calls), str(_ScYDL.calls))
+    _ScYDL.calls.clear()
+    _ScYDL.mode = "yt_ok"
+    _yt_track = B.resolve_track("yt test gaana")
+    check("sc fallback youtube wins", _yt_track.get("source") == "youtube", str(_yt_track))
+    check("sc fallback no soundcloud when youtube works",
+          not any(c.startswith("scsearch1:") for c in _ScYDL.calls), str(_ScYDL.calls))
+    _ScYDL.calls.clear()
+    _ScYDL.mode = "both_blocked"
+    try:
+        B.resolve_track("nope gaana")
+        check("sc fallback both blocked raises", False)
+    except B.MusicError as _e:
+        check("sc fallback both blocked raises", str(_e) == "youtube_blocked", str(_e))
+    _ScYDL.mode = "yt_blocked_sc_ok"
+    _link_track = B.resolve_track("https://soundcloud.com/test/sc-gaana")
+    check("sc fallback direct link", _link_track.get("source") == "soundcloud"
+          and _link_track["title"] == "SC Link Gaana", str(_link_track))
+    # /play with the fallback: no blocked reply, track found instead
+    _real_session_sc = B.ASSISTANT_SESSION
+    _real_factory_sc = B._GroupCallFactory
+    B.ASSISTANT_SESSION = ""
+    B._GroupCallFactory = None
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/play sc test gaana", uid=111, name="Tester", chat_id=-100501))
+    check("sc fallback play finds track",
+          any("mil gaya" in t for _, t in FakeMessage.outbox)
+          and not any("block kar diya" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    B.ASSISTANT_SESSION = _real_session_sc
+    B._GroupCallFactory = _real_factory_sc
+    B._yt_dlp = _saved_ydl
+    # player card names the SoundCloud source honestly
+    B.MUSIC.clear()
+    B.music_state(-100501)["current"] = {"title": "SC Gaana", "duration": 210,
+                                         "source": "soundcloud", "by": "Tester"}
+    check("sc fallback player names source",
+          "SoundCloud se" in B.music_player_text(-100501), B.music_player_text(-100501))
+    B.music_state(-100501)["current"] = {"title": "YT Gaana", "duration": 200,
+                                         "source": "youtube", "by": "Tester"}
+    check("sc fallback player youtube no note",
+          "SoundCloud" not in B.music_player_text(-100501), B.music_player_text(-100501))
+    B.MUSIC.clear()
+
     # ---- v2.3.1: /promote uses ChatPrivileges (real Pyrogram API) ----
     _fake_app2 = FakeApp()
     FakeApp.calls.clear()
