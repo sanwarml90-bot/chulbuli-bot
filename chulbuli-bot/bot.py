@@ -41,7 +41,10 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
+from types import SimpleNamespace
 
 from pyrogram import Client, filters, raw, utils
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
@@ -84,7 +87,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -568,6 +571,23 @@ app = Client(
 
 
 async def safe_reply(message: Message, text: str, **kwargs):
+    markup = kwargs.get("reply_markup")
+    if _markup_has_web_app(markup):
+        # v2.4.1 — a web_app button is rejected over Pyrogram MTProto
+        # (400 BUTTON_TYPE_INVALID, live v2.4.0 logs); send via the Bot API.
+        try:
+            result = await _botapi_send_message(
+                message.chat.id, text, reply_markup=markup,
+                reply_to_message_id=kwargs.get("reply_to_message_id", message.id))
+            return SimpleNamespace(id=result["message_id"], chat=message.chat, text=text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] Bot API send failed, falling back to Pyrogram: {exc!r}")
+            kwargs = dict(kwargs)
+            stripped = _strip_web_app(markup)
+            if stripped is None:
+                kwargs.pop("reply_markup", None)
+            else:
+                kwargs["reply_markup"] = stripped
     try:
         return await message.reply_text(text, **kwargs)
     except FloodWait as e:
@@ -580,6 +600,152 @@ async def safe_reply(message: Message, text: str, **kwargs):
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] safe_reply failed: {exc!r}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Bot API (HTTP) route for web_app buttons — v2.4.1
+# ---------------------------------------------------------------------------
+# LIVE BUG (v2.4.0, Railway logs 2026-11-13 09:50-09:51 IST): every
+# messages.SendMessage / messages.EditMessage whose inline keyboard contains
+# a web_app button failed over Pyrogram MTProto with 400 BUTTON_TYPE_INVALID
+# ("[chulbuli] safe_reply failed" x3, "[chulbuli] menu callback failed" x3),
+# breaking /start, /help and the menu callbacks. The IDENTICAL markup is
+# ACCEPTED by the Telegram Bot API over HTTP (verified with 3 test sends to
+# the owner: web_app-only, callback-only, web_app+mixed — all ok:true).
+# Pyrogram serializes the markup correctly (KeyboardButtonWebView) — the
+# MTProto path itself is what the server rejects. So: any send/edit whose
+# markup contains a web_app button goes through api.telegram.org instead.
+# All other markups (callback-only) stay on Pyrogram — they work fine.
+# The route is decided purely by markup content, never by how the original
+# message was sent, so menu edits keep working after a Bot API send.
+def _markup_has_web_app(markup) -> bool:
+    """True when an InlineKeyboardMarkup contains a web_app button."""
+    if markup is None:
+        return False
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        for btn in row:
+            if getattr(btn, "web_app", None) is not None:
+                return True
+    return False
+
+
+def _markup_to_botapi(markup) -> dict | None:
+    """Serialize a Pyrogram InlineKeyboardMarkup to Bot API reply_markup JSON."""
+    if markup is None:
+        return None
+    keyboard = []
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        out_row = []
+        for btn in row:
+            b = {"text": btn.text}
+            if getattr(btn, "callback_data", None) is not None:
+                b["callback_data"] = btn.callback_data
+            web_app = getattr(btn, "web_app", None)
+            if web_app is not None:
+                b["web_app"] = {"url": web_app.url}
+            url = getattr(btn, "url", None)
+            if url:
+                b["url"] = url
+            out_row.append(b)
+        keyboard.append(out_row)
+    return {"inline_keyboard": keyboard}
+
+
+def _strip_web_app(markup):
+    """Same markup minus web_app buttons (fallback so the menu still works)."""
+    if markup is None:
+        return None
+    rows = []
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        kept = [btn for btn in row if getattr(btn, "web_app", None) is None]
+        if kept:
+            rows.append(kept)
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+def _botapi_call_sync(method: str, params: dict) -> dict:
+    """One synchronous Bot API POST (stdlib urllib only). Token never logged."""
+    token = os.environ.get("BOT_TOKEN", "")
+    if not token:
+        raise RuntimeError("BOT_TOKEN env var not set")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    req = urllib.request.Request(
+        url, data=json.dumps(params).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+            desc = body.get("description", "")
+        except Exception:  # noqa: BLE001
+            desc = f"HTTP {e.code}"
+        raise RuntimeError(f"Bot API {method} HTTP {e.code}: {desc}") from e
+
+
+async def _botapi_send_message(chat_id: int, text: str, reply_markup=None,
+                               reply_to_message_id: int | None = None) -> dict:
+    """Send via Bot API HTTP. Returns the result dict (has message_id)."""
+    params = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup is not None:
+        params["reply_markup"] = _markup_to_botapi(reply_markup)
+    if reply_to_message_id is not None:
+        params["reply_to_message_id"] = reply_to_message_id
+    try:
+        result = await asyncio.to_thread(_botapi_call_sync, "sendMessage", params)
+    except RuntimeError as exc:
+        if "parse" not in str(exc).lower():
+            raise
+        # Bot API Markdown is stricter than Pyrogram's lenient parser
+        # (e.g. a display name with * or _). Retry as plain text so the
+        # Mini App button still survives.
+        params.pop("parse_mode", None)
+        result = await asyncio.to_thread(_botapi_call_sync, "sendMessage", params)
+    if not result.get("ok"):
+        raise RuntimeError(f"Bot API sendMessage failed: {result.get('description', result)}")
+    return result["result"]
+
+
+async def _botapi_edit_message_text(chat_id: int, message_id: int, text: str,
+                                    reply_markup=None) -> dict:
+    """Edit via Bot API HTTP. Returns the result dict."""
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text,
+              "parse_mode": "Markdown"}
+    if reply_markup is not None:
+        params["reply_markup"] = _markup_to_botapi(reply_markup)
+    try:
+        result = await asyncio.to_thread(_botapi_call_sync, "editMessageText", params)
+    except RuntimeError as exc:
+        if "parse" not in str(exc).lower():
+            raise
+        params.pop("parse_mode", None)
+        result = await asyncio.to_thread(_botapi_call_sync, "editMessageText", params)
+    if not result.get("ok"):
+        raise RuntimeError(f"Bot API editMessageText failed: {result.get('description', result)}")
+    return result["result"]
+
+
+async def _safe_edit(message, text: str, **kwargs):
+    """Edit a bot message, routing web_app markups via the Bot API (v2.4.1)."""
+    markup = kwargs.get("reply_markup")
+    if _markup_has_web_app(markup):
+        try:
+            await _botapi_edit_message_text(message.chat.id, message.id, text,
+                                            reply_markup=markup)
+            message.text = text
+            return message
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] Bot API edit failed, falling back to Pyrogram: {exc!r}")
+            kwargs = dict(kwargs)
+            stripped = _strip_web_app(markup)
+            if stripped is None:
+                kwargs.pop("reply_markup", None)
+            else:
+                kwargs["reply_markup"] = stripped
+    return await message.edit_text(text, **kwargs)
 
 
 async def is_chat_admin(client: Client, chat_id: int, user_id: int) -> bool:
@@ -851,29 +1017,29 @@ async def menu_callbacks(client: Client, query):
     try:
         name = display_name(query.from_user)
         if action == "home":
-            await query.message.edit_text(START_TEXT.format(name=name), reply_markup=main_menu_keyboard())
+            await _safe_edit(query.message, START_TEXT.format(name=name), reply_markup=main_menu_keyboard())
         elif action == "games":
-            await query.message.edit_text(MENU_GAMES_TEXT, reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, MENU_GAMES_TEXT, reply_markup=menu_back_keyboard())
         elif action == "economy":
-            await query.message.edit_text(MENU_ECONOMY_TEXT, reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, MENU_ECONOMY_TEXT, reply_markup=menu_back_keyboard())
         elif action == "wordguess":
-            await query.message.edit_text(MENU_WORDGUESS_TEXT, reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, MENU_WORDGUESS_TEXT, reply_markup=menu_back_keyboard())
         elif action == "romance":
-            await query.message.edit_text(MENU_ROMANCE_TEXT, reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, MENU_ROMANCE_TEXT, reply_markup=menu_back_keyboard())
         elif action == "help":
-            await query.message.edit_text(HELP_TEXT, reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, HELP_TEXT, reply_markup=menu_back_keyboard())
         elif action == "balance":
             if not economy_on():
                 await query.answer("Economy abhi off hai 🙂", show_alert=True)
                 return
             user = get_user(query.from_user.id, name)
-            await query.message.edit_text(balance_text(user, query.from_user.id, name),
-                                          reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, balance_text(user, query.from_user.id, name),
+                             reply_markup=menu_back_keyboard())
         elif action == "top":
             if not economy_on():
                 await query.answer("Economy abhi off hai 🙂", show_alert=True)
                 return
-            await query.message.edit_text(toprich_text(), reply_markup=menu_back_keyboard())
+            await _safe_edit(query.message, toprich_text(), reply_markup=menu_back_keyboard())
         await query.answer()
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] menu callback failed: {exc!r}")

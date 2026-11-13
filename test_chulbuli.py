@@ -19,7 +19,7 @@ import urllib.request
 sys.path.insert(0, os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
 os.chdir(os.path.expanduser("~/workspace/bot-copy-3in1/chulbuli-bot"))
 
-from pyrogram.errors import BotMethodInvalid, FloodWait
+from pyrogram.errors import BotMethodInvalid, ButtonTypeInvalid, FloodWait
 
 import bot as B
 
@@ -151,6 +151,11 @@ class FakeMessage:
         self.command = [p.lstrip("/").split("@")[0] for p in parts] if parts and parts[0].startswith("/") else []
 
     async def reply_text(self, text, **kwargs):
+        if B._markup_has_web_app(kwargs.get("reply_markup")):
+            # Mirror the real server (v2.4.1): Pyrogram MTProto rejects a
+            # web_app button with 400 BUTTON_TYPE_INVALID (live v2.4.0 logs).
+            # The bot must route such markups via the Bot API instead.
+            raise ButtonTypeInvalid("The type of one of the buttons you provided is invalid")
         FakeMessage.outbox.append((self.chat.id, text))
         FakeMessage.outbox_full.append((self.chat.id, text, kwargs))
         m = FakeMessage.__new__(FakeMessage)
@@ -166,6 +171,10 @@ class FakeMessage:
         return m
 
     async def edit_text(self, text, **kwargs):
+        if B._markup_has_web_app(kwargs.get("reply_markup")):
+            # Mirror the real server (v2.4.1): web_app buttons are rejected
+            # over MTProto — edits carrying one must go via the Bot API.
+            raise ButtonTypeInvalid("The type of one of the buttons you provided is invalid")
         FakeMessage.edits.append((self.chat.id, text, kwargs))
         self.text = text
         return self
@@ -210,6 +219,10 @@ class FakeApp:
         return FakeApp.me
 
     async def send_message(self, chat_id, text, **kwargs):
+        if B._markup_has_web_app(kwargs.get("reply_markup")):
+            # Mirror the real server (v2.4.1): web_app buttons are rejected
+            # over MTProto — sends carrying one must go via the Bot API.
+            raise ButtonTypeInvalid("The type of one of the buttons you provided is invalid")
         FakeMessage.outbox.append((chat_id, text))
         FakeMessage.outbox_full.append((chat_id, text, kwargs))
         m = FakeMessage.__new__(FakeMessage)
@@ -227,6 +240,10 @@ class FakeApp:
         return True
 
     async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        if B._markup_has_web_app(kwargs.get("reply_markup")):
+            # Mirror the real server (v2.4.1): web_app buttons are rejected
+            # over MTProto — edits carrying one must go via the Bot API.
+            raise ButtonTypeInvalid("The type of one of the buttons you provided is invalid")
         FakeMessage.edits.append((chat_id, text, kwargs))
         return None
 
@@ -318,6 +335,21 @@ class DummyClient:
 async def main():
     client = DummyClient()
     B.app = FakeApp()  # DM sends (UNO hands, mafia roles, ...) go to the outbox
+    # v2.4.1 — fake for the Bot API helper (B._botapi_call_sync). Tests patch
+    # B._botapi_call_sync with _fake_botapi_ok/_fake_botapi_fail and restore
+    # the original afterwards; _botapi_calls records (method, params).
+    _botapi_calls = []
+    _orig_botapi = B._botapi_call_sync
+
+    def _fake_botapi_ok(method, params):
+        _botapi_calls.append((method, params))
+        return {"ok": True, "result": {"message_id": 4242,
+                                        "chat": {"id": params["chat_id"]},
+                                        "text": params["text"]}}
+
+    def _fake_botapi_fail(method, params):
+        _botapi_calls.append((method, params))
+        raise RuntimeError("Bot API down (test)")
     # Hermetic run: fresh data, and keep saves out of the repo's data.json
     B.DATA = B._blank_data()
     B.DATA_FILE = "/tmp/test_chulbuli_data.json"
@@ -2955,18 +2987,27 @@ async def main():
     check("v240 bare question falls through", B.get_user(779)["coins"] == 1000
           and not any("🎰" in t for _, t in FakeMessage.outbox),
           f"coins={B.get_user(779)['coins']} outbox={FakeMessage.outbox}")
-    # /games command sends the Mini App button
-    FakeMessage.outbox.clear()
+    # /games command sends the Mini App button — v2.4.1: a web_app markup is
+    # rejected over Pyrogram MTProto (400 BUTTON_TYPE_INVALID, live v2.4.0
+    # logs), so the bot routes it through the Bot API helper instead.
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_ok
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear()
     await B.cmd_games(client, FakeMessage("/games", uid=111, chat_id=-100123))
-    _full = FakeMessage.outbox_full[-1] if FakeMessage.outbox_full else (None, "", {})
-    _mk = _full[2].get("reply_markup")
+    B._botapi_call_sync = _orig_botapi
     _web = None
-    if _mk:
-        for _row in _mk.inline_keyboard:
+    for _method, _params in _botapi_calls:
+        _rm = _params.get("reply_markup") or {}
+        for _row in _rm.get("inline_keyboard", []):
             for _b in _row:
-                if getattr(_b, "web_app", None):
-                    _web = _b.web_app.url
+                if "web_app" in _b:
+                    _web = _b["web_app"]["url"]
     check("v240 games cmd miniapp button", _web == B.MINIAPP_URL, str(_web))
+    check("v240 games cmd via bot api", len(_botapi_calls) == 1
+          and _botapi_calls[0][0] == "sendMessage"
+          and _botapi_calls[0][1].get("chat_id") == -100123, str(_botapi_calls))
+    check("v240 games cmd not via pyrogram", len(FakeMessage.outbox) == 0,
+          str(FakeMessage.outbox))
     # main menu carries the Mini App button too
     _mm = B.main_menu_keyboard()
     _web2 = None
@@ -2995,6 +3036,182 @@ async def main():
     await B.web_app_data_handler(client, _FakeWadMessage('not json at all'))
     check("v240 webapp bad json ignored", B.get_user(780)["coins"] == 1500,
           f"coins={B.get_user(780)['coins']}")
+
+    # ================= v2.4.1: web_app buttons via Bot API =================
+    # Live v2.4.0 bug: Pyrogram MTProto rejects any send/edit whose inline
+    # keyboard contains a web_app button (400 BUTTON_TYPE_INVALID) — /start,
+    # /help and the menu callbacks broke. The identical markup is accepted
+    # by the Bot API over HTTP, so web_app markups now go through a small
+    # urllib helper; callback-only markups stay on Pyrogram.
+    def _has_webapp_url(calls):
+        for _m, _p in calls:
+            for _row in (_p.get("reply_markup") or {}).get("inline_keyboard", []):
+                for _b in _row:
+                    if _b.get("web_app", {}).get("url") == B.MINIAPP_URL:
+                        return True
+        return False
+    # (0) the fake harness now mirrors the real restriction
+    _raise_check = False
+    try:
+        await FakeMessage("/x", uid=111, chat_id=111, ctype="private").reply_text(
+            "hi", reply_markup=B.main_menu_keyboard())
+    except ButtonTypeInvalid:
+        _raise_check = True
+    check("v241 fake raises on webapp send", _raise_check)
+    _raise_check2 = False
+    try:
+        await FakeMessage("/x", uid=111, chat_id=111, ctype="private").edit_text(
+            "hi", reply_markup=B.main_menu_keyboard())
+    except ButtonTypeInvalid:
+        _raise_check2 = True
+    check("v241 fake raises on webapp edit", _raise_check2)
+    # (a) /start, /help, /games and the Word Guess board go via the Bot API
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_ok
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear()
+    await B.cmd_start_help(client, FakeMessage("/start", uid=111, name="Tester", chat_id=111, ctype="private"))
+    _start_calls = list(_botapi_calls)
+    _botapi_calls.clear()
+    await B.cmd_start_help(client, FakeMessage("/help", uid=111, name="Tester", chat_id=111, ctype="private"))
+    _help_calls = list(_botapi_calls)
+    _botapi_calls.clear()
+    await B.cmd_games(client, FakeMessage("/games", uid=111, chat_id=-100123))
+    _games_calls = list(_botapi_calls)
+    B._botapi_call_sync = _orig_botapi
+    check("v241 start via bot api", len(_start_calls) == 1 and _start_calls[0][0] == "sendMessage"
+          and _has_webapp_url(_start_calls), str(_start_calls))
+    check("v241 help via bot api", len(_help_calls) == 1 and _help_calls[0][0] == "sendMessage"
+          and _has_webapp_url(_help_calls), str(_help_calls))
+    check("v241 games via bot api", len(_games_calls) == 1 and _has_webapp_url(_games_calls),
+          str(_games_calls))
+    check("v241 start/help/games not via pyrogram", len(FakeMessage.outbox) == 0,
+          str(FakeMessage.outbox))
+    # Word Guess board (first message carries the Mini App button)
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_ok
+    FakeMessage.outbox.clear()
+    await B.cmd_wordguess(client, FakeMessage("/wordguess", uid=111, chat_id=-100250))
+    _wg_calls = list(_botapi_calls)
+    B._botapi_call_sync = _orig_botapi
+    _wg_state = B.game_state(-100250)
+    check("v241 wordguess board via bot api", len(_wg_calls) == 1 and _has_webapp_url(_wg_calls),
+          str(_wg_calls))
+    check("v241 wordguess board msg id from bot api",
+          _wg_state is not None and _wg_state.get("board_msg_id") == 4242,
+          str(_wg_state))
+    check("v241 wordguess board not via pyrogram", len(FakeMessage.outbox) == 0,
+          str(FakeMessage.outbox))
+    # menu "home" edit (main menu markup) goes via Bot API editMessageText
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_ok
+    FakeMessage.edits.clear()
+    _home_msg = FakeMessage(B.START_TEXT.format(name="Tester"), uid=999, name="Chulbuli", chat_id=111, ctype="private")
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:home", uid=111, name="Tester", message=_home_msg))
+    _home_calls = list(_botapi_calls)
+    B._botapi_call_sync = _orig_botapi
+    check("v241 menu home edit via bot api", len(_home_calls) == 1
+          and _home_calls[0][0] == "editMessageText"
+          and _home_calls[0][1].get("chat_id") == 111
+          and _home_calls[0][1].get("message_id") == _home_msg.id
+          and _has_webapp_url(_home_calls), str(_home_calls))
+    check("v241 menu home edit not via pyrogram", len(FakeMessage.edits) == 0,
+          str(FakeMessage.edits))
+    # (b) the helper posts correct JSON to api.telegram.org
+    _urlopen_calls = []
+    _orig_urlopen = B.urllib.request.urlopen
+
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+    def _fake_urlopen(req, timeout=None):
+        _urlopen_calls.append(req)
+        return _FakeResp({"ok": True, "result": {"message_id": 5150,
+                                                 "chat": {"id": -100123}, "text": "hi"}})
+
+    _old_token = os.environ.get("BOT_TOKEN")
+    os.environ["BOT_TOKEN"] = "123456:TESTTOKEN"
+    B.urllib.request.urlopen = _fake_urlopen
+    try:
+        _res = await B._botapi_send_message(-100123, "hi **there**",
+                                            reply_markup=B.main_menu_keyboard(),
+                                            reply_to_message_id=7)
+    finally:
+        B.urllib.request.urlopen = _orig_urlopen
+        if _old_token is None:
+            os.environ.pop("BOT_TOKEN", None)
+        else:
+            os.environ["BOT_TOKEN"] = _old_token
+    check("v241 botapi returns message id", _res.get("message_id") == 5150, str(_res))
+    _req = _urlopen_calls[0] if _urlopen_calls else None
+    _body = json.loads(_req.data.decode("utf-8")) if _req is not None else {}
+    check("v241 botapi url", _req is not None and "api.telegram.org" in _req.full_url
+          and _req.full_url.endswith("/sendMessage"), str(getattr(_req, "full_url", None)))
+    check("v241 botapi json fields", _body.get("chat_id") == -100123
+          and _body.get("text") == "hi **there**"
+          and _body.get("parse_mode") == "Markdown"
+          and _body.get("reply_to_message_id") == 7, str(_body))
+    _b0 = (_body.get("reply_markup") or {}).get("inline_keyboard", [[]])[0][0]
+    check("v241 botapi json webapp", _b0.get("web_app", {}).get("url") == B.MINIAPP_URL
+          and _b0.get("text") == "🎮 Mini App — Games khelo", str(_b0))
+    # (c) Bot API down -> the user still gets a working callback-only menu
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_fail
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear()
+    await B.cmd_start_help(client, FakeMessage("/start", uid=111, name="Tester", chat_id=111, ctype="private"))
+    B._botapi_call_sync = _orig_botapi
+    _fb_kb = FakeMessage.outbox_full[-1][2].get("reply_markup") if FakeMessage.outbox_full else None
+    _fb_cbs = [b.callback_data for row in (_fb_kb.inline_keyboard if _fb_kb else []) for b in row]
+    _fb_web = any(getattr(b, "web_app", None) for row in (_fb_kb.inline_keyboard if _fb_kb else []) for b in row)
+    check("v241 fallback start still replies", any("Chulbuli" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    check("v241 fallback menu has callbacks", "menu:games" in _fb_cbs and "menu:help" in _fb_cbs,
+          str(_fb_cbs))
+    check("v241 fallback menu drops webapp", not _fb_web, str(_fb_kb))
+    # menu "home" edit fallback
+    B._botapi_call_sync = _fake_botapi_fail
+    FakeMessage.edits.clear()
+    _fb_msg = FakeMessage(B.START_TEXT.format(name="Tester"), uid=999, name="Chulbuli", chat_id=111, ctype="private")
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:home", uid=111, name="Tester", message=_fb_msg))
+    B._botapi_call_sync = _orig_botapi
+    _fb_edits = FakeMessage.edits
+    _fb_ekb = _fb_edits[-1][2].get("reply_markup") if _fb_edits else None
+    _fb_eweb = any(getattr(b, "web_app", None) for row in (_fb_ekb.inline_keyboard if _fb_ekb else []) for b in row)
+    check("v241 fallback home edit works", len(_fb_edits) == 1 and "hiee" in _fb_edits[0][1],
+          str(_fb_edits))
+    check("v241 fallback home edit drops webapp", not _fb_eweb, str(_fb_ekb))
+    # (d) web_app_data coin credit still works (win clamped +500, draw 0)
+    _u781 = B.get_user(781, "Wad2")
+    _u781["coins"] = 2000
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "mines", "result": "win", "coins": 9999}', uid=781))
+    check("v241 webapp win clamped 500", B.get_user(781)["coins"] == 2500,
+          f"coins={B.get_user(781)['coins']}")
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "uno", "result": "draw", "coins": 500}', uid=781))
+    check("v241 webapp draw no credit", B.get_user(781)["coins"] == 2500,
+          f"coins={B.get_user(781)['coins']}")
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "chess", "result": "win"}', uid=781))
+    check("v241 webapp win no coins field", B.get_user(781)["coins"] == 2500,
+          f"coins={B.get_user(781)['coins']}")
+    # (e) callback-only menus still go through Pyrogram (Bot API not touched)
+    _botapi_calls.clear()
+    B._botapi_call_sync = _fake_botapi_ok
+    FakeMessage.edits.clear(); FakeMessage.outbox.clear()
+    _py_msg = FakeMessage(B.START_TEXT.format(name="Tester"), uid=999, name="Chulbuli", chat_id=111, ctype="private")
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:games", uid=111, name="Tester", message=_py_msg))
+    await B.cmd_wordgrid(client, FakeMessage("/wordgrid", uid=111, chat_id=-100251))
+    B._botapi_call_sync = _orig_botapi
+    check("v241 callback menu stays on pyrogram", len(_botapi_calls) == 0, str(_botapi_calls))
+    check("v241 submenu edit via pyrogram", any("/uno" in t for _, t, _ in FakeMessage.edits),
+          str([t[:40] for _, t, _ in FakeMessage.edits]))
+    check("v241 callback send via pyrogram", any("WORD GRID" in t for _, t in FakeMessage.outbox),
+          str([t[:40] for _, t in FakeMessage.outbox]))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
