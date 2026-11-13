@@ -2336,6 +2336,97 @@ async def main():
           str(len(_GenericYDL.calls)))
     B._yt_dlp = _saved_ydl
 
+    # ---- v2.5.1: YouTube cookies (YTDLP_COOKIES env var) for /play ----
+    # Live evidence: player clients alone are NOT enough on Railway's IP
+    # (bot-check on two different songs, 2026-11-13 09:24/09:26/09:40).
+    # The fix: Sanji's own logged-in YouTube cookies (Netscape export)
+    # set as a Railway env var, written once to a 0600 temp file and
+    # passed to yt-dlp as `cookiefile` for BOTH search and download.
+    _saved_cookies = os.environ.pop("YTDLP_COOKIES", None)
+    _cookie_path = B._YT_COOKIE_FILE
+    try:
+        if os.path.exists(_cookie_path):
+            os.remove(_cookie_path)
+    except Exception:  # noqa: BLE001
+        pass
+    check("yt cookies none when unset", B._yt_cookie_file() is None)
+    os.environ["YTDLP_COOKIES"] = ("# Netscape HTTP Cookie File\n"
+                                   ".youtube.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+test\n")
+    _got_cookie = B._yt_cookie_file()
+    check("yt cookies file written",
+          _got_cookie == _cookie_path and os.path.isfile(_got_cookie), str(_got_cookie))
+    check("yt cookies file mode 0600",
+          (os.stat(_got_cookie).st_mode & 0o777) == 0o600,
+          oct(os.stat(_got_cookie).st_mode & 0o777))
+    check("yt cookies content kept",
+          "CONSENT" in open(_got_cookie, encoding="utf-8").read())
+    check("yt cookies second call same file", B._yt_cookie_file() == _cookie_path)
+
+    class _CookieYDL:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            if download:
+                # mirror real yt-dlp: write a dummy audio file where
+                # outtmpl points, so _music_download_sync finds it.
+                path = self.opts["outtmpl"].replace("%(ext)s", "m4a")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as _f:
+                    _f.write(b"fake-audio")
+                return {"title": "Cookie Gaana", "webpage_url": "https://youtube.com/watch?v=cookie",
+                        "url": "https://audio.example/cookie.m4a", "duration": 200,
+                        "requested_downloads": [{"filepath": path}]}
+            return {"title": "Cookie Gaana", "webpage_url": "https://youtube.com/watch?v=cookie",
+                    "url": "https://audio.example/cookie.m4a", "duration": 200}
+
+    _CookieYDL.calls.clear()
+    _saved_ydl = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _CookieYDL})
+    _cookie_track = B.resolve_track("cookie gaana")
+    check("yt cookies extract passes cookiefile",
+          bool(_CookieYDL.calls) and _CookieYDL.calls[0].get("cookiefile") == _cookie_path,
+          str(_CookieYDL.calls[0] if _CookieYDL.calls else None))
+    check("yt cookies track resolves", _cookie_track["title"] == "Cookie Gaana",
+          str(_cookie_track))
+    # download path passes the same cookiefile (fake writes a real file)
+    _CookieYDL.calls.clear()
+    _dl_cookie = B._music_download_sync({"title": "Cookie Gaana",
+                                         "url": "https://youtube.com/watch?v=cookie",
+                                         "audio": "https://audio.example/cookie.m4a",
+                                         "duration": 200})
+    check("yt cookies download passes cookiefile",
+          bool(_CookieYDL.calls) and _CookieYDL.calls[0].get("cookiefile") == _cookie_path,
+          str(_CookieYDL.calls[0] if _CookieYDL.calls else None))
+    check("yt cookies download writes file", os.path.isfile(_dl_cookie), str(_dl_cookie))
+    B._music_delete_file(_dl_cookie)
+    B._yt_dlp = _saved_ydl
+    # unset -> no cookiefile anywhere
+    os.environ.pop("YTDLP_COOKIES", None)
+    try:
+        if os.path.exists(_cookie_path):
+            os.remove(_cookie_path)
+    except Exception:  # noqa: BLE001
+        pass
+    _CookieYDL.calls.clear()
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _CookieYDL})
+    B.resolve_track("no cookie gaana")
+    check("yt cookies unset no cookiefile",
+          bool(_CookieYDL.calls) and "cookiefile" not in _CookieYDL.calls[0],
+          str(_CookieYDL.calls[0] if _CookieYDL.calls else None))
+    B._yt_dlp = _saved_ydl
+    if _saved_cookies is not None:
+        os.environ["YTDLP_COOKIES"] = _saved_cookies
+
     # ---- v2.3.1: /promote uses ChatPrivileges (real Pyrogram API) ----
     _fake_app2 = FakeApp()
     FakeApp.calls.clear()

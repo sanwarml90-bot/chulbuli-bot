@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -3498,7 +3498,8 @@ def print_startup_diagnostics() -> None:
     print(f"[chulbuli] python: {sys.version.split()[0]} ({sys.platform})")
     print(f"[chulbuli] voice: pytgcalls={_GroupCallFactory is not None} "
           f"session={'set' if ASSISTANT_SESSION else 'MISSING'} "
-          f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'}")
+          f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'} "
+          f"yt_cookies={'yes' if _yt_cookie_file() else 'no'}")
 
 
 def fmt_duration(sec: int) -> str:
@@ -3582,20 +3583,63 @@ def _is_youtube_blocked(msg: str) -> bool:
     return any(m in low for m in _YT_BLOCKED_MARKERS)
 
 
+_YT_COOKIE_FILE = os.path.join(tempfile.gettempdir(), "chulbuli-yt-cookies.txt")
+
+
+def _yt_cookie_file() -> str | None:
+    """Path of the YouTube cookies file, or None when no cookies are set.
+
+    The cookies come from the user's own logged-in YouTube export
+    ("Get cookies.txt LOCALLY" extension, Netscape format), set as the
+    Railway env var YTDLP_COOKIES — never committed to the repo. Written
+    once to a 0600 temp file so yt-dlp's `cookiefile` option can use it;
+    with a real logged-in session YouTube stops treating Railway's IP
+    as a bot. The cookie content itself is never logged. Returns None
+    when the env var is empty/unset.
+    """
+    text = (os.environ.get("YTDLP_COOKIES") or "").strip()
+    if not text:
+        return None
+    try:
+        if os.path.isfile(_YT_COOKIE_FILE):
+            with open(_YT_COOKIE_FILE, encoding="utf-8") as fh:
+                if fh.read().strip() == text:
+                    return _YT_COOKIE_FILE
+        with open(_YT_COOKIE_FILE, "w", encoding="utf-8") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+        os.chmod(_YT_COOKIE_FILE, 0o600)
+        return _YT_COOKIE_FILE
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _yt_add_cookies(opts: dict) -> dict:
+    """Add `cookiefile` to a YoutubeDL opts dict when cookies are set."""
+    path = _yt_cookie_file()
+    if path:
+        opts["cookiefile"] = path
+    return opts
+
+
 def _yt_extract(src: str):
     """extract_info with anti-bot player clients + one retry on YouTube errors.
 
     First attempt uses the mobile Innertube clients (android/ios) + web —
     they often bypass the YouTube bot-check that blocks plain web requests
     from datacenter IPs. If that fails with a YouTube block, retry ONCE with
-    the tv/web clients. Raises MusicError (never a raw yt-dlp error) so the
-    /play handler can always reply honestly instead of going silent.
+    the tv/web clients. When YTDLP_COOKIES is set, the logged-in cookies
+    are also passed (cookiefile) — live logs show the player clients
+    alone are NOT enough on Railway's IP (blocked 2026-11-13 09:24/09:26/
+    09:40 on two different songs). Raises MusicError (never a raw yt-dlp
+    error) so the /play handler can always reply honestly instead of
+    going silent.
     Verified against installed yt-dlp 2026.10.26: `extractor_args` is a valid
     YoutubeDL param ({"youtube": {"player_client": [...]}}), and
     android/ios/web/tv are valid Innertube client names.
     """
     base = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
             "no_warnings": True, "skip_download": True}
+    _yt_add_cookies(base)
     client_sets = (["android", "ios", "web"], ["tv", "web"])
     last = None
     for attempt, clients in enumerate(client_sets):
@@ -3684,6 +3728,7 @@ def _music_download_sync(track: dict) -> str:
     opts = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
             "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
             "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}}
+    _yt_add_cookies(opts)
     if music_ffmpeg_setup():
         # yt-dlp's FFmpegExtractAudio needs BOTH ffmpeg and ffprobe.
         # imageio-ffmpeg ships only the ffmpeg binary (no ffprobe), so on
