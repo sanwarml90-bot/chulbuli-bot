@@ -83,7 +83,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.8"
+VERSION = "2.3.9"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3368,6 +3368,33 @@ def _music_start_error_text(exc: BaseException) -> str:
     return str(exc) or name
 
 
+def _music_apply_send_shim(user_client) -> None:
+    """Alias Pyrogram 1.x's Client.send onto 2.x's Client.invoke, on the
+    assistant client only.
+
+    pytgcalls 2.1.0 was written for Pyrogram 1.x, where Client.send sent
+    raw MTProto functions; its PyrogramBridge calls self.client.send(...)
+    in 6 places (CheckGroupCall, LeaveGroupCall, EditGroupCallParticipant,
+    GetFullChannel, GetFullChat). Pyrogram 2.x renamed that operation to
+    Client.invoke (same contract: raw TLObject function in, raw response
+    out) and Client has NO send at all — verified by introspection on the
+    installed 2.0.106 ('send' in dir(Client) is False). Without this alias
+    every gc.start dies with AttributeError: 'Client' object has no
+    attribute 'send' (live /play report 2026-11-13 09:11 IST). The bridge's
+    other client calls all exist in 2.0.106 (handle_updates and
+    resolve_peer are async defs, storage.user_id exists), so send is the
+    ONLY missing one. invoke is a bound async method; assigning it as an
+    instance attribute makes await client.send(fn) behave exactly like
+    await client.invoke(fn) — verified in an async context on the real
+    Client class (both return a coroutine; both raise ConnectionError
+    when the client is not started). The bot client never touches
+    pytgcalls, so the shim is assistant-only.
+    """
+    if getattr(user_client, "send", None) is None and hasattr(user_client, "invoke"):
+        user_client.send = user_client.invoke
+        print("[chulbuli] music: pyrogram1 send shim applied (send -> invoke)")
+
+
 async def _music_ensure_assistant() -> bool:
     """Start the assistant client + GroupCallFactory once; log its identity
     via get_me so a live deploy proves which account is connected."""
@@ -3388,6 +3415,11 @@ async def _music_ensure_assistant() -> bool:
             await user_client.start()
             me = await user_client.get_me()
             print(f"[chulbuli] music assistant: @{me.username} ({me.id})")
+            # pytgcalls 2.1.0's bridge calls client.send (Pyrogram 1.x
+            # name); Pyrogram 2.x only has invoke — alias it BEFORE the
+            # factory is built, or every gc.start dies with
+            # AttributeError: 'Client' object has no attribute 'send'.
+            _music_apply_send_shim(user_client)
             factory = _GroupCallFactory(user_client)
             _ASSISTANT.update({"client": user_client, "factory": factory,
                                "started": True, "me": me})

@@ -2700,6 +2700,127 @@ async def main():
     B.ASSISTANT_SESSION = _real_session6
     B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
     B.MUSIC.clear()
+    # ---- v2.3.9: pytgcalls bridge needs Client.send (Pyrogram 1.x name) ----
+    # Live /play report 2026-11-13 09:11 IST: "ye gaana baj nahi paya:
+    # 'Client' object has no attribute 'send'". pytgcalls 2.1.0's
+    # PyrogramBridge calls self.client.send(...) for its raw MTProto work
+    # (CheckGroupCall etc.), but Pyrogram 2.0.106 has NO Client.send — the
+    # same operation is Client.invoke. The fix aliases send -> invoke on
+    # the assistant client only, before the GroupCallFactory is built.
+    # Real-API guard: the pinned Pyrogram really has invoke and no send.
+    check("v239 real pyrogram has invoke not send",
+          hasattr(_pyro.Client, "invoke") and not hasattr(_pyro.Client, "send"),
+          str([n for n in ("send", "invoke") if hasattr(_pyro.Client, n)]))
+
+    class _FakeAsstSend:
+        """Assistant client mirroring real Pyrogram 2.0.106: has invoke,
+        has NO send — exactly like the live client before the shim."""
+        def __init__(self):
+            self.invoked = []
+
+        async def start(self):
+            return True
+
+        async def get_me(self):
+            class _Me:
+                username = "CBIOFINDIA"
+                id = 8617937893
+            return _Me()
+
+        async def invoke(self, query, retries=10, timeout=15, sleep_threshold=None):
+            self.invoked.append(query)
+            return "raw-ok"
+
+        async def get_dialogs(self, limit=0):
+            yield FakeDialog(-100502)
+
+        async def join_chat(self, link):
+            return True
+
+    # shim delegates send to invoke on a client that has no send
+    _shim_client = _FakeAsstSend()
+    check("v239 no shim no send", not hasattr(_shim_client, "send"))
+    try:
+        _shim_client.send("CheckGroupCall")
+        check("v239 no shim send raises AttributeError", False, "no error raised")
+    except AttributeError:
+        check("v239 no shim send raises AttributeError", True)
+    _buf239 = io.StringIO()
+    with contextlib.redirect_stdout(_buf239):
+        B._music_apply_send_shim(_shim_client)
+    _shim_result = await _shim_client.send("CheckGroupCall")
+    check("v239 shim delegates send to invoke",
+          hasattr(_shim_client, "send") and _shim_result == "raw-ok"
+          and _shim_client.invoked == ["CheckGroupCall"]
+          and "send shim applied" in _buf239.getvalue(),
+          _buf239.getvalue() + f" invoked={_shim_client.invoked!r}")
+    # shim never clobbers an existing send (e.g. a Pyrogram 1.x client)
+    _legacy = _FakeAsstSend()
+    _legacy.send = lambda q: "legacy-send"
+    B._music_apply_send_shim(_legacy)
+    check("v239 shim keeps existing send", _legacy.send("x") == "legacy-send"
+          and _legacy.invoked == [])
+
+    # full path: ensure applies the shim, then the bridge-style gc.start
+    # (which calls client.send, like real pytgcalls) succeeds through it
+    class _ShimBridgeGroupCallFile(_FakeGroupCallFile):
+        def __init__(self, *a, client=None, **kw):
+            super().__init__(*a, **kw)
+            self._bridge_client = client
+
+        async def start(self, chat_id):
+            await self._bridge_client.send("CheckGroupCall")
+            self.started.append(chat_id)
+            self.is_connected = True
+
+    class _ShimGroupCallFactory(_FakeGroupCallFactory):
+        def get_file_group_call(self, input_filename=None, output_filename=None,
+                                play_on_repeat=True):
+            gc = _ShimBridgeGroupCallFile(input_filename=input_filename,
+                                          play_on_repeat=play_on_repeat,
+                                          client=self.user_client)
+            self.created.append(gc)
+            return gc
+
+    _asst_send = _FakeAsstSend()
+    _real_ytdlp9 = B._yt_dlp
+    B._yt_dlp = _FakeYtDlp
+    B._GroupCallFactory = _ShimGroupCallFactory
+    B._music_make_client = lambda: _asst_send
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _buf239b = io.StringIO()
+    _stream_exc9 = None
+    _track239 = {"title": "Test Gaana", "url": "https://youtube.com/watch?v=test",
+                 "audio": "https://audio.example/test.m4a", "duration": 200,
+                 "by": "", "by_id": 0}
+    try:
+        with contextlib.redirect_stdout(_buf239b):
+            _ok9 = await B._music_ensure_assistant()
+            await asyncio.sleep(0.05)
+            await B._music_stream_track(-100503, _track239)
+    except Exception as _e:  # noqa: BLE001
+        _stream_exc9 = _e
+    check("v239 ensure applies shim",
+          _ok9 is True and hasattr(_asst_send, "send")
+          and "send shim applied" in _buf239b.getvalue(),
+          _buf239b.getvalue() + f" exc={_stream_exc9!r}")
+    check("v239 bridge send succeeds through shim",
+          _stream_exc9 is None and _asst_send.invoked == ["CheckGroupCall"]
+          and B.music_state(-100503).get("in_call") is True,
+          f"exc={_stream_exc9!r} invoked={_asst_send.invoked!r}")
+    B._yt_dlp = _real_ytdlp9
+    try:
+        await B._music_leave(-100503)
+    except Exception:
+        pass
+    B.MUSIC.clear()
+    B._GroupCallFactory = _real_factory6
+    B._music_make_client = _real_mkc6
+    B.ASSISTANT_SESSION = _real_session6
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
