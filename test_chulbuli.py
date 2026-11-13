@@ -2463,6 +2463,139 @@ async def main():
     finally:
         B.app.get_chat = _real_get_chat
         B._populate_peer_cache = _real_populate
+    # ---- v2.3.7: USER_ALREADY_PARTICIPANT is a success, not a failure ----
+    # Live /play report 2026-11-13 08:55 IST: the assistant was ALREADY a
+    # member, Telegram returned 400 USER_ALREADY_PARTICIPANT, and the old
+    # code turned that into MusicError("assistant group me join nahi kar
+    # paya"). Being already a participant IS the goal — the join is a
+    # no-op and the play retry must surface the true gc.start result.
+    class _FakeAsstJoin:
+        def __init__(self, behaviour):
+            self.behaviour = behaviour  # "already" | "string" | "other" | "ok"
+            self.joined = []
+
+        async def join_chat(self, link):
+            self.joined.append(link)
+            if self.behaviour == "already":
+                raise B.UserAlreadyParticipant(
+                    "The user is already a participant of this chat")
+            if self.behaviour == "string":
+                raise Exception("[400 USER_ALREADY_PARTICIPANT] - The user is "
+                                "already a participant of this chat")
+            if self.behaviour == "other":
+                raise Exception("FLOOD_WAIT_10")
+            return True
+
+    async def _chat_with_username(chat_id):
+        class _C:
+            username = "testgroup"
+            invite_link = None
+        return _C()
+
+    async def _chat_with_link(chat_id):
+        class _C:
+            username = None
+            invite_link = "https://t.me/+testinvite"
+        return _C()
+
+    _real_get_chat2 = B.app.get_chat
+    try:
+        # username path: join raises the real class -> returns normally
+        _asst_already = _FakeAsstJoin("already")
+        B._ASSISTANT.update({"client": _asst_already, "factory": None,
+                             "started": True, "me": None, "init_started": True})
+        B.app.get_chat = _chat_with_username
+        try:
+            await B._music_assistant_join_chat(-100503)
+            check("v237 join already participant by username",
+                  _asst_already.joined == ["testgroup"])
+        except B.MusicError as _e:
+            check("v237 join already participant by username", False, str(_e))
+        # invite-link path: same class, no username on the chat
+        _asst_already2 = _FakeAsstJoin("already")
+        B._ASSISTANT.update({"client": _asst_already2})
+        B.app.get_chat = _chat_with_link
+        try:
+            await B._music_assistant_join_chat(-100503)
+            check("v237 join already participant by link",
+                  _asst_already2.joined == ["https://t.me/+testinvite"])
+        except B.MusicError as _e:
+            check("v237 join already participant by link", False, str(_e))
+        # string fallback: the error surfaces as plain text, still a success
+        _asst_str = _FakeAsstJoin("string")
+        B._ASSISTANT.update({"client": _asst_str})
+        B.app.get_chat = _chat_with_username
+        try:
+            await B._music_assistant_join_chat(-100503)
+            check("v237 join already participant string fallback",
+                  _asst_str.joined == ["testgroup"])
+        except B.MusicError as _e:
+            check("v237 join already participant string fallback", False, str(_e))
+        # a DIFFERENT join error still fails honestly
+        _asst_other = _FakeAsstJoin("other")
+        B._ASSISTANT.update({"client": _asst_other})
+        try:
+            await B._music_assistant_join_chat(-100503)
+            check("v237 join other error still fails", False, "no MusicError raised")
+        except B.MusicError as _e:
+            check("v237 join other error still fails",
+                  "join nahi kar paya" in str(_e), str(_e))
+    finally:
+        B.app.get_chat = _real_get_chat2
+    # gc.start's original exception is logged before the join attempt
+    class _FlakyGroupCallFile(_FakeGroupCallFile):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.start_calls = 0
+
+        async def start(self, chat_id):
+            self.start_calls += 1
+            if self.start_calls == 1:
+                raise RuntimeError("boom-start-first")
+            self.started.append(chat_id)
+            self.is_connected = True
+
+    class _FlakyGroupCallFactory(_FakeGroupCallFactory):
+        def get_file_group_call(self, input_filename=None, output_filename=None,
+                                play_on_repeat=True):
+            gc = _FlakyGroupCallFile(input_filename=input_filename,
+                                     play_on_repeat=play_on_repeat)
+            self.created.append(gc)
+            return gc
+
+    _flaky_factory = _FlakyGroupCallFactory(_FakeAsstJoin("ok"))
+    _real_ytdlp2 = B._yt_dlp
+    B._yt_dlp = _FakeYtDlp
+    B._GroupCallFactory = _FlakyGroupCallFactory
+    B._ASSISTANT.update({"client": _FakeAsstJoin("ok"),
+                         "factory": _flaky_factory, "started": True,
+                         "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _buf237 = io.StringIO()
+    _track237 = {"title": "Test Gaana", "url": "https://youtube.com/watch?v=test",
+                 "audio": "https://audio.example/test.m4a", "duration": 200,
+                 "by": "", "by_id": 0}
+    _stream_exc = None
+    try:
+        with contextlib.redirect_stdout(_buf237):
+            await B._music_stream_track(-100503, _track237)
+    except Exception as _e:  # noqa: BLE001
+        _stream_exc = _e
+    _gc503 = B.music_state(-100503).get("gc")
+    check("v237 gc.start failure logged before join",
+          "gc.start failed, trying assistant join" in _buf237.getvalue()
+          and "boom-start-first" in _buf237.getvalue(),
+          _buf237.getvalue() + f" exc={_stream_exc!r}")
+    check("v237 gc.start retried after join",
+          _stream_exc is None and _gc503 is not None and _gc503.start_calls == 2
+          and B.music_state(-100503).get("in_call") is True,
+          f"exc={_stream_exc!r}")
+    B._yt_dlp = _real_ytdlp2
+    try:
+        await B._music_leave(-100503)
+    except Exception:
+        pass
+    B.MUSIC.clear()
     # restore music state
     B._GroupCallFactory = _real_factory6
     B._music_make_client = _real_mkc6

@@ -45,7 +45,7 @@ from datetime import datetime
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, UserAlreadyParticipant
 from pyrogram.types import (
     ChatPermissions,
     ChatPrivileges,
@@ -83,7 +83,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.6"
+VERSION = "2.3.7"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -3494,7 +3494,18 @@ async def _music_assistant_join_chat(chat_id: int) -> None:
             except Exception:  # noqa: BLE001
                 link = await app.export_chat_invite_link(chat_id)
             await user_client.join_chat(link)
+    except UserAlreadyParticipant:
+        # The assistant is ALREADY a member — that IS the goal, not a
+        # failure (Telegram returns 400 USER_ALREADY_PARTICIPANT for a
+        # join that is already done; live /play report 2026-11-13 08:55 IST).
+        print("[chulbuli] music: assistant already in group")
+        return
     except Exception as exc:  # noqa: BLE001
+        if "USER_ALREADY_PARTICIPANT" in str(exc):
+            # Same case surfaced as a plain error string (other Pyrogram
+            # versions wrap it differently) — still a success.
+            print("[chulbuli] music: assistant already in group")
+            return
         raise MusicError(f"assistant group me join nahi kar paya: {exc}")
 
 
@@ -3535,6 +3546,10 @@ async def _music_stream_track(chat_id: int, track: dict) -> None:
             try:
                 await gc.start(chat_id)
             except Exception as exc:  # noqa: BLE001
+                # Log the REAL first failure before the join attempt — the
+                # join error used to mask it (e.g. USER_ALREADY_PARTICIPANT
+                # made a healthy start look like a join failure).
+                print(f"[chulbuli] music gc.start failed, trying assistant join: {exc!r}")
                 # assistant group me nahi hai to join karke dobara try karo
                 try:
                     await _music_assistant_join_chat(chat_id)
