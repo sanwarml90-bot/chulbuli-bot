@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.6"
+VERSION = "2.5.7"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -883,7 +883,6 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
 /yaad — main tumhare baare me kya yaad rakhti hun
 /bhool — sab kuch bhool jao
-Owner /owner me chat on/off kar sakta hai.
 
 **💞 Romance**
 /propose — reply karke propose karo
@@ -916,10 +915,7 @@ Owner /owner me chat on/off kar sakta hai.
 /profile — apni full profile
 /alive /vault /shop /inv /guide /free
 /gencode /redeem /delcode /cinfo — gift codes
-+hug +kiss +pat +slap +bite +punch +murder — reply karke
-
-**👑 Owner**
-/owner — owner panel (sirf Sanji)"""
++hug +kiss +pat +slap +bite +punch +murder — reply karke"""
 
 
 @app.on_message(filters.command(["start", "help"]))
@@ -9418,9 +9414,10 @@ async def handle_plus_action(message: Message) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Owner panel — only Sanji (7966027018). /owner command + the 👑 Owner
+# Owner panel — only Sanji (7966027018). Entry is ONLY the 👑 Owner
 # Panel button in the main menu (owner only). /panel was REMOVED (v2.5.6)
-# on Sanji's order — the button replaces it.
+# and /owner was REMOVED (v2.5.7) on Sanji's order — both commands are
+# gone from the code and from help; the button is the only way in.
 # ---------------------------------------------------------------------------
 def owner_panel_text() -> str:
     users = len(DATA["users"])
@@ -9460,15 +9457,6 @@ def owner_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📢 Broadcast", callback_data="own:broadcast"),
          InlineKeyboardButton("🔄 Status / Restart", callback_data="own:status")],
     ])
-
-
-@app.on_message(filters.command(["owner"]))
-async def cmd_owner(client: Client, message: Message):
-    if message.from_user is None or message.from_user.id != OWNER_ID:
-        await safe_reply(message, "Ye panel sirf owner ke liye hai 🙂")
-        return
-    track_user(message)
-    await safe_reply(message, owner_panel_text(), reply_markup=owner_keyboard())
 
 
 async def do_broadcast(text: str) -> tuple[int, int, int, int]:
