@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.8"
+VERSION = "2.6.0"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -98,7 +98,8 @@ API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
 ASSISTANT_SESSION = os.environ.get("ASSISTANT_SESSION", "") or ""
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+DATA_FILE = os.path.abspath(os.environ.get("CHULBULI_DATA_FILE")
+                             or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json"))
 START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
@@ -147,6 +148,7 @@ DEFAULT_USER = {
     "bets_today": 0, "shield_until": 0, "powers": {}, "married_to": None,
     "elo": 1200, "games_won": 0, "subway_best": 0, "banned": False, "first_seen": 0,
     "grid_points": 0, "wc_wins": 0, "last_free": 0,
+    "miniapp_reward_day": "", "miniapp_rewarded_today": 0,
 }
 
 
@@ -177,7 +179,21 @@ def load_data() -> dict:
         data.setdefault("ai_model", "auto")
         data.setdefault("ai_system", "")
         return data
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        return _blank_data()
+    except (json.JSONDecodeError, OSError) as exc:  # noqa: BLE001
+        # Corrupt data is NOT silently treated as a fresh database: keep
+        # a recoverable copy of the damaged file, log it, then start
+        # blank. (v2.6.0 audit — the old code just swallowed the error.)
+        print(f"[chulbuli] data load failed for {DATA_FILE}: {exc!r}")
+        try:
+            import shutil
+            shutil.copyfile(DATA_FILE, DATA_FILE + ".corrupt")
+        except OSError:
+            pass
+        return _blank_data()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] unexpected data load error: {exc!r}")
         return _blank_data()
 
 
@@ -186,14 +202,24 @@ _save_lock = asyncio.Lock()
 
 
 def save_data() -> None:
-    """Synchronous atomic save (called from handlers; file is small)."""
+    """Atomically persist data; CHULBULI_DATA_FILE can point to a durable volume."""
+    tmp = DATA_FILE + ".tmp"
     try:
-        tmp = DATA_FILE + ".tmp"
+        parent = os.path.dirname(DATA_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(DATA, fh, ensure_ascii=False)
+            json.dump(DATA, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, DATA_FILE)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] data save failed for {DATA_FILE}: {exc!r}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def get_user(uid: int, name: str = "") -> dict:
@@ -1098,7 +1124,9 @@ async def web_app_data_handler(client: Client, message: Message):
         return
     try:
         payload = json.loads(data.data)
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
         return
     if str(payload.get("game", "")) == "chess" and payload.get("match_id"):
         # v2.5.0 — a move sent from the Mini App online chess board. A solo
@@ -1112,7 +1140,20 @@ async def web_app_data_handler(client: Client, message: Message):
     except (TypeError, ValueError):
         coins = 0
     if result == "win" and coins > 0:
-        credit = min(coins, MINIAPP_WIN_MAX)
+        # v2.6.0 — Mini App results arrive from the user's Telegram Web App
+        # session, but the game state itself is client-side. Limit rewards
+        # server-side so a modified client cannot repeatedly mint coins:
+        # at most MINIAPP_WIN_MAX total per user per day.
+        today = today_key()
+        if user.get("miniapp_reward_day") != today:
+            user["miniapp_reward_day"] = today
+            user["miniapp_rewarded_today"] = 0
+        remaining = max(0, MINIAPP_WIN_MAX - int(user.get("miniapp_rewarded_today", 0) or 0))
+        credit = min(coins, remaining)
+        if credit <= 0:
+            await safe_reply(message, "🎮 Aaj ka Mini App reward limit poora ho gaya — kal phir khelna 🙂")
+            return
+        user["miniapp_rewarded_today"] = int(user.get("miniapp_rewarded_today", 0) or 0) + credit
         add_coins(user, credit)
         save_data()
         await safe_reply(message, f"🎮 Mini App — {game} jeet gaye! +{fmt_coins(credit)} coins! Balance: {fmt_coins(user['coins'])} 🎉")
