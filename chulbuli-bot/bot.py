@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.4"
+VERSION = "2.6.5"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5059,13 +5059,27 @@ AI_PROVIDERS = {
         "label": "Groq",
         "url": "https://api.groq.com/openai/v1/chat/completions",
         "key_env": "GROQ_API_KEY",
-        "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+        # Free chat models, verified 2026-11-13 (Groq rate-limits page +
+        # Sept 29, 2026 /models test: all 4 answered a call). Llama 3.1/3.3
+        # are Enterprise-only since 2026-08-16; Whisper/prompt-guard/
+        # safeguard are not chat models, so they are NOT listed.
+        "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                   "qwen/qwen3.8-27b", "allam-2-7b"],
     },
     "gemini": {
         "label": "Gemini",
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         "key_env": "GEMINI_API_KEY",
-        "models": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"],
+        # Free chat models, verified 2026-11-13 (Google pricing page,
+        # Nov 11-13, 2026). 2.5-flash + 2.0-flash are GONE from the free
+        # lists (2.5-flash is deprecated, routes to 3.5-flash-lite from
+        # Dec 1, 2026; 2.0-flash is not listed free any more), and
+        # 2.5-pro is deprecated + closed to new projects — all removed.
+        # 2.5-flash-lite stays last: still served, legacy fallback only.
+        "models": ["gemini-3.8-flash", "gemini-4-hydrogen",
+                   "gemini-3.6-flash", "gemini-3-flash-preview",
+                   "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                   "gemini-2.5-flash-lite"],
     },
 }
 AI_PROVIDER_ORDER = ["openrouter", "groq", "gemini"]
