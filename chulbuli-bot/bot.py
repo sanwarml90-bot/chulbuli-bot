@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5169,14 +5169,26 @@ def _ai_post(model: str, messages: list) -> str | None:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         content = content.strip()
         return content or None
     except Exception as exc:  # noqa: BLE001
+        if "429" in str(exc):
+            # v2.6.1: remember the rate-limit so the next chat skips this
+            # model instead of burning another call on it.
+            _AI_LAST_429[model] = time.time()
         print(f"[chulbuli] AI call failed ({model}): {exc!r}")
         return None
+
+
+# v2.6.1 — per-model 429 cooldown (Sanji: "group me reply bahut time
+# bad de rahi hai"). The chain tried models one by one; when gemma was
+# rate-limited every chat burned 2+ slow calls on it before reaching a
+# model that answers. A 429'd model is now skipped for 60 s.
+_AI_LAST_429: dict[str, float] = {}
+_AI_COOLDOWN_SECS = 60
 
 
 def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
@@ -5266,6 +5278,9 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
                              "content": turn.get("t", "") or ""})
     messages.append({"role": "user", "content": text})
     for model in ai_model_order():
+        if time.time() - _AI_LAST_429.get(model, 0) < _AI_COOLDOWN_SECS:
+            print(f"[chulbuli] AI model skipped (429 cooldown): {model}")
+            continue
         try:
             out = await asyncio.to_thread(_ai_post, model, messages)
         except Exception as exc:  # noqa: BLE001
