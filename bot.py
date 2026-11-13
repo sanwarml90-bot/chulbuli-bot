@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -1132,6 +1132,10 @@ async def web_app_data_handler(client: Client, message: Message):
     if str(payload.get("game", "")) == "chess" and payload.get("match_id"):
         # v2.5.0 — a move sent from the Mini App online chess board. A solo
         # chess result (no match_id) falls through to the coin logic below.
+        if payload.get("action") == "join":
+            # v2.6.3 — join sent from inside the Mini App (lobby web_app button).
+            await _chess_webapp_join(message, payload)
+            return
         await _chess_webapp_move(message, payload)
         return
     game = str(payload.get("game", "game"))
@@ -6205,9 +6209,15 @@ def _chess_miniapp_markup(match: dict) -> InlineKeyboardMarkup:
 
 
 def chess_join_keyboard(match_id: str) -> InlineKeyboardMarkup:
-    """v2.5.0 — Join button on a chess lobby message. The match_id is in the
-    callback so several chess lobbies can wait in one group at once."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Join karo", callback_data=f"chess:join:{match_id}")]])
+    """v2.5.0 — Join button on a chess lobby message. v2.6.3: the first row
+    is a web_app button (Sanji: 'join par click karte hi mini app khule')
+    — tapping it opens the Mini App at once and the join completes with
+    one tap inside; the callback button stays as a fallback."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 Join karo — Mini App khulega",
+                              web_app=WebAppInfo(url=MINIAPP_URL + "?join=" + match_id))],
+        [InlineKeyboardButton("🙋 Join karo", callback_data=f"chess:join:{match_id}")],
+    ])
 
 
 async def _chess_lobby_timeout(match_id: str, seconds: int = LOBBY_TIMEOUT_SECONDS) -> None:
@@ -6347,6 +6357,21 @@ async def _chess_announce_move(message, match: dict, res: dict):
     await safe_send_text(match["chat_id"],
                          _chess_turn_text(match, res["san"], res["check"], res["me"]),
                          reply_markup=_chess_miniapp_markup(match))
+
+
+async def _chess_webapp_join(message, payload: dict):
+    """v2.6.3 — join a chess match from inside the Mini App
+    ({game: "chess", action: "join", match_id}). The lobby's web_app Join
+    button opens the Mini App at once; the join completes with one tap
+    inside. Errors go to the chat (the user sees them when the app
+    closes); on success _chess_start posts the start message."""
+    match_id = str(payload.get("match_id") or "")
+    match = _CHESS_MATCHES.get(match_id)
+    if not match or match["chat_id"] != message.chat.id:
+        return
+    err = await _chess_join(match, message.from_user.id, display_name(message.from_user))
+    if err:
+        await safe_reply(message, err)
 
 
 async def _chess_webapp_move(message, payload: dict):

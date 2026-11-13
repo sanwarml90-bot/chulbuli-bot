@@ -449,7 +449,7 @@ function botChessMove() {
 // board in the group. No auto-refresh here — the new board arrives via the
 // group's next Mini App button.
 const _qp = new URLSearchParams(window.location.search);
-const onlineMatch = _qp.get("match") || null;
+let onlineMatch = _qp.get("match") || null;
 const onlineFen = _qp.get("fen") || null;
 let onlineYou = (_qp.get("you") === "black") ? "b" : "w";
 const onlineW = _qp.get("w") || null, onlineB = _qp.get("b") || null;
@@ -471,6 +471,40 @@ const onlineW = _qp.get("w") || null, onlineB = _qp.get("b") || null;
   document.getElementById("chessResult").className = "result";
   show("chess");
   renderChess();
+})();
+
+// ================= Chess join from the Mini App (v2.6.3) =================
+// The lobby's web_app Join button opens this page with ?join=<match_id>.
+// The joiner is always Black. The board opens at once (the starting
+// position IS the current position — the match has just started) with a
+// Join button; tapping it sends the join to the bot (sendData closes the
+// app) and the start message with the color buttons appears in the group.
+const joinMatchId = _qp.get("join") || null;
+(function initChessJoin() {
+  if (!joinMatchId || typeof Chess === "undefined") return;
+  chessModeV = "online";
+  onlineYou = "b";
+  chess = new Chess();
+  chessSel = null; chessLast = null; chessRewarded = false;
+  const row = document.getElementById("chessModeRow");
+  if (row) row.style.display = "none";
+  show("chess");
+  renderChess();
+  document.getElementById("chessStatus").textContent = "Black banke join karna hai? Neeche dabao 👇";
+  const el = document.getElementById("chessResult");
+  el.className = "result show";
+  el.innerHTML = "";
+  const b = document.createElement("button");
+  b.className = "btn";
+  b.textContent = "🖤 Join as Black — match shuru karo";
+  b.onclick = () => {
+    if (tg && tg.sendData) tg.sendData(JSON.stringify({ game: "chess", action: "join", match_id: joinMatchId }));
+    else toast("Join tabhi hoga jab Mini App Telegram ke andar kholo 🙂");
+    b.textContent = "Join ho gaya! White ki chaal ka wait karo 🙂";
+    b.disabled = true;
+    onlineMatch = joinMatchId;
+  };
+  el.appendChild(b);
 })();
 
 // ================= UNO (simplified, bot ke saath) =================
