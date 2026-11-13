@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.8"
+VERSION = "2.6.9"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5099,14 +5099,41 @@ AI_PROVIDERS = {
 AI_PROVIDER_ORDER = ["openrouter", "groq", "gemini"]
 
 
-def _ai_key_for(provider: str) -> str:
-    """API key for a provider: the owner's panel-set key first (DATA),
-    else the Railway env var. The value is NEVER logged or echoed back."""
+# v2.6.9 — key formats are fixed per provider. A key pasted under the
+# WRONG provider (e.g. a Groq key saved as the OpenRouter key) used to be
+# sent to the wrong API and 401'd forever; now it is ignored so the right
+# key (env var or a correct panel key) is used instead.
+_AI_KEY_PREFIXES = {"openrouter": "sk-or-", "groq": "gsk_", "gemini": "AIza"}
+
+
+def _ai_raw_key(provider: str) -> str:
+    """Whatever key is stored for a provider (panel first, else env var),
+    stripped — used only to tell 'wrong format' apart from 'no key'."""
     cfg = AI_PROVIDERS.get(provider)
     if not cfg:
         return ""
     keys = DATA.get("ai_keys") or {}
-    return (keys.get(provider) or "").strip() or os.environ.get(cfg["key_env"], "")
+    return ((keys.get(provider) or "").strip()
+            or os.environ.get(cfg["key_env"], "").strip())
+
+
+def _ai_key_for(provider: str) -> str:
+    """API key for a provider: the owner's panel-set key first (DATA),
+    else the Railway env var. The value is NEVER logged or echoed back.
+    A stored key with the wrong format for this provider is ignored —
+    it was almost certainly pasted under the wrong provider."""
+    cfg = AI_PROVIDERS.get(provider)
+    if not cfg:
+        return ""
+    prefix = _AI_KEY_PREFIXES.get(provider, "")
+    keys = DATA.get("ai_keys") or {}
+    panel = (keys.get(provider) or "").strip()
+    if panel and (not prefix or panel.startswith(prefix)):
+        return panel
+    env = os.environ.get(cfg["key_env"], "").strip()
+    if env and (not prefix or env.startswith(prefix)):
+        return env
+    return ""
 
 
 def ai_provider() -> str:
@@ -5392,7 +5419,11 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     if not ai_on():
         return None
     if not any(_ai_key_for(p) for p in AI_PROVIDER_ORDER):
+        _wrong_gate = [f"{AI_PROVIDERS[p]['label']}: key ka format galat hai"
+                       for p in AI_PROVIDER_ORDER if _ai_raw_key(p)]
         _AI_LAST_ERROR = "koi AI key nahi hai — Owner Panel → 🔑 API Key se key daalo"
+        if _wrong_gate:
+            _AI_LAST_ERROR += " | " + " | ".join(_wrong_gate)
         return None
     system = ai_system_prompt()
     facts = memory_facts(user_id) if user_id is not None else []
@@ -5445,6 +5476,13 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     _AI_LAST_ERROR = " | ".join(
         f"{AI_PROVIDERS[p]['label']}: {e}" for p, e in failed.items()
     ) or "AI fail — wajah pata nahi"
+    # v2.6.9: a provider with a stored key in the WRONG format never even
+    # got tried — say so, so the owner knows the key is the problem.
+    _wrong = [f"{AI_PROVIDERS[p]['label']}: key ka format galat hai"
+              for p in AI_PROVIDER_ORDER
+              if p not in failed and _ai_raw_key(p) and not _ai_key_for(p)]
+    if _wrong:
+        _AI_LAST_ERROR = (_AI_LAST_ERROR + " | " + " | ".join(_wrong)) if _AI_LAST_ERROR else " | ".join(_wrong)
     return None
 
 
