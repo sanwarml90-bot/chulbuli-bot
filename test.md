@@ -227,3 +227,108 @@ Sanji: "🎵 ye gaana baj nahi paya: 'Client' object has no attribute 'send' �
 - VERIFIED in installed Pyrogram 2.0.106 source (not guessed): `Client.send` does NOT exist (`'send' in dir(Client)` False); `Client.invoke(self, query: TLObject, retries=10, timeout=15, sleep_threshold=None)` — raw function in, raw response out, RPCError on failure — wahi contract jo 1.x `send` ka tha. Async context me `invoke()` coroutine return karta hai (verified: `asyncio.iscoroutine` True; aliased `send` bhi); not-started client pe dono ConnectionError raise karte hain. Bridge ke baaki client calls sab 2.0.106 me exist karte hain: `handle_updates` (async def), `resolve_peer` (async def), `storage.user_id` — `send` hi ek missing call hai. Real `Client` instance pe attribute assignment kaam karta hai (no `__slots__` problem — verified by actually setting `c.send = c.invoke` on a real Client).
 - [ ] Tests: 452/452 PASS, 3 consecutive runs (baseline 445; +7 naye): real Pyrogram me invoke hai / send nahi (API guard); shim ke bina `client.send` AttributeError raise karta hai (proving shim hi fix hai); shim `send` ko `invoke` pe delegate karta hai (result + recorded call + log line); shim existing `send` ko kabhi overwrite nahi karta (Pyrogram 1.x client safe); full path — `_music_ensure_assistant` shim lagata hai, phir bridge-style `gc.start` (jo `client.send` call karta hai) succeed hota hai aur `in_call` True hota hai
 - [ ] LIVE test (ABHI TAK NAHI HUA — ye fix live-prove NAHI hai): Sanji ke phone se group me active VC ke saath /play — gaana ASLI me bajna chahiye; logs me `[chulbuli] music: pyrogram1 send shim applied` + `[chulbuli] music assistant: @CBIOFINDIA` dikhna chahiye
+
+## 25. Mini App + /end fix + buttons + bare commands + 2-min lobby (v2.4.0 — Sanji ke orders, 2026-11-13 ~09:21-09:25 IST)
+Sanji: (1) chess jaise games chat text me khelna mushkil hai — Mini App (Telegram Web App) banao, HTML + achha UI, chess + dusre hard games andar. (2) Mini App me VC/chat bhi chahiye — is version me NAHI (voice server chahiye; sirf placeholder). (3) /end kaam nahi karta — fix karo. (4) Games me commands ki jagah BUTTONS. (5) Bare `bbet` (bina slash) `/bbet` jaisa kaam kare. (6) `/` type karne pe commands dikhne chahiye (setMyCommands). (7) HAR game ko 2-minute lobby limit — 2 min me koi join na kare to game auto-end.
+- [ ] /end fix: `_clear_all_game_state()` ab GAMES + MAFIA + _MATH_SINGLE TEENO clear karta hai ek hi call me (pehle early-return karta tha — GAMES game hote hue MAFIA/math kabhi clear nahi hota tha; yehi asli bug tha). Lobby bet refund hota hai (`_refund_lobby`, jo ab RPS/Cricket ke p1/p2/bat/bowl players ko bhi refund karta hai — pehle sirf "players" list refund hoti thi, RPS p1 ka bet doob jata tha). `cmd_music` /end ko defer karta hai jab koi bhi game state ho. Reply: game end hua to "Game khatam kar diya 🙂", koi game nahi to "koi game chal nahi raha 🙂". Purana test "/end no game" (jo zero sends expect karta tha) naye spec pe update kiya.
+- [ ] 2-minute lobby auto-end: `_lobby_timeout(chat_id, kind, seconds=120)` — sleep-based background task (koi naya thread nahi), har lobby game ke creation pe `asyncio.create_task` se chalta hai (wordchain, rps, cricket, card, chess, xoxo). Sirf JOIN wait capped hai — started game ko kabhi nahi chhedta. Timeout pe lobby bets refund + message "⏰ 2 minute me koi join nahi hua — <Game> game khatam kar diya 🙂". RPS special: throw ho chuka ho to live match hai, cancel nahi hota. Jo games pehle se apna (chhota) lobby timer rakhte hain (uno 60s, tap 30s, etc.) wo waise hi hain.
+- [ ] Buttons: RPS 🪨/📄/✂️ throw buttons (`rps_throw_keyboard`, callback `rps:`), BBet amount buttons 100/500/1000/all/half (`bbet_amount_keyboard`, callback `bbet:`), Cricket 1-6 number buttons (`cricket_num_keyboard`, callback `cric:`), Card Join button (join_keyboard + `do_join` me card branch), Mines 5x5 tap grid + 💰 Cashout button (callback `mines:`), Word Guess pe "🎮 Mini App me khelo" button. Sab ke liye shared helpers (`_rps_do_throw`, `_bbet_play`, `_cricket_do_num`, `_card_join`, `_mines_do_pick`/`_mines_cashout`) — commands waise hi kaam karte hain, buttons sirf addition hain.
+- [ ] Bare commands: group text handler me `_parse_bare_command` — pehla word known game/economy command ho AUR baaki sirf ek command-like argument ho (amount/all/half/difficulty) to wo command chalta hai ("bbet 100" == "/bbet 100"). "bbet kya hai?" trigger NAHI karta. Admin/moderation commands (ban, mute, warn, ...) kabhi bina slash trigger nahi hote. Bare list: bal, daily, toprich, leaderboard, wordguess, wg, rps, cricket, math, bbet, bet, card, number, uno, chess, mines, tap, crash, jumble, charades, bingo, xoxo, mafia, hack, bomb, roulette, bluff, subway, scribble.
+- [ ] setMyCommands: LIVE Bot API call se 93 commands set kiye (2026-11-13 ~10:20 IST, `{"ok":true,"result":true}`, getMyCommands se verify — 93, pehla /start, aakhri /games). List neeche hai (re-run ke liye):
+/start — Chulbuli se milo
+/help — Saare commands dekho
+/bal — Apna balance dekho
+/daily — Rozana free coins lo
+/give — Kisi ko coins do
+/deposit — Bank me coins jama karo
+/withdraw — Bank se coins nikalo
+/toprich — Sabse ameer users
+/leaderboard — Top players
+/rank — Apna rank dekho
+/pfp — Profile photo dekho
+/gems — Apne gems dekho
+/convert — Coins ko gems me badlo
+/rob — Kisi ko looto
+/kill — Kisi ko maaro (game)
+/protect — Khud ko bachao
+/revive — Kisi ko zinda karo
+/powers — Powers dekho
+/pinfo — Power ki jaankari
+/mypowers — Meri powers
+/extend — Power badhao
+/wordguess — 4-letter word guess karo
+/wg — Word Guess (short)
+/wordgrid — Word grid khelo
+/wordchain — Word chain khelo
+/rps — Rock Paper Scissors
+/cricket — Cricket khelo
+/math — Math sawal
+/bbet — Bet lagao
+/card — Card game khelo
+/number — Number guess karo
+/uno — UNO khelo
+/chess — Chess khelo
+/mines — Mines khelo
+/tap — Tap game
+/crash — Crash game
+/jumble — Jumble word
+/charades — Charades khelo
+/bingo — Bingo khelo
+/xoxo — Tic Tac Toe
+/mafia — Mafia game
+/hack — Hack game
+/bomb — Bomb game
+/roulette — Roulette khelo
+/bluff — Bluff game
+/subway — Subway game
+/scribble — Scribble khelo
+/propose — Kisi ko propose karo
+/divorce — Divorce lo
+/marriage — Shaadi karo
+/couple — Couple dekho
+/warn — Kisi ko warn karo
+/unwarn — Warn hatao
+/mute — Kisi ko mute karo
+/unmute — Unmute karo
+/ban — Kisi ko ban karo
+/unban — Ban hatao
+/kick — Kisi ko nikalo
+/pin — Message pin karo
+/unpin — Pin hatao
+/purge — Messages saaf karo
+/staff — Staff list dekho
+/utag — Sabko tag karo
+/atag — Admins ko tag karo
+/reload — Data reload karo
+/mystats — Mere stats dekho
+/play — Gaana bajao
+/queue — Gaano ki queue
+/skip — Gaana skip karo
+/pause — Gaana roko
+/resume — Gaana chalao
+/stop — Music band karo
+/clear — Queue saaf karo
+/ping — Bot ki speed check karo
+/end — Game khatam karo
+/owner — Owner se milo
+/panel — Owner panel
+/yaad — AI ko kuch yaad dilao
+/bhool — AI ko bhulao
+/acc — Accounts dekho
+/send — Message bhejo
+/wordly — Wordly khelo
+/new — Naya word grid
+/gridtop — Word grid top
+/alive — Bot zinda hai?
+/vault — Vault dekho
+/shop — Shop kholo
+/inv — Inventory dekho
+/guide — Guide padho
+/free — Free coins lo
+/gencode — Gift code banao
+/redeem — Gift code use karo
+/games — Mini App games kholo
+- [ ] Mini App: `webapp/index.html` (single self-contained file, dark UI, Hinglish) + `webapp/chess.min.js` (chess.js 0.10.3 bundled, koi CDN dependency nahi). Games: Chess (asli rules, 2-player + random-move bot), UNO (bot ke saath), Mines (5x5, 3 mines, cashout), Word Grid (chhupa word dhoondho), Word Guess (4-letter, chat jaisa scoring, +500), RPS (+50), Math Rush (60s, +20/sahi), Card Draw (+100). `Telegram.WebApp` (ready/expand) + `sendData({game, result, coins})` — bot me `web_app_data` handler coins credit karta hai, win max +500 clamp (client-side numbers kabhi blind trust nahi), loss/draw pe 0. /start aur /help menus me "🎮 Mini App" button, /games command, Word Guess board pe Mini App button. VC/voice chat: SIRF placeholder section ("VC / voice chat — jald aa raha hai", tap pe kuch nahi karta) — voice server ke bina possible nahi, is version me nahi banaya.
+- [ ] Mini App URL: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/ — GitHub Pages (repo root, main branch). Pages enable + curl-verify: <STATUS — push ke baad bharo>
+- [ ] Tests: 488/488 PASS, 3 consecutive runs (baseline 452; +36 naye v2.4.0 checks): /end clears GAMES+MAFIA+math (ek saath), /end no game reply, /end refunds lobby bet, lobby timeout ends+refunds (card + RPS p1), started game timeout se bachta hai, RPS/BBet buttons + callbacks, cricket/mines helpers, bare-command parse rules (question/admin/unknown word trigger nahi), bare "bbet 100" e2e, /games + menu Mini App buttons, web_app_data win clamp 500 / lose 0 / bad json ignore.
+- [ ] LIVE test (ABHI TAK NAHI HUA — ye build live-verify NAHI hai): Sanji ke phone se Mini App kholo aur ek game khelo (coins claim hone chahiye); group me /end karo (game khatam hona chahiye); bare "bbet 100" bhejo; `/` type karke commands dekho. Railway deploy ke baad VERSION "2.4.0" dikhna chahiye.

@@ -755,7 +755,8 @@ async def main():
     check("/end clears", B.game_state(-100215) is None and any("Game khatam" in t for _, t in FakeMessage.outbox))
     FakeMessage.outbox.clear()
     await B.cmd_end_game(client, FakeMessage("/end", uid=111, name="End1", chat_id=-100215))
-    check("/end no game", len(FakeMessage.outbox) == 0)
+    check("/end no game", any("koi game chal nahi raha" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
 
     # ---- AI chat: no key -> None, fallback rule-based; toggle off -> None;
     #      mocked API success; first model fails -> second model answers ----
@@ -2821,6 +2822,179 @@ async def main():
     B.ASSISTANT_SESSION = _real_session6
     B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
     B.MUSIC.clear()
+
+    # ---------- v2.4.0: /end, lobby timeout, buttons, bare commands ----------
+    # /end clears EVERY game state store (GAMES + MAFIA + _MATH_SINGLE)
+    _cid240 = -100240
+    B.set_game(_cid240, {"kind": "rps", "amount": 0, "p1": 771, "p2": None,
+                         "throws": {}, "scores": {}, "round": 1})
+    B.MAFIA[_cid240] = {"kind": "mafia", "players": [771], "amount": 0}
+    B._MATH_SINGLE[_cid240] = {"q": "2+2", "a": 4, "by": 771}
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=771, chat_id=_cid240))
+    check("v240 end clears GAMES", B.game_state(_cid240) is None)
+    check("v240 end clears MAFIA", _cid240 not in B.MAFIA)
+    check("v240 end clears math single", _cid240 not in B._MATH_SINGLE)
+    check("v240 end reply", any("Game khatam kar diya" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    # /end with no game running
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=771, chat_id=-100241))
+    check("v240 end no game", any("koi game chal nahi raha" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    # /end refunds a lobby bet (card lobby, amount 100)
+    _u771 = B.get_user(771, "EndTester")
+    _u771["coins"] = 1000
+    B.set_game(_cid240, {"kind": "card", "amount": 100, "need": 2,
+                         "players": [771], "starter": 771})
+    FakeMessage.outbox.clear()
+    await B.cmd_end_game(client, FakeMessage("/end", uid=771, chat_id=_cid240))
+    check("v240 end refunds lobby bet", B.get_user(771)["coins"] == 1100,
+          f"coins={B.get_user(771)['coins']}")
+    check("v240 end clears card lobby", B.game_state(_cid240) is None)
+    # 2-minute lobby timeout (fake the clock: lobby opened 200s ago)
+    _cid242 = -100242
+    _u772 = B.get_user(772, "TimeoutTester")
+    _u772["coins"] = 500
+    FakeMessage.outbox.clear()
+    B.set_game(_cid242, {"kind": "card", "amount": 100, "need": 2,
+                         "players": [772], "starter": 772,
+                         "lobby_opened_at": time.time() - 200})
+    await B._lobby_timeout(_cid242, "card", seconds=0)
+    check("v240 lobby timeout ends game", B.game_state(_cid242) is None)
+    check("v240 lobby timeout refunds", B.get_user(772)["coins"] == 600,
+          f"coins={B.get_user(772)['coins']}")
+    check("v240 lobby timeout msg", any("koi join nahi hua" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    # a started (in-progress) game is NOT touched by the lobby timeout —
+    # the 2-minute cap is for the JOIN wait only
+    B.set_game(_cid242, {"kind": "card", "amount": 0, "need": 2, "players": [772],
+                         "starter": 772, "started": True})
+    await B._lobby_timeout(_cid242, "card", seconds=0)
+    check("v240 lobby started survives", B.game_state(_cid242) is not None)
+    B.set_game(_cid242, None)
+    # RPS lobby timeout refunds p1 (p1/p2 shape, no "players" list)
+    _u773 = B.get_user(773, "RpsTimeout")
+    _u773["coins"] = 300
+    _cid243 = -100243
+    B.set_game(_cid243, {"kind": "rps", "amount": 100, "p1": 773, "p2": None,
+                         "throws": {}, "scores": {}, "round": 1,
+                         "lobby_opened_at": time.time() - 200})
+    await B._lobby_timeout(_cid243, "rps", seconds=0)
+    check("v240 lobby timeout refunds rps p1", B.game_state(_cid243) is None
+          and B.get_user(773)["coins"] == 400, f"coins={B.get_user(773)['coins']}")
+    # RPS buttons exist + callback records the throw
+    _kb = B.rps_throw_keyboard()
+    _btns = [b for row in _kb.inline_keyboard for b in row]
+    check("v240 rps buttons", len(_btns) == 3 and all(b.callback_data.startswith("rps:") for b in _btns),
+          str([b.callback_data for b in _btns]))
+    B.set_game(_cid243, {"kind": "rps", "amount": 0, "p1": 773, "p2": 774,
+                         "throws": {}, "scores": {773: 0, 774: 0}, "round": 1})
+    _qm = FakeMessage("x", uid=773, chat_id=_cid243)
+    await B.rps_callbacks(client, FakeCallbackQuery("rps:rock", uid=773, message=_qm))
+    _st = B.game_state(_cid243)
+    check("v240 rps callback records throw", _st is not None
+          and _st.get("throws", {}).get(773) == "rock" and _st.get("played") is True, str(_st))
+    B.set_game(_cid243, None)
+    # BBet buttons exist + callback plays (win or lose, exactly +/-amount)
+    _kb2 = B.bbet_amount_keyboard()
+    _btns2 = [b for row in _kb2.inline_keyboard for b in row]
+    check("v240 bbet buttons", len(_btns2) == 5 and all(b.callback_data.startswith("bbet:") for b in _btns2),
+          str([b.callback_data for b in _btns2]))
+    _u774 = B.get_user(774, "BbetTester")
+    _u774["coins"] = 1000
+    _u774["bets_today"] = 0
+    await B.bbet_callbacks(client, FakeCallbackQuery("bbet:100", uid=774,
+                                                     message=FakeMessage("x", uid=774, chat_id=-100244)))
+    check("v240 bbet callback plays", B.get_user(774)["coins"] in (900, 1100),
+          f"coins={B.get_user(774)['coins']}")
+    # cricket helper (button path = same logic as /num)
+    _cid246 = -100246
+    B.set_game(_cid246, {"kind": "cricket", "players": [775, "bot"], "started": True,
+                         "innings": 1, "ball": 0, "scores": {"775": 0, "bot": 0},
+                         "bat": 775, "bowl": "bot", "picks": {}})
+    _ctxt = B._cricket_do_num(_cid246, 775, 4)
+    check("v240 cricket num", _ctxt is not None and ("runs" in _ctxt or "OUT" in _ctxt), str(_ctxt))
+    B.set_game(_cid246, None)
+    # mines grid + pick helper
+    _st_m = {"kind": "mines", "player": 776, "amount": 100, "mines": {0, 1, 2},
+             "revealed": set(), "started": True}
+    _kb_m = B.mines_grid_keyboard(_st_m)
+    check("v240 mines grid 5x5+cashout", len(_kb_m.inline_keyboard) == 6
+          and len(_kb_m.inline_keyboard[0]) == 5
+          and _kb_m.inline_keyboard[5][0].callback_data == "mines:cashout")
+    B.set_game(-100245, dict(_st_m))
+    _mtxt = B._mines_do_pick(-100245, 776, 1, 4)
+    check("v240 mines pick safe", _mtxt is not None and "Safe" in _mtxt, str(_mtxt))
+    _mtxt2 = B._mines_do_pick(-100245, 776, 1, 1)
+    check("v240 mines pick boom", _mtxt2 is not None and "BOOM" in _mtxt2
+          and B.game_state(-100245) is None, str(_mtxt2))
+    # bare commands: parse rules
+    check("v240 bare bbet parses", B._parse_bare_command("bbet 100") == ("bbet", ["100"]))
+    check("v240 bare bbet no arg", B._parse_bare_command("bbet") == ("bbet", []))
+    check("v240 bare rps parses", B._parse_bare_command("rps 500") == ("rps", ["500"]))
+    check("v240 bare question no trigger", B._parse_bare_command("bbet kya hai?") is None)
+    check("v240 bare two-word chat no trigger", B._parse_bare_command("bbet kya hota hai") is None)
+    check("v240 bare admin no trigger", B._parse_bare_command("ban") is None)
+    check("v240 bare admin with arg no trigger", B._parse_bare_command("ban 123") is None)
+    check("v240 bare normal chat no trigger", B._parse_bare_command("hello kaise ho") is None)
+    check("v240 bare unknown word no trigger", B._parse_bare_command("xyzabc 100") is None)
+    # bare "bbet 100" end-to-end through the group text handler
+    _u779 = B.get_user(779, "BareTester")
+    _u779["coins"] = 1000
+    _u779["bets_today"] = 0
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("bbet 100", uid=779, chat_id=-100247))
+    check("v240 bare bbet e2e", B.get_user(779)["coins"] in (900, 1100)
+          and any("BBet" in t or "🎰" in t for _, t in FakeMessage.outbox),
+          f"coins={B.get_user(779)['coins']} outbox={FakeMessage.outbox}")
+    # bare "bbet kya hai?" falls through to normal chat (no BBet result)
+    _u779["coins"] = 1000
+    FakeMessage.outbox.clear()
+    await B.group_text_handler(client, FakeMessage("bbet kya hai?", uid=779, chat_id=-100247))
+    check("v240 bare question falls through", B.get_user(779)["coins"] == 1000
+          and not any("🎰" in t for _, t in FakeMessage.outbox),
+          f"coins={B.get_user(779)['coins']} outbox={FakeMessage.outbox}")
+    # /games command sends the Mini App button
+    FakeMessage.outbox.clear()
+    await B.cmd_games(client, FakeMessage("/games", uid=111, chat_id=-100123))
+    _full = FakeMessage.outbox_full[-1] if FakeMessage.outbox_full else (None, "", {})
+    _mk = _full[2].get("reply_markup")
+    _web = None
+    if _mk:
+        for _row in _mk.inline_keyboard:
+            for _b in _row:
+                if getattr(_b, "web_app", None):
+                    _web = _b.web_app.url
+    check("v240 games cmd miniapp button", _web == B.MINIAPP_URL, str(_web))
+    # main menu carries the Mini App button too
+    _mm = B.main_menu_keyboard()
+    _web2 = None
+    for _row in _mm.inline_keyboard:
+        for _b in _row:
+            if getattr(_b, "web_app", None):
+                _web2 = _b.web_app.url
+    check("v240 menu miniapp button", _web2 == B.MINIAPP_URL, str(_web2))
+    # web_app_data handler credits a win (clamped to 500) and ignores a loss
+    class _FakeWebAppData:
+        def __init__(self, data):
+            self.data = data
+    class _FakeWadMessage(FakeMessage):
+        def __init__(self, data, uid=780, chat_id=-100248):
+            super().__init__("x", uid=uid, chat_id=chat_id)
+            self.web_app_data = _FakeWebAppData(data)
+    _u780 = B.get_user(780, "WadTester")
+    _u780["coins"] = 1000
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "wordguess", "result": "win", "coins": 9999}'))
+    check("v240 webapp win clamped 500", B.get_user(780)["coins"] == 1500,
+          f"coins={B.get_user(780)['coins']}")
+    await B.web_app_data_handler(client, _FakeWadMessage('{"game": "rps", "result": "lose", "coins": 50}'))
+    check("v240 webapp lose no credit", B.get_user(780)["coins"] == 1500,
+          f"coins={B.get_user(780)['coins']}")
+    await B.web_app_data_handler(client, _FakeWadMessage('not json at all'))
+    check("v240 webapp bad json ignored", B.get_user(780)["coins"] == 1500,
+          f"coins={B.get_user(780)['coins']}")
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

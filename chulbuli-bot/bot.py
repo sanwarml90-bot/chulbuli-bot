@@ -52,6 +52,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    WebAppInfo,
 )
 
 try:
@@ -83,7 +84,11 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.3.9"
+VERSION = "2.4.0"
+
+# Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
+# Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
+MINIAPP_URL = "https://sanwarml90-bot.github.io/chulbuli-bot/webapp/"
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "")
@@ -817,6 +822,7 @@ Dil se khelna, dil todna mat 😌💕"""
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 Mini App — Games khelo", web_app=WebAppInfo(url=MINIAPP_URL))],
         [InlineKeyboardButton("🎮 Games", callback_data="menu:games"),
          InlineKeyboardButton("💰 Paise", callback_data="menu:economy")],
         [InlineKeyboardButton("🎲 Word Guess", callback_data="menu:wordguess"),
@@ -875,6 +881,58 @@ async def menu_callbacks(client: Client, query):
             await query.answer()
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.on_message(filters.command(["games"]))
+async def cmd_games(client: Client, message: Message):
+    """v2.4.0 — open the Mini App game hub."""
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    await safe_reply(
+        message,
+        "🎮 **Chulbuli Mini App** — chess, UNO, mines, word grid, word guess, RPS, math rush — sab ek hi jagah, achhe UI ke saath!\n\nNeeche wale button se kholo 🙂",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎮 Mini App kholo", web_app=WebAppInfo(url=MINIAPP_URL))]]))
+
+
+# v2.4.0 — Mini App game results come back via Telegram.WebApp.sendData().
+# The page runs client-side, so its numbers are NEVER trusted blindly: a win
+# credits at most +500 coins, a loss/draw credits 0, and anything else is
+# clamped to 0. Coins are never deducted from the Mini App.
+MINIAPP_WIN_MAX = 500
+
+
+def _has_web_app_data(_, __, message):
+    return getattr(message, "web_app_data", None) is not None
+
+
+@app.on_message(filters.create(_has_web_app_data))
+async def web_app_data_handler(client: Client, message: Message):
+    """v2.4.0 — credit Mini App game results (clamped, anti-abuse)."""
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    data = getattr(message, "web_app_data", None)
+    if data is None:
+        return
+    try:
+        payload = json.loads(data.data)
+    except Exception:  # noqa: BLE001
+        return
+    game = str(payload.get("game", "game"))
+    result = str(payload.get("result", ""))
+    try:
+        coins = int(payload.get("coins", 0))
+    except (TypeError, ValueError):
+        coins = 0
+    if result == "win" and coins > 0:
+        credit = min(coins, MINIAPP_WIN_MAX)
+        add_coins(user, credit)
+        save_data()
+        await safe_reply(message, f"🎮 Mini App — {game} jeet gaye! +{fmt_coins(credit)} coins! Balance: {fmt_coins(user['coins'])} 🎉")
+    elif result in ("lose", "draw"):
+        await safe_reply(message, f"🎮 Mini App — {game} {result}! Koi coins nahi mile, dobara khelo 🙂")
 
 
 @app.on_message(filters.command(["yaad"]))
@@ -1566,6 +1624,8 @@ async def cmd_wordguess(client: Client, message: Message):
         "Board message pe **reply** karke apna guess bhejo.\n"
         "🟩 = sahi jagah | 🟦 = word me hai, galat jagah | ⬜ = word me nahi\n"
         "6 guesses, jeetne wale ko **+500 coins**! Round 0/6",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎮 Mini App me khelo", web_app=WebAppInfo(url=MINIAPP_URL))]]),
     )
     if msg is not None:
         state["board_msg_id"] = msg.id
@@ -1733,6 +1793,7 @@ async def cmd_wordchain(client: Client, message: Message):
                                "names": {str(message.from_user.id): display_name(message.from_user)},
                                "started": False, "turn": 0, "last_word": None,
                                "used": set(), "strikes": {}, "starter": message.from_user.id})
+    asyncio.create_task(_lobby_timeout(message.chat.id, "wordchain"))
     await safe_reply(message, "⛓️ **WORDCHAIN** — lobby khul gaya!\n/join se join karo (2+ players chahiye), phir /forcestart se shuru karo.\nRule: agla word pichhle word ke aakhri letter se shuru hona chahiye. 3 galat = out!",
                      reply_markup=join_keyboard())
 
@@ -1814,6 +1875,8 @@ async def do_join(chat_id: int, uid: int, name: str) -> str | None:
                     f"{state['names'].get(str(state['players'][1]), '')} ⭕\n"
                     f"{xoxo_text(state['board'])}\nPehle {state['names'].get(str(state['players'][0]), '')} — /place <1-9> karo!")
         return f"🎮 {name} join ho gaya! Players: {len(state['players'])} — /forcestart se shuru karo 🙂"
+    if kind == "card":
+        return _card_join(chat_id, uid, name)
     if kind == "chess":
         if len(state["players"]) >= 2:
             return None
@@ -2002,6 +2065,7 @@ async def cmd_rps(client: Client, message: Message):
         return
     set_game(message.chat.id, {"kind": "rps", "amount": amount, "p1": message.from_user.id,
                                "p2": None, "throws": {}, "scores": {}, "round": 1})
+    asyncio.create_task(_lobby_timeout(message.chat.id, "rps"))
     if amount > 0:
         add_coins(user, -amount)
         save_data()
@@ -2010,6 +2074,7 @@ async def cmd_rps(client: Client, message: Message):
         f"✂️ **ROCK PAPER SCISSORS** — {display_name(message.from_user)} ne challenge kiya"
         + (f" ({fmt_coins(amount)} ka pot)!" if amount else "!") +
         "\nKoi /joinrps se join kare, phir dono /throw rock/paper/scissors bhejo. Best of 3! 60 sec me koi na aaye to main hi khelungi 😄",
+        reply_markup=rps_throw_keyboard(),
     )
 
 
@@ -2035,7 +2100,77 @@ async def cmd_joinrps(client: Client, message: Message):
         add_coins(user, -amount)
         save_data()
     state["p2"] = message.from_user.id
-    await safe_reply(message, f"✂️ {display_name(message.from_user)} join ho gaya! Dono /throw rock/paper/scissors bhejo — Round 1!")
+    await safe_reply(message, f"✂️ {display_name(message.from_user)} join ho gaya! Dono /throw rock/paper/scissors bhejo — Round 1!",
+                     reply_markup=rps_throw_keyboard())
+
+
+def _rps_do_throw(chat_id: int, uid: int, choice: str) -> str | None:
+    """v2.4.0 — shared RPS throw logic for /throw AND the 🪨/📄/✂️ buttons.
+    `choice` must already be canonical ("rock"/"paper"/"scissors"). Returns
+    the reply text, or None when there is no RPS game in this chat."""
+    state = game_state(chat_id)
+    if not state or state.get("kind") != "rps":
+        return None
+    if uid not in (state["p1"], state.get("p2")):
+        return "Tum is match me nahi ho 🙂"
+    if uid in state["throws"]:
+        return "Tum throw kar chuke ho — dusre ka wait karo 🙂"
+    state["throws"][uid] = choice
+    state["played"] = True  # v2.4.0: a throw means the match is live, not a lobby
+    em = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+    if state.get("p2") is None:
+        # Bot plays as opponent
+        bot_choice = random.choice(["rock", "paper", "scissors"])
+        state["throws"]["bot"] = bot_choice
+        result = rps_winner(choice, bot_choice)
+        if result == 0:
+            state["throws"] = {}
+            return f"{em[choice]} vs {em[bot_choice]} — Draw! Dobara /throw karo 🙂"
+        if result == 1:
+            win = state["amount"] * 2 if state["amount"] else 200
+            add_coins(get_user(uid), win)
+            save_data()
+            set_game(chat_id, None)
+            return f"{em[choice]} vs {em[bot_choice]} — **Tum jeet gaye!** +{fmt_coins(win)} coins! 🎉"
+        set_game(chat_id, None)
+        return f"{em[choice]} vs {em[bot_choice]} — Main jeet gayi! 😄 Dobara khelna ho to /rps karo"
+    if len(state["throws"]) < 2:
+        return "Throw mil gaya — dusre player ka wait karo 🙂"
+    p1, p2 = state["p1"], state["p2"]
+    c1, c2 = state["throws"][p1], state["throws"][p2]
+    result = rps_winner(c1, c2)
+    n1 = DATA["users"].get(str(p1), {}).get("name", "P1")
+    n2 = DATA["users"].get(str(p2), {}).get("name", "P2")
+    scores = state["scores"]
+    if result == 0:
+        state["throws"] = {}
+        return f"{em[c1]} vs {em[c2]} — Draw! Round {state['round']} dobara — /throw karo 🙂"
+    winner = p1 if result == 1 else p2
+    scores[winner] = scores.get(winner, 0) + 1
+    state["throws"] = {}
+    if scores[winner] >= 2:
+        pot = state["amount"] * 2 if state["amount"] else 0
+        if pot:
+            add_coins(get_user(winner), pot)
+        else:
+            add_coins(get_user(winner), 200)
+            pot = 200
+        save_data()
+        set_game(chat_id, None)
+        return f"{em[c1]} vs {em[c2]} — 🏆 **{n1 if winner == p1 else n2}** match jeet gaya! +{fmt_coins(pot)} coins! 🎉"
+    state["round"] += 1
+    return (f"{em[c1]} vs {em[c2]} — Round {state['round'] - 1} jeeta: "
+            f"**{n1 if winner == p1 else n2}** (score {scores.get(p1, 0)}-{scores.get(p2, 0)})! "
+            f"Agla round — /throw karo 🙂")
+
+
+def rps_throw_keyboard() -> InlineKeyboardMarkup:
+    """v2.4.0 — 🪨/📄/✂️ buttons instead of typing /throw."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🪨 Rock", callback_data="rps:rock"),
+        InlineKeyboardButton("📄 Paper", callback_data="rps:paper"),
+        InlineKeyboardButton("✂️ Scissors", callback_data="rps:scissors"),
+    ]])
 
 
 @app.on_message(filters.command(["throw"]))
@@ -2051,65 +2186,38 @@ async def cmd_throw(client: Client, message: Message):
                "stone": "rock", "patthar": "rock", "kagaz": "paper", "kainchi": "scissors"}
     choice = aliases.get(choice, "")
     if not choice:
-        await safe_reply(message, "Aise: `/throw rock` ya `/throw paper` ya `/throw scissors` 🙂")
+        await safe_reply(message, "Aise: `/throw rock` ya `/throw paper` ya `/throw scissors` 🙂",
+                         reply_markup=rps_throw_keyboard())
         return
-    uid = message.from_user.id
-    if uid not in (state["p1"], state.get("p2")):
-        await safe_reply(message, "Tum is match me nahi ho 🙂")
+    text = _rps_do_throw(message.chat.id, message.from_user.id, choice)
+    if text:
+        await safe_reply(message, text)
+
+
+@app.on_callback_query(filters.regex(r"^rps:"))
+async def rps_callbacks(client: Client, query):
+    """v2.4.0 — RPS throw buttons. Same logic as /throw."""
+    if query.from_user is None or is_banned(query.from_user.id):
+        try:
+            await query.answer("🚫", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
         return
-    if uid in state["throws"]:
-        await safe_reply(message, "Tum throw kar chuke ho — dusre ka wait karo 🙂")
-        return
-    state["throws"][uid] = choice
-    if state.get("p2") is None:
-        # Bot plays as opponent
-        bot_choice = random.choice(["rock", "paper", "scissors"])
-        state["throws"]["bot"] = bot_choice
-        result = rps_winner(choice, bot_choice)
-        em = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
-        if result == 0:
-            await safe_reply(message, f"{em[choice]} vs {em[bot_choice]} — Draw! Dobara /throw karo 🙂")
-            state["throws"] = {}
+    try:
+        choice = query.data.split(":", 1)[1]
+        if choice not in ("rock", "paper", "scissors"):
+            await query.answer()
             return
-        if result == 1:
-            win = state["amount"] * 2 if state["amount"] else 200
-            add_coins(user, win)
-            save_data()
-            await safe_reply(message, f"{em[choice]} vs {em[bot_choice]} — **Tum jeet gaye!** +{fmt_coins(win)} coins! 🎉")
-        else:
-            await safe_reply(message, f"{em[choice]} vs {em[bot_choice]} — Main jeet gayi! 😄 Dobara khelna ho to /rps karo")
-        set_game(message.chat.id, None)
-        return
-    if len(state["throws"]) < 2:
-        await safe_reply(message, "Throw mil gaya — dusre player ka wait karo 🙂")
-        return
-    p1, p2 = state["p1"], state["p2"]
-    c1, c2 = state["throws"][p1], state["throws"][p2]
-    result = rps_winner(c1, c2)
-    em = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
-    n1 = DATA["users"].get(str(p1), {}).get("name", "P1")
-    n2 = DATA["users"].get(str(p2), {}).get("name", "P2")
-    scores = state["scores"]
-    if result == 0:
-        await safe_reply(message, f"{em[c1]} vs {em[c2]} — Draw! Round {state['round']} dobara — /throw karo 🙂")
-        state["throws"] = {}
-        return
-    winner = p1 if result == 1 else p2
-    scores[winner] = scores.get(winner, 0) + 1
-    state["throws"] = {}
-    if scores[winner] >= 2:
-        pot = state["amount"] * 2 if state["amount"] else 0
-        if pot:
-            add_coins(get_user(winner), pot)
-        else:
-            add_coins(get_user(winner), 200)
-            pot = 200
-        save_data()
-        await safe_reply(message, f"{em[c1]} vs {em[c2]} — 🏆 **{n1 if winner == p1 else n2}** match jeet gaya! +{fmt_coins(pot)} coins! 🎉")
-        set_game(message.chat.id, None)
-    else:
-        state["round"] += 1
-        await safe_reply(message, f"{em[c1]} vs {em[c2]} — Round {state['round'] - 1} jeeta: **{n1 if winner == p1 else n2}** (score {scores.get(p1, 0)}-{scores.get(p2, 0)})! Agla round — /throw karo 🙂")
+        text = _rps_do_throw(query.message.chat.id, query.from_user.id, choice)
+        await query.answer()
+        if text:
+            await safe_reply_text(query.message.chat.id, text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] rps callback failed: {exc!r}")
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2132,6 +2240,7 @@ async def cmd_cricket(client: Client, message: Message):
     set_game(message.chat.id, {"kind": "cricket", "players": [message.from_user.id],
                                "started": False, "innings": 1, "ball": 0,
                                "scores": {}, "bat": None, "bowl": None, "picks": {}})
+    asyncio.create_task(_lobby_timeout(message.chat.id, "cricket"))
     await safe_reply(message, "🏏 **INDIAN CRICKET ARENA**\n/join se dusra player aao, ya /startsolo se mere saath khelo!\nPhir /startcricket se match shuru 🙂",
                      reply_markup=join_keyboard())
 
@@ -2149,7 +2258,8 @@ async def cmd_startsolo(client: Client, message: Message):
     state["bat"] = state["players"][0]
     state["bowl"] = "bot"
     state["scores"] = {str(state["players"][0]): 0, "bot": 0}
-    await safe_reply(message, f"🏏 Match shuru! Tum batting kar rahe ho — har ball pe /num <1-6> bhejo! 6 balls ki innings hai 🙂")
+    await safe_reply(message, f"🏏 Match shuru! Tum batting kar rahe ho — har ball pe /num <1-6> bhejo! 6 balls ki innings hai 🙂",
+                     reply_markup=cricket_num_keyboard())
 
 
 @app.on_message(filters.command(["startcricket"]))
@@ -2168,7 +2278,102 @@ async def cmd_startcricket(client: Client, message: Message):
     state["bowl"] = state["players"][1]
     state["scores"] = {str(p): 0 for p in state["players"]}
     bat_name = DATA["users"].get(str(state["bat"]), {}).get("name", "P1")
-    await safe_reply(message, f"🏏 Match shuru! {bat_name} batting kar raha hai — dono /num <1-6> bhejo! 6 balls ki innings 🙂")
+    await safe_reply(message, f"🏏 Match shuru! {bat_name} batting kar raha hai — dono /num <1-6> bhejo! 6 balls ki innings 🙂",
+                     reply_markup=cricket_num_keyboard())
+
+
+def _cricket_do_num(chat_id: int, uid: int, n: int) -> str | None:
+    """v2.4.0 — shared cricket /num logic for /num AND the 1-6 buttons.
+    `n` must be 1-6. Returns the reply text, or None when the pick was
+    recorded silently (already picked) or there is no cricket game."""
+    state = game_state(chat_id)
+    if not state or state.get("kind") != "cricket" or not state["started"]:
+        return None
+    if not (1 <= n <= 6):
+        return "1 se 6 tak ka number bhejo — `/num 4` 🙂"
+    if uid not in (state["bat"], state["bowl"]):
+        return "Tum is match me nahi ho 🙂"
+    if uid in state["picks"]:
+        return None
+    state["picks"][uid] = n
+    if state["bowl"] == "bot":
+        state["picks"]["bot"] = random.randint(1, 6)
+    if len(state["picks"]) < 2:
+        return f"Ball {state['ball'] + 1}: tumhara number mil gaya — dusre ka wait karo 🙂"
+    bat_pick = state["picks"][state["bat"]]
+    bowl_pick = state["picks"][state["bowl"]]
+    state["picks"] = {}
+    state["ball"] += 1
+    bat_name = "Main" if state["bat"] == "bot" else DATA["users"].get(str(state["bat"]), {}).get("name", "Batsman")
+    if bat_pick == bowl_pick:
+        # OUT
+        if state["innings"] == 1:
+            target = state["scores"][str(state["bat"])] + 1
+            state["innings"] = 2
+            state["ball"] = 0
+            old_bat, old_bowl = state["bat"], state["bowl"]
+            state["bat"], state["bowl"] = old_bowl, old_bat
+            state["target"] = target
+            return f"🏏 OUT! {bat_pick} = {bowl_pick}! Pehli innings khatam — score: {state['scores'][str(old_bat)]}. Target: {target}! Ab dusri innings — /num bhejo 🙂"
+        s1 = state["scores"][str(state["players"][0])]
+        s2 = state["scores"][str(state["players"][1])]
+        if s1 == s2:
+            result = "🤝 Match DRAW ho gaya!"
+        else:
+            winner = state["players"][0] if s1 > s2 else state["players"][1]
+            if winner != "bot":
+                add_coins(get_user(winner), 500)
+                save_data()
+            wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
+            result = f"🏆 **{wname}** jeet gaya! Score {s1}-{s2}! +500 coins! 🎉"
+        set_game(chat_id, None)
+        return f"🏏 OUT! {bat_pick} = {bowl_pick}!\n{result}"
+    state["scores"][str(state["bat"])] += bat_pick
+    if state["innings"] == 2 and state["scores"][str(state["bat"])] >= state.get("target", 999):
+        s1 = state["scores"][str(state["players"][0])]
+        s2 = state["scores"][str(state["players"][1])]
+        winner = state["bat"]
+        if winner != "bot":
+            add_coins(get_user(winner), 500)
+            save_data()
+        wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
+        set_game(chat_id, None)
+        return f"🏏 {bat_pick} runs! Score: {s1}-{s2}\n🏆 **{wname}** jeet gaya! +500 coins! 🎉"
+    if state["ball"] >= 6:
+        if state["innings"] == 1:
+            target = state["scores"][str(state["bat"])] + 1
+            state["innings"] = 2
+            state["ball"] = 0
+            old_bat, old_bowl = state["bat"], state["bowl"]
+            state["bat"], state["bowl"] = old_bowl, old_bat
+            state["target"] = target
+            return f"🏏 {bat_pick} runs! Pehli innings khatam — score: {state['scores'][str(old_bat)]}. Target: {target}! Ab dusri innings 🙂"
+        s1 = state["scores"][str(state["players"][0])]
+        s2 = state["scores"][str(state["players"][1])]
+        if s1 == s2:
+            result = "🤝 Match DRAW ho gaya!"
+        else:
+            winner = state["players"][0] if s1 > s2 else state["players"][1]
+            if winner != "bot":
+                add_coins(get_user(winner), 500)
+                save_data()
+            wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
+            result = f"🏆 **{wname}** jeet gaya! Score {s1}-{s2}! +500 coins! 🎉"
+        set_game(chat_id, None)
+        return f"🏏 {bat_pick} runs!\n{result}"
+    return f"🏏 {bat_pick} runs! Ball {state['ball']}/6 — score: {state['scores'][str(state['bat'])]}. Agli ball ke liye /num bhejo 🙂"
+
+
+def cricket_num_keyboard() -> InlineKeyboardMarkup:
+    """v2.4.0 — 1-6 number buttons instead of typing /num."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("1️⃣", callback_data="cric:1"),
+        InlineKeyboardButton("2️⃣", callback_data="cric:2"),
+        InlineKeyboardButton("3️⃣", callback_data="cric:3"),
+        InlineKeyboardButton("4️⃣", callback_data="cric:4"),
+        InlineKeyboardButton("5️⃣", callback_data="cric:5"),
+        InlineKeyboardButton("6️⃣", callback_data="cric:6"),
+    ]])
 
 
 @app.on_message(filters.command(["num"]))
@@ -2185,90 +2390,37 @@ async def cmd_num(client: Client, message: Message):
         n = int(message.command[1]) if len(message.command) > 1 else 0
     except ValueError:
         n = 0
-    if not (1 <= n <= 6):
-        await safe_reply(message, "1 se 6 tak ka number bhejo — `/num 4` 🙂")
-        return
-    uid = message.from_user.id
-    if uid not in (state["bat"], state["bowl"]):
-        await safe_reply(message, "Tum is match me nahi ho 🙂")
-        return
-    if uid in state["picks"]:
-        return
-    state["picks"][uid] = n
-    if state["bowl"] == "bot":
-        state["picks"]["bot"] = random.randint(1, 6)
-    if len(state["picks"]) < 2:
-        await safe_reply(message, f"Ball {state['ball'] + 1}: tumhara number mil gaya — dusre ka wait karo 🙂")
-        return
-    bat_pick = state["picks"][state["bat"]]
-    bowl_pick = state["picks"][state["bowl"]]
-    state["picks"] = {}
-    state["ball"] += 1
-    bat_name = "Main" if state["bat"] == "bot" else DATA["users"].get(str(state["bat"]), {}).get("name", "Batsman")
-    if bat_pick == bowl_pick:
-        # OUT
-        if state["innings"] == 1:
-            target = state["scores"][str(state["bat"])] + 1
-            state["innings"] = 2
-            state["ball"] = 0
-            old_bat, old_bowl = state["bat"], state["bowl"]
-            state["bat"], state["bowl"] = old_bowl, old_bat
-            await safe_reply(message, f"🏏 OUT! {bat_pick} = {bowl_pick}! Pehli innings khatam — score: {state['scores'][str(old_bat)]}. Target: {target}! Ab dusri innings — /num bhejo 🙂")
-            state["target"] = target
-        else:
-            s1 = state["scores"][str(state["players"][0])]
-            s2 = state["scores"][str(state["players"][1])]
-            if s1 == s2:
-                result = "🤝 Match DRAW ho gaya!"
-            else:
-                winner = state["players"][0] if s1 > s2 else state["players"][1]
-                if winner != "bot":
-                    add_coins(get_user(winner), 500)
-                    save_data()
-                wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
-                result = f"🏆 **{wname}** jeet gaya! Score {s1}-{s2}! +500 coins! 🎉"
-            await safe_reply(message, f"🏏 OUT! {bat_pick} = {bowl_pick}!\n{result}")
-            set_game(message.chat.id, None)
-        return
-    state["scores"][str(state["bat"])] += bat_pick
-    if state["innings"] == 2 and state["scores"][str(state["bat"])] >= state.get("target", 999):
-        s1 = state["scores"][str(state["players"][0])]
-        s2 = state["scores"][str(state["players"][1])]
-        winner = state["bat"]
-        if winner != "bot":
-            add_coins(get_user(winner), 500)
-            save_data()
-        wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
-        await safe_reply(message, f"🏏 {bat_pick} runs! Score: {s1}-{s2}\n🏆 **{wname}** jeet gaya! +500 coins! 🎉")
-        set_game(message.chat.id, None)
-        return
-    if state["ball"] >= 6:
-        if state["innings"] == 1:
-            target = state["scores"][str(state["bat"])] + 1
-            state["innings"] = 2
-            state["ball"] = 0
-            old_bat, old_bowl = state["bat"], state["bowl"]
-            state["bat"], state["bowl"] = old_bowl, old_bat
-            state["target"] = target
-            await safe_reply(message, f"🏏 {bat_pick} runs! Pehli innings khatam — score: {state['scores'][str(old_bat)]}. Target: {target}! Ab dusri innings 🙂")
-        else:
-            s1 = state["scores"][str(state["players"][0])]
-            s2 = state["scores"][str(state["players"][1])]
-            if s1 == s2:
-                result = "🤝 Match DRAW ho gaya!"
-            else:
-                winner = state["players"][0] if s1 > s2 else state["players"][1]
-                if winner != "bot":
-                    add_coins(get_user(winner), 500)
-                    save_data()
-                wname = "Main" if winner == "bot" else DATA["users"].get(str(winner), {}).get("name", "")
-                result = f"🏆 **{wname}** jeet gaya! Score {s1}-{s2}! +500 coins! 🎉"
-            await safe_reply(message, f"🏏 {bat_pick} runs!\n{result}")
-            set_game(message.chat.id, None)
-        return
-    await safe_reply(message, f"🏏 {bat_pick} runs! Ball {state['ball']}/6 — score: {state['scores'][str(state['bat'])]}. Agli ball ke liye /num bhejo 🙂")
+    text = _cricket_do_num(message.chat.id, message.from_user.id, n)
+    if text:
+        kb = cricket_num_keyboard() if game_state(message.chat.id) else None
+        await safe_reply(message, text, reply_markup=kb) if kb else await safe_reply(message, text)
 
 
+@app.on_callback_query(filters.regex(r"^cric:"))
+async def cricket_callbacks(client: Client, query):
+    """v2.4.0 — cricket 1-6 number buttons. Same logic as /num."""
+    if query.from_user is None or is_banned(query.from_user.id):
+        try:
+            await query.answer("🚫", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    try:
+        n = int(query.data.split(":", 1)[1])
+        text = _cricket_do_num(query.message.chat.id, query.from_user.id, n)
+        await query.answer()
+        if text:
+            kb = cricket_num_keyboard() if game_state(query.message.chat.id) else None
+            if kb:
+                await safe_reply_text(query.message.chat.id, text, reply_markup=kb)
+            else:
+                await safe_reply_text(query.message.chat.id, text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] cricket callback failed: {exc!r}")
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001
+            pass
 @app.on_message(filters.command(["cancel"]))
 async def cmd_cancel(client: Client, message: Message):
     user = track_user(message)
@@ -2409,6 +2561,37 @@ async def handle_math_answer(message: Message) -> bool:
 # ---------------------------------------------------------------------------
 # BBet / Bet — one implementation (Daizy + Nova merged), 50/50 double-or-lose
 # ---------------------------------------------------------------------------
+def _bbet_play(user: dict, amount: int) -> str:
+    """v2.4.0 — shared BBet resolution for /bbet AND the amount buttons.
+    `amount` must already be parsed and > 0. Returns the result text."""
+    reset_daily(user)
+    if user["bets_today"] >= 200:
+        return "Aaj ki bet limit khatam (200) — kal aana 🙂"
+    if user["coins"] < amount:
+        return "Itne coins nahi hain 😅"
+    user["bets_today"] += 1
+    if random.random() < 0.5:
+        add_coins(user, amount)
+        add_xp(user, 5 * power_mult(user))
+        save_data()
+        return f"🎰 **JEET GAYE!** +{fmt_coins(amount)} coins! Balance: {fmt_coins(user['coins'])} 🎉"
+    add_coins(user, -amount)
+    save_data()
+    return f"🎰 Haar gaye… -{fmt_coins(amount)} coins. Dobara try karo, kismat badlegi 🙂"
+
+
+def bbet_amount_keyboard() -> InlineKeyboardMarkup:
+    """v2.4.0 — amount buttons instead of typing /bbet <amount>."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💰 100", callback_data="bbet:100"),
+        InlineKeyboardButton("💰 500", callback_data="bbet:500"),
+        InlineKeyboardButton("💰 1000", callback_data="bbet:1000"),
+    ], [
+        InlineKeyboardButton("💰 All", callback_data="bbet:all"),
+        InlineKeyboardButton("💰 Half", callback_data="bbet:half"),
+    ]])
+
+
 @app.on_message(filters.command(["bbet", "bet"]))
 async def cmd_bbet(client: Client, message: Message):
     if not economy_on():
@@ -2420,27 +2603,41 @@ async def cmd_bbet(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    reset_daily(user)
-    if user["bets_today"] >= 200:
-        await safe_reply(message, "Aaj ki bet limit khatam (200) — kal aana 🙂")
-        return
     amount = parse_amount(message.command[1] if len(message.command) > 1 else "", user)
     if amount is None or amount <= 0:
-        await safe_reply(message, "Kitne ki bet? `/bbet 100` ya `/bbet all` 🙂")
+        await safe_reply(message, "Kitne ki bet? `/bbet 100` ya `/bbet all` 🙂",
+                         reply_markup=bbet_amount_keyboard())
         return
-    if user["coins"] < amount:
-        await safe_reply(message, "Itne coins nahi hain 😅")
+    await safe_reply(message, _bbet_play(user, amount))
+
+
+@app.on_callback_query(filters.regex(r"^bbet:"))
+async def bbet_callbacks(client: Client, query):
+    """v2.4.0 — BBet amount buttons. Same logic as /bbet."""
+    if query.from_user is None or is_banned(query.from_user.id):
+        try:
+            await query.answer("🚫", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
         return
-    user["bets_today"] += 1
-    if random.random() < 0.5:
-        add_coins(user, amount)
-        add_xp(user, 5 * power_mult(user))
-        save_data()
-        await safe_reply(message, f"🎰 **JEET GAYE!** +{fmt_coins(amount)} coins! Balance: {fmt_coins(user['coins'])} 🎉")
-    else:
-        add_coins(user, -amount)
-        save_data()
-        await safe_reply(message, f"🎰 Haar gaye… -{fmt_coins(amount)} coins. Dobara try karo, kismat badlegi 🙂")
+    try:
+        if not economy_on() or not games_on():
+            await query.answer("Economy/Games abhi off hain 🙂", show_alert=True)
+            return
+        raw = query.data.split(":", 1)[1]
+        user = get_user(query.from_user.id, display_name(query.from_user))
+        amount = parse_amount(raw, user)
+        await query.answer()
+        if amount is None or amount <= 0:
+            await safe_reply_text(query.message.chat.id, "Kitne ki bet? 🙂")
+            return
+        await safe_reply_text(query.message.chat.id, _bbet_play(user, amount))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] bbet callback failed: {exc!r}")
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2476,25 +2673,24 @@ async def cmd_card(client: Client, message: Message):
     save_data()
     set_game(message.chat.id, {"kind": "card", "amount": amount, "need": players_n,
                                "players": [message.from_user.id], "starter": message.from_user.id})
-    await safe_reply(message, f"🃏 **CARD GAME** — {fmt_coins(amount)} ka pot, {players_n} players chahiye!\n/joincard se join karo — sabse bada card jeetega! 🙂")
+    asyncio.create_task(_lobby_timeout(message.chat.id, "card"))
+    await safe_reply(message, f"🃏 **CARD GAME** — {fmt_coins(amount)} ka pot, {players_n} players chahiye!\n/joincard se join karo — sabse bada card jeetega! 🙂",
+                     reply_markup=join_keyboard())
 
 
-@app.on_message(filters.command(["joincard"]))
-async def cmd_joincard(client: Client, message: Message):
-    user = track_user(message)
-    if user is None or is_banned(message.from_user.id):
-        return
-    state = game_state(message.chat.id)
+def _card_join(chat_id: int, uid: int, name: str) -> str | None:
+    """v2.4.0 — shared card join logic for /joincard AND the Join button.
+    Returns the reply text, or None when there is no card lobby."""
+    state = game_state(chat_id)
     if not state or state.get("kind") != "card":
-        return
-    if message.from_user.id in state["players"]:
-        await safe_reply(message, "Tum pehle se join ho 🙂")
-        return
+        return None
+    if uid in state["players"]:
+        return "Tum pehle se join ho 🙂"
+    user = get_user(uid, name)
     if user["coins"] < state["amount"]:
-        await safe_reply(message, "Pot ke liye itne coins nahi hain 😅")
-        return
+        return "Pot ke liye itne coins nahi hain 😅"
     add_coins(user, -state["amount"])
-    state["players"].append(message.from_user.id)
+    state["players"].append(uid)
     save_data()
     if len(state["players"]) >= state["need"]:
         cards = {}
@@ -2514,10 +2710,19 @@ async def cmd_joincard(client: Client, message: Message):
         save_data()
         wnames = ", ".join(DATA["users"].get(str(w), {}).get("name") or str(w) for w in winners)
         lines.append(f"\n🏆 Winner: **{wnames}** +{fmt_coins(share)} coins!")
-        await safe_reply(message, "\n".join(lines))
-        set_game(message.chat.id, None)
-    else:
-        await safe_reply(message, f"🃏 {display_name(message.from_user)} join ho gaya! {len(state['players'])}/{state['need']} players — aur {state['need'] - len(state['players'])} chahiye 🙂")
+        set_game(chat_id, None)
+        return "\n".join(lines)
+    return f"🃏 {name} join ho gaya! {len(state['players'])}/{state['need']} players — aur {state['need'] - len(state['players'])} chahiye 🙂"
+
+
+@app.on_message(filters.command(["joincard"]))
+async def cmd_joincard(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    text = _card_join(message.chat.id, message.from_user.id, display_name(message.from_user))
+    if text:
+        await safe_reply(message, text)
 
 
 # ---------------------------------------------------------------------------
@@ -3806,8 +4011,12 @@ async def cmd_music(client: Client, message: Message):
     if user is None or is_banned(message.from_user.id):
         return
     cmd = message.command[0] if message.command else ""
-    # /end belongs to the game handler when a game is running
-    if cmd == "end" and (game_state(message.chat.id) or message.chat.id in MAFIA):
+    # /end belongs to the game handler ALWAYS (v2.4.0) — cmd_end_game clears
+    # every game state (GAMES, MAFIA, math questions) and only then falls
+    # back to stopping music. The old "defer only when a game is running"
+    # check missed states that live outside GAMES/MAFIA, so /end fell into
+    # the music-stop branch while the game kept running.
+    if cmd == "end":
         return
     # UNO owns /play while a UNO game is running (its /play handler fires too)
     if cmd == "play" and (game_state(message.chat.id) or {}).get("kind") == "uno":
@@ -3858,7 +4067,7 @@ async def cmd_music(client: Client, message: Message):
         else:
             await safe_reply(message, "resume nahi kar payi 🙂")
         return
-    if cmd in ("stop", "end"):
+    if cmd == "stop":  # /end never reaches here (deferred above, v2.4.0)
         if not st.get("playing") and not st.get("current") and not st.get("queue"):
             await safe_reply(message, "abhi kuch chal nahi raha 🙂")
             return
@@ -4631,10 +4840,58 @@ async def _lobby_timer(chat_id: int, kind: str, wait: int, min_players: int, sta
         print(f"[chulbuli] lobby auto-start failed ({kind}): {exc!r}")
 
 
+LOBBY_TIMEOUT_SECONDS = 120
+
+_LOBBY_NAMES = {"wordchain": "Wordchain", "cricket": "Cricket", "rps": "RPS",
+                "card": "Card", "chess": "Chess", "xoxo": "XOXO"}
+
+
+async def _lobby_timeout(chat_id: int, kind: str, seconds: int = LOBBY_TIMEOUT_SECONDS) -> None:
+    """v2.4.0 — 2-minute lobby rule (Sanji): if the lobby is still waiting for
+    players after `seconds`, cancel it (refund bets) with a message. Only the
+    JOIN wait is capped — a started game is never touched, and games that
+    already have their own (shorter) lobby timer keep it. RPS is special: the
+    bot-opponent fallback means a lobby with a throw already played is a live
+    match, so it is only cancelled while nobody joined AND nobody threw."""
+    await asyncio.sleep(seconds)
+    state = game_state(chat_id)
+    if not state or state.get("kind") != kind or state.get("started"):
+        return
+    if kind == "rps":
+        if state.get("p2") is not None or state.get("played"):
+            return
+        amt = state.get("amount", 0)
+        if amt > 0:
+            add_coins(get_user(state["p1"]), amt)
+            save_data()
+    elif kind == "card":
+        if len(state.get("players", [])) >= state.get("need", 2):
+            return
+        _refund_lobby(state)
+    else:
+        _refund_lobby(state)
+    set_game(chat_id, None)
+    name = _LOBBY_NAMES.get(kind, kind)
+    try:
+        await app.send_message(
+            chat_id,
+            f"⏰ 2 minute me koi join nahi hua — {name} game khatam kar diya 🙂 "
+            f"dobara shuru karna ho to /{kind} likho")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _refund_lobby(state: dict) -> None:
     amt = state.get("amount", 0)
     if amt > 0:
-        for uid in state.get("players", []):
+        uids = list(state.get("players", []) or [])
+        # v2.4.0 — RPS/Cricket keep players as p1/p2 and bat/bowl, not a
+        # "players" list; refund them too (skip the "bot" placeholder).
+        for key in ("p1", "p2", "bat", "bowl"):
+            uid = state.get(key)
+            if uid and uid != "bot" and uid not in uids:
+                uids.append(uid)
+        for uid in uids:
             add_coins(get_user(uid), amt)
         save_data()
 
@@ -4765,9 +5022,9 @@ async def _uno_start(chat_id: int):
             pass
 
 
-async def safe_reply_text(chat_id: int, text: str):
+async def safe_reply_text(chat_id: int, text: str, **kwargs):
     try:
-        await app.send_message(chat_id, text)
+        await app.send_message(chat_id, text, **kwargs)
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] send to {chat_id} failed: {exc!r}")
 
@@ -5019,6 +5276,7 @@ async def cmd_chess(client: Client, message: Message):
     state = _lobby_new(message.chat.id, "chess", message.from_user.id, amount)
     state["names"][str(message.from_user.id)] = display_name(message.from_user)
     state["board"] = _chess.Board()
+    asyncio.create_task(_lobby_timeout(message.chat.id, "chess"))
     if amount > 0:
         add_coins(user, -amount)
         state["pot"] = amount
@@ -5189,9 +5447,87 @@ async def cmd_mines(client: Client, message: Message):
     set_game(message.chat.id, {"kind": "mines", "player": message.from_user.id,
                                "amount": amount, "mines": mines, "revealed": set(),
                                "started": True, "gid": f"mines-{int(time.time() * 1000)}"})
-    await safe_reply(message, f"💣 **MINES** — {fmt_coins(amount)} ka bet!\n"
-          "5x5 grid me 3 mines chhupi hain. /pick <row> <col> se tile kholo (1-5, jaise /pick 2 3).\n"
-          "Har safe tile = bada multiplier. /cashout se jeeta hua le lo — mine pe click = sab gaya! 😱")
+    state = game_state(message.chat.id)
+    await safe_reply(message, mines_grid_text(state) + "\n\n5x5 grid me 3 mines chhupi hain. Tile pe tap karo ya /pick <row> <col> se kholo (1-5, jaise /pick 2 3).\nHar safe tile = bada multiplier. /cashout se jeeta hua le lo — mine pe click = sab gaya! 😱",
+                     reply_markup=mines_grid_keyboard(state))
+
+
+def _mines_do_pick(chat_id: int, uid: int, r: int, c: int) -> str | None:
+    """v2.4.0 — shared mines pick logic for /pick AND the 5x5 tap grid.
+    Returns the reply text, or None when there is no mines game."""
+    state = game_state(chat_id)
+    if not state or state.get("kind") != "mines":
+        return None
+    if uid != state["player"]:
+        return "Ye mines game tumhara nahi hai 🙂"
+    if not (1 <= r <= 5 and 1 <= c <= 5):
+        return "Row aur column 1 se 5 ke beech hone chahiye 🙂"
+    idx = (r - 1) * 5 + (c - 1)
+    if idx in state["revealed"]:
+        return "Ye tile pehle se khuli hai 🙂"
+    if idx in state["mines"]:
+        lost = state["amount"]
+        set_game(chat_id, None)
+        return f"💥 **BOOM!** Mine mil gayi! {fmt_coins(lost)} gaye 😭 Dobara khelna ho to /mines karo."
+    state["revealed"].add(idx)
+    mult = mines_mult(len(state["revealed"]))
+    win = int(state["amount"] * mult)
+    if len(state["revealed"]) >= 22:
+        add_coins(get_user(uid), win)
+        save_data()
+        set_game(chat_id, None)
+        return f"🎉 Saare safe tiles khol diye! **{fmt_coins(win)}** jeet gaye! 🏆"
+    return (f"✅ Safe! {len(state['revealed'])}/22 tiles khuli. Multiplier ab **x{mult}** — "
+            f"cashout value {fmt_coins(win)}. /pick se aage badho ya /cashout karo 🙂")
+
+
+def _mines_cashout(chat_id: int, uid: int) -> str | None:
+    """v2.4.0 — shared mines cashout for /cashout AND the 💰 Cashout button.
+    Returns the result text, or None when there is no mines game for this user."""
+    state = game_state(chat_id)
+    if not state or state.get("kind") != "mines":
+        return None
+    if uid != state["player"]:
+        return None
+    mult = mines_mult(len(state["revealed"]))
+    win = int(state["amount"] * mult)
+    add_coins(get_user(uid), win)
+    save_data()
+    set_game(chat_id, None)
+    return f"💰 Cashout! Multiplier x{mult} — **{fmt_coins(win)}** mil gaye! 🎉"
+
+
+def mines_grid_text(state: dict) -> str:
+    """v2.4.0 — render the 5x5 mines board (revealed = ✅, hidden = ⬜)."""
+    rows = []
+    for r in range(5):
+        cells = []
+        for c in range(5):
+            idx = r * 5 + c
+            cells.append("✅" if idx in state.get("revealed", set()) else "⬜")
+        rows.append(" ".join(cells))
+    mult = mines_mult(len(state.get("revealed", set())))
+    win = int(state.get("amount", 0) * mult)
+    return (f"💣 **MINES** — {fmt_coins(state.get('amount', 0))} ka bet!\n\n"
+            + "\n".join(rows)
+            + f"\n\n{len(state.get('revealed', set()))}/22 tiles khuli — multiplier x{mult}, "
+            f"cashout value {fmt_coins(win)}")
+
+
+def mines_grid_keyboard(state: dict) -> InlineKeyboardMarkup:
+    """v2.4.0 — 5x5 tap grid + Cashout button."""
+    rows = []
+    for r in range(5):
+        row = []
+        for c in range(5):
+            idx = r * 5 + c
+            if idx in state.get("revealed", set()):
+                row.append(InlineKeyboardButton("✅", callback_data="mines:open"))
+            else:
+                row.append(InlineKeyboardButton("⬜", callback_data=f"mines:{r + 1}:{c + 1}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("💰 Cashout", callback_data="mines:cashout")])
+    return InlineKeyboardMarkup(rows)
 
 
 @app.on_message(filters.command(["pick"]))
@@ -5202,40 +5538,69 @@ async def cmd_mines_pick(client: Client, message: Message):
     state = game_state(message.chat.id)
     if not state or state.get("kind") != "mines":
         return
-    if message.from_user.id != state["player"]:
-        await safe_reply(message, "Ye mines game tumhara nahi hai 🙂")
-        return
     if len(message.command) < 3:
-        await safe_reply(message, "Aise: /pick 2 3 (row aur column 1-5) 🙂")
+        await safe_reply(message, "Aise: /pick 2 3 (row aur column 1-5) 🙂",
+                         reply_markup=mines_grid_keyboard(state))
         return
     try:
         r, c = int(message.command[1]), int(message.command[2])
     except ValueError:
         await safe_reply(message, "Row aur column number me likho — jaise /pick 2 3 🙂")
         return
-    if not (1 <= r <= 5 and 1 <= c <= 5):
-        await safe_reply(message, "Row aur column 1 se 5 ke beech hone chahiye 🙂")
+    text = _mines_do_pick(message.chat.id, message.from_user.id, r, c)
+    if text:
+        st = game_state(message.chat.id)
+        if st:
+            await safe_reply(message, mines_grid_text(st) + "\n\n" + text,
+                             reply_markup=mines_grid_keyboard(st))
+        else:
+            await safe_reply(message, text)
+
+
+@app.on_callback_query(filters.regex(r"^mines:"))
+async def mines_callbacks(client: Client, query):
+    """v2.4.0 — mines 5x5 tap grid + Cashout button. Same logic as /pick."""
+    if query.from_user is None or is_banned(query.from_user.id):
+        try:
+            await query.answer("🚫", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
         return
-    idx = (r - 1) * 5 + (c - 1)
-    if idx in state["revealed"]:
-        await safe_reply(message, "Ye tile pehle se khuli hai 🙂")
-        return
-    if idx in state["mines"]:
-        lost = state["amount"]
-        set_game(message.chat.id, None)
-        await safe_reply(message, f"💥 **BOOM!** Mine mil gayi! {fmt_coins(lost)} gaye 😭 Dobara khelna ho to /mines karo.")
-        return
-    state["revealed"].add(idx)
-    mult = mines_mult(len(state["revealed"]))
-    win = int(state["amount"] * mult)
-    if len(state["revealed"]) >= 22:
-        add_coins(user, win)
-        save_data()
-        set_game(message.chat.id, None)
-        await safe_reply(message, f"🎉 Saare safe tiles khol diye! **{fmt_coins(win)}** jeet gaye! 🏆")
-        return
-    await safe_reply(message, f"✅ Safe! {len(state['revealed'])}/22 tiles khuli. Multiplier ab **x{mult}** — "
-          f"cashout value {fmt_coins(win)}. /pick se aage badho ya /cashout karo 🙂")
+    try:
+        parts = query.data.split(":")
+        chat_id = query.message.chat.id
+        state = game_state(chat_id)
+        if not state or state.get("kind") != "mines":
+            await query.answer("Abhi koi mines game nahi hai 🙂", show_alert=True)
+            return
+        if query.from_user.id != state["player"]:
+            await query.answer("Ye mines game tumhara nahi hai 🙂", show_alert=True)
+            return
+        if parts[1] == "open":
+            await query.answer("Ye tile pehle se khuli hai 🙂")
+            return
+        if parts[1] == "cashout":
+            text = _mines_cashout(chat_id, query.from_user.id)
+            await query.answer()
+            if text:
+                await query.message.edit_text(text)
+            return
+        r, c = int(parts[1]), int(parts[2])
+        text = _mines_do_pick(chat_id, query.from_user.id, r, c)
+        await query.answer()
+        if text:
+            st = game_state(chat_id)
+            if st:
+                await query.message.edit_text(mines_grid_text(st) + "\n\n" + text,
+                                              reply_markup=mines_grid_keyboard(st))
+            else:
+                await query.message.edit_text(text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] mines callback failed: {exc!r}")
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.on_message(filters.command(["cashout"]))
@@ -5249,12 +5614,9 @@ async def cmd_cashout(client: Client, message: Message):
     if state["kind"] == "mines":
         if message.from_user.id != state["player"]:
             return
-        mult = mines_mult(len(state["revealed"]))
-        win = int(state["amount"] * mult)
-        add_coins(user, win)
-        save_data()
-        set_game(message.chat.id, None)
-        await safe_reply(message, f"💰 Cashout! Multiplier x{mult} — **{fmt_coins(win)}** mil gaye! 🎉")
+        text = _mines_cashout(message.chat.id, message.from_user.id)
+        if text:
+            await safe_reply(message, text)
         return
     # crash
     uid = message.from_user.id
@@ -5802,6 +6164,7 @@ async def cmd_xoxo(client: Client, message: Message):
         return
     st = _lobby_new(message.chat.id, "xoxo", message.from_user.id, amount)
     st["names"][str(message.from_user.id)] = display_name(message.from_user)
+    asyncio.create_task(_lobby_timeout(message.chat.id, "xoxo"))
     if amount > 0:
         add_coins(user, -amount)
         st["pot"] = amount
@@ -6857,27 +7220,60 @@ async def handle_scribble_guess(message: Message) -> bool:
 # ---------------------------------------------------------------------------
 # /end — end the active game (any kind) / mafia game. Refunds bets if the
 # game is still in lobby.
+def _clear_all_game_state(chat_id: int) -> str | None:
+    """v2.4.0 — /end helper: clear EVERY per-chat game state store and refund
+    lobby bets where applicable. Returns "mafia" / "math" / "game" for what
+    was cleared, or None when no game state existed. GAMES holds every
+    set_game game (wordguess, wordgrid, wordchain, rps, cricket, math, card,
+    number, uno, chess, mines, tap, crash, jumble, charades, bingo, xoxo,
+    hack, bomb, roulette, bluff, subway, scribble); MAFIA holds mafia;
+    _MATH_SINGLE holds the periodic math-poster question (the state the old
+    /end missed — it lives outside GAMES/MAFIA)."""
+    cleared = None
+    state = game_state(chat_id)
+    if state:
+        if not state.get("started"):
+            _refund_lobby(state)
+        set_game(chat_id, None)
+        cleared = "game"
+    if chat_id in MAFIA:
+        st = MAFIA[chat_id]
+        if not st.get("started"):
+            _refund_lobby(st)
+        del MAFIA[chat_id]
+        if cleared is None:
+            cleared = "mafia"
+    if chat_id in _MATH_SINGLE:
+        _MATH_SINGLE.pop(chat_id, None)
+        if cleared is None:
+            cleared = "math"
+    return cleared
+
+
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["end"]))
 async def cmd_end_game(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
-    state = game_state(message.chat.id)
-    if state:
-        if not state.get("started"):
-            _refund_lobby(state)
-        set_game(message.chat.id, None)
-        await safe_reply(message, "Game khatam kar diya 🙂")
-        return
-    if message.chat.id in MAFIA:
-        st = MAFIA[message.chat.id]
-        if not st.get("started"):
-            _refund_lobby(st)
-        del MAFIA[message.chat.id]
+    cleared = _clear_all_game_state(message.chat.id)
+    if cleared == "mafia":
         await safe_reply(message, "Mafia game khatam kar diya 🙂")
         return
-    # no game — fall through to the music placeholder (it also handles /end)
+    if cleared:
+        await safe_reply(message, "Game khatam kar diya 🙂")
+        return
+    # No game — /end doubles as music stop (old behaviour, kept).
+    st = music_state(message.chat.id)
+    if st.get("playing") or st.get("current") or st.get("queue"):
+        st["queue"].clear()
+        st["current"] = None
+        st["playing"] = False
+        st["paused"] = False
+        await _music_leave(message.chat.id)
+        await safe_reply(message, "⏹ music band kar diya 🙂")
+        return
+    await safe_reply(message, "koi game chal nahi raha 🙂")
 
 # ===========================================================================
 # v2.2.0 — GAP FEATURES from the all-16-bots audit (pure bot logic only).
@@ -7669,6 +8065,7 @@ async def _wordchain_start_mode(message: Message, mode_key: str) -> None:
     if mode_key == "rfl":
         state["chaos_letter"] = random.choice("abcdefghijklmnopqrstuvwxyz")
     set_game(message.chat.id, state)
+    asyncio.create_task(_lobby_timeout(message.chat.id, "wordchain"))
     extra = ""
     if mode == "chaos":
         extra = f"\nPehla chaos letter: **{state['chaos_letter'].upper()}**"
@@ -8255,6 +8652,46 @@ async def handle_owner_pending(message: Message) -> bool:
 # ---------------------------------------------------------------------------
 # Catch-all: game inputs, filters, chat persona (group=1, after commands)
 # ---------------------------------------------------------------------------
+# v2.4.0 — bare game/economy commands (no slash): "bbet 100" works like
+# "/bbet 100". Admin/moderation commands are deliberately EXCLUDED — they
+# only ever trigger with a slash, so a stray word can never mute/ban anyone.
+BARE_COMMANDS = {
+    "bal": cmd_bal, "daily": cmd_daily, "toprich": cmd_toprich,
+    "leaderboard": cmd_toprich, "wordguess": cmd_wordguess, "wg": cmd_wordguess,
+    "rps": cmd_rps, "cricket": cmd_cricket, "math": cmd_math,
+    "bbet": cmd_bbet, "bet": cmd_bbet, "card": cmd_card, "number": cmd_number,
+    "uno": cmd_uno, "chess": cmd_chess, "mines": cmd_mines, "tap": cmd_tap,
+    "crash": cmd_crash, "jumble": cmd_jumble, "charades": cmd_charades,
+    "bingo": cmd_bingo, "xoxo": cmd_xoxo, "mafia": cmd_mafia, "hack": cmd_hack,
+    "bomb": cmd_bomb, "roulette": cmd_roulette, "bluff": cmd_bluff,
+    "subway": cmd_subway, "scribble": cmd_scribble,
+}
+
+_BARE_ARG_RE = re.compile(r"^(all|half|sab|sara|aadha|easy|medium|hard|\d[\d,]*k?)$")
+
+
+def _parse_bare_command(text: str) -> tuple[str, list[str]] | None:
+    """v2.4.0 — detect a bare command in a plain message. Returns
+    (cmd, args) or None. Only a message that IS the command triggers it: the
+    first word must be a known bare command and the rest must be empty or a
+    single command-like argument (an amount, all/half, or a difficulty). A
+    question about a command ("bbet kya hai?") never triggers."""
+    words = text.strip().split()
+    if not words:
+        return None
+    first = words[0].lower().strip(".,!?")
+    if first not in BARE_COMMANDS:
+        return None
+    rest = words[1:]
+    if not rest:
+        return first, []
+    if len(rest) == 1:
+        arg = rest[0].lower().strip(".,!?")
+        if _BARE_ARG_RE.match(arg):
+            return first, [arg]
+    return None
+
+
 @app.on_message(filters.group & filters.text, group=1)
 async def group_text_handler(client: Client, message: Message):
     user = track_user(message)
@@ -8336,6 +8773,15 @@ async def group_text_handler(client: Client, message: Message):
             if trigger.lower() in low:
                 await safe_reply(message, reply)
                 return
+    # v2.4.0 — bare game/economy commands ("bbet 100" == "/bbet 100").
+    # Commands take priority over game inputs (a wordchain word that happens
+    # to be a command name still runs the command).
+    bare = _parse_bare_command(text)
+    if bare is not None:
+        cmd, args = bare
+        message.command = [cmd] + args
+        await BARE_COMMANDS[cmd](client, message)
+        return
     # v2.3.0 — remember this group message (proactive engagement reads it)
     record_recent(message.chat.id, message.from_user.id,
                   display_name(message.from_user), text, message.id)

@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Chulbuli Mini App 🎮</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="chess.min.js"></script>
+<style>
+  :root {
+    --bg: #12101f;
+    --card: #1e1a33;
+    --card2: #2a2450;
+    --pink: #ff5c8a;
+    --pink2: #ff8fb3;
+    --gold: #ffd166;
+    --green: #3ddc84;
+    --red: #ff5252;
+    --text: #f5f3ff;
+    --muted: #b8b3d9;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 0 0 90px 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: linear-gradient(135deg, #ff5c8a, #7c4dff);
+    padding: 14px 16px 12px; text-align: center;
+  }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .9; }
+  .coins-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    margin: 12px 16px 0; padding: 10px 14px;
+    background: var(--card); border-radius: 14px; font-size: 15px;
+  }
+  .coins-bar b { color: var(--gold); }
+  .coins-bar button {
+    background: var(--gold); color: #222; border: 0; border-radius: 10px;
+    padding: 8px 14px; font-size: 14px; font-weight: 700;
+  }
+  .screen { display: none; padding: 16px; }
+  .screen.active { display: block; }
+  .back {
+    background: var(--card2); color: var(--text); border: 0; border-radius: 10px;
+    padding: 9px 16px; font-size: 15px; margin-bottom: 12px;
+  }
+  h2 { margin: 4px 0 6px; font-size: 20px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .card {
+    background: var(--card); border-radius: 16px; padding: 18px 12px;
+    text-align: center; border: 1px solid #ffffff14;
+  }
+  .card .ico { font-size: 38px; }
+  .card .t { font-size: 16px; font-weight: 700; margin-top: 6px; }
+  .card .d { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+  .card:active { background: var(--card2); transform: scale(.97); }
+  .btn {
+    display: block; width: 100%; padding: 14px; margin: 8px 0;
+    background: var(--pink); color: #fff; border: 0; border-radius: 12px;
+    font-size: 16px; font-weight: 700;
+  }
+  .btn.ghost { background: var(--card2); color: var(--text); }
+  .btn.gold { background: var(--gold); color: #222; }
+  .btn:disabled { opacity: .45; }
+  .result {
+    display: none; margin: 12px 0; padding: 14px; border-radius: 14px;
+    background: #14331f; border: 1px solid var(--green); font-size: 16px; text-align: center;
+  }
+  .result.lose { background: #3a1414; border-color: var(--red); }
+  .result.show { display: block; }
+  .result .big { font-size: 20px; font-weight: 800; }
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: #000c; color: #fff; padding: 10px 18px; border-radius: 20px;
+    font-size: 14px; display: none; z-index: 50; white-space: nowrap;
+  }
+  /* Chess */
+  .board { display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; max-width: 380px; margin: 0 auto; border-radius: 8px; overflow: hidden; }
+  .sq { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; font-size: clamp(22px, 7.5vw, 34px); cursor: pointer; user-select: none; }
+  .sq.light { background: #f0d9b5; }
+  .sq.dark { background: #b58863; }
+  .sq.sel { outline: 3px solid var(--pink); outline-offset: -3px; }
+  .sq.last { background: #cdd26a !important; }
+  .sq .w { color: #fff; text-shadow: 0 0 3px #000, 0 2px 4px #000; }
+  .sq .b { color: #111; text-shadow: 0 0 2px #fff; }
+  .status { text-align: center; font-size: 16px; margin: 10px 0; }
+  /* Mines */
+  .minegrid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; max-width: 340px; margin: 0 auto; }
+  .tile { aspect-ratio: 1; font-size: 24px; border: 0; border-radius: 10px; background: var(--card2); color: var(--text); }
+  .tile.safe { background: #1d5c33; }
+  .tile.boom { background: var(--red); }
+  /* Word guess */
+  .wg-row { display: flex; gap: 6px; justify-content: center; margin-bottom: 6px; }
+  .wg-cell { width: 52px; height: 52px; border: 2px solid var(--card2); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 26px; font-weight: 800; text-transform: uppercase; }
+  .wg-cell.g { background: var(--green); border-color: var(--green); color: #06210f; }
+  .wg-cell.b { background: #4a90e2; border-color: #4a90e2; }
+  .wg-cell.x { background: #3a3654; border-color: #3a3654; }
+  .kb { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; margin-top: 14px; }
+  .kb button { width: 32px; height: 44px; border: 0; border-radius: 8px; background: var(--card2); color: var(--text); font-size: 16px; font-weight: 700; }
+  .kb button.wide { width: 68px; }
+  /* Word grid */
+  .wg-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; max-width: 340px; margin: 0 auto; }
+  .wg-tile { aspect-ratio: 1; font-size: 24px; font-weight: 800; border: 0; border-radius: 10px; background: var(--card2); color: var(--text); }
+  .wg-tile.hit { background: var(--green); color: #06210f; }
+  /* RPS / card */
+  .bigbtns { display: flex; gap: 10px; justify-content: center; margin: 16px 0; }
+  .bigbtns button { font-size: 44px; padding: 14px 18px; border-radius: 16px; border: 0; background: var(--card2); }
+  .bigbtns button:active { transform: scale(.94); background: var(--pink); }
+  .center { text-align: center; }
+  .score { font-size: 18px; text-align: center; margin: 8px 0; }
+  /* UNO */
+  .uno-top { text-align: center; font-size: 15px; margin: 6px 0 12px; }
+  .uno-card { display: inline-block; width: 62px; height: 92px; border-radius: 10px; margin: 4px; font-size: 26px; font-weight: 800; color: #fff; border: 2px solid #fff3; vertical-align: top; }
+  .uno-card small { display: block; font-size: 11px; margin-top: 4px; }
+  .uno-hand { text-align: center; }
+  .uno-card.playable { outline: 3px solid var(--gold); }
+  .colorpick { display: flex; gap: 10px; justify-content: center; margin: 12px 0; }
+  .colorpick button { width: 52px; height: 52px; border-radius: 12px; border: 3px solid #fff; font-size: 20px; }
+  /* VC placeholder */
+  .vc-box { background: var(--card); border: 1px dashed #ffffff33; border-radius: 16px; padding: 18px; text-align: center; margin: 16px; }
+  .vc-box .ico { font-size: 36px; }
+  .vc-box p { color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .badge { display: inline-block; background: var(--gold); color: #222; font-size: 11px; font-weight: 800; border-radius: 8px; padding: 3px 8px; margin-top: 6px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>💕 Chulbuli Mini App</h1>
+  <p>Chess • UNO • Mines • Word Games — sab ek hi jagah!</p>
+</header>
+
+<div class="coins-bar">
+  <span>💰 Unclaimed coins: <b id="unclaimed">0</b></span>
+  <button id="claimBtn" onclick="claimCoins()" disabled>Claim karo 🎁</button>
+</div>
+
+<!-- ============ MENU ============ -->
+<div class="screen active" id="menu">
+  <div class="grid">
+    <div class="card" onclick="show('chess')"><div class="ico">♟️</div><div class="t">Chess</div><div class="d">2-player ya bot ke saath — asli rules</div></div>
+    <div class="card" onclick="show('uno')"><div class="ico">🃏</div><div class="t">UNO</div><div class="d">Bot ke saath — color/number match karo</div></div>
+    <div class="card" onclick="show('mines')"><div class="ico">💣</div><div class="t">Mines</div><div class="d">5×5 grid — mine se bacho, cashout karo</div></div>
+    <div class="card" onclick="show('wordgrid')"><div class="ico">🔤</div><div class="t">Word Grid</div><div class="d">Grid me chhupa word dhoondho</div></div>
+    <div class="card" onclick="show('wordguess')"><div class="ico">🎲</div><div class="t">Word Guess</div><div class="d">4-letter word — 6 guesses, +500 coins</div></div>
+    <div class="card" onclick="show('rps')"><div class="ico">✂️</div><div class="t">Rock Paper Scissors</div><div class="d">Bot se — jeeto to +50 coins</div></div>
+    <div class="card" onclick="show('math')"><div class="ico">🧮</div><div class="t">Math Rush</div><div class="d">60 second — jitne sahi, utne coins</div></div>
+    <div class="card" onclick="show('card')"><div class="ico">🎴</div><div class="t">Card Draw</div><div class="d">Bada card jeetega — +100 coins</div></div>
+  </div>
+</div>
+
+<!-- ============ VC PLACEHOLDER (v2.4.0: NOT built — needs a voice server) ============ -->
+<div class="vc-box" id="vcBox">
+  <div class="ico">🎙️</div>
+  <h2 style="margin:8px 0 4px">VC / Voice Chat</h2>
+  <span class="badge">JALD AA RAHA HAI</span>
+  <p>Mini App me voice chat aur group baat-cheet ke liye ek voice/media server chahiye — is version me sirf games hain. Voice room baad me aayega 🙂</p>
+  <button class="btn ghost" onclick="toast('Voice chat jald aa raha hai 🙂')">Voice Room kholo</button>
+</div>
+
+<footer>Made with 💕 by Chulbuli • Coins bot me claim karne par milte hain</footer>
+<div class="toast" id="toast"></div>
+
+<!-- ============ CHESS ============ -->
+<div class="screen" id="chess">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>♟️ Chess</h2>
+  <p class="sub">Piece pe tap karo, phir uski chaal wali jagah pe tap karo. Promotion auto-queen.</p>
+  <div style="text-align:center;margin-bottom:10px">
+    <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessMode('2p')">👥 2 Player</button>
+    <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessMode('bot')">🤖 Bot se khelo</button>
+    <button class="btn ghost" style="display:inline-block;width:auto;padding:10px 16px" onclick="chessReset()">🔄 Naya game</button>
+  </div>
+  <div class="status" id="chessStatus">Safed ki baari</div>
+  <div class="board" id="chessBoard"></div>
+  <div class="result" id="chessResult"></div>
+</div>
+
+<!-- ============ UNO ============ -->
+<div class="screen" id="uno">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>🃏 UNO</h2>
+  <p class="sub">Apna card tabhi khel sakte ho jab color ya number top card se match kare. Wild kisi bhi card pe chalega.</p>
+  <div class="uno-top" id="unoTop"></div>
+  <div class="center"><button class="btn gold" style="width:auto;padding:10px 22px" onclick="unoDraw()">🃏 Card lo (Draw)</button></div>
+  <div class="colorpick" id="unoColorPick" style="display:none">
+    <button style="background:#e53935" onclick="unoPickColor('red')">🔴</button>
+    <button style="background:#43a047" onclick="unoPickColor('green')">🟢</button>
+    <button style="background:#1e88e5" onclick="unoPickColor('blue')">🔵</button>
+    <button style="background:#fdd835;color:#222" onclick="unoPickColor('yellow')">🟡</button>
+  </div>
+  <h3 style="text-align:center">Tumhare cards (<span id="unoCount">0</span>)</h3>
+  <div class="uno-hand" id="unoHand"></div>
+  <div class="result" id="unoResult"></div>
+</div>
+
+<!-- ============ MINES ============ -->
+<div class="screen" id="mines">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>💣 Mines</h2>
+  <p class="sub">5×5 grid me 3 mines chhupi hain. Safe tile = coins badhte hain. Mine = sab gaya!</p>
+  <div class="score" id="minesScore">0/22 tiles • Cashout: 0 coins</div>
+  <div class="minegrid" id="mineGrid"></div>
+  <button class="btn gold" id="minesCashout" onclick="minesCashout()">💰 Cashout karo</button>
+  <button class="btn ghost" onclick="minesReset()">🔄 Naya game</button>
+  <div class="result" id="minesResult"></div>
+</div>
+
+<!-- ============ WORD GRID ============ -->
+<div class="screen" id="wordgrid">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>🔤 Word Grid</h2>
+  <p class="sub">Neeche wala word grid me chhupa hai — uske letters ko order me tap karo!</p>
+  <div class="score">Dhoondho: <b id="wgTarget" style="color:var(--gold);letter-spacing:3px"></b></div>
+  <div class="wg-grid" id="wgGrid"></div>
+  <button class="btn ghost" onclick="wgReset()">🔄 Naya word</button>
+  <div class="result" id="wgResult"></div>
+</div>
+
+<!-- ============ WORD GUESS ============ -->
+<div class="screen" id="wordguess">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>🎲 Word Guess</h2>
+  <p class="sub">4-letter word guess karo — 6 chances. 🟩 sahi jagah, 🟦 word me hai, ⬜ nahi hai. Jeeto to +500 coins!</p>
+  <div id="wgBoard"></div>
+  <div class="kb" id="wgKb"></div>
+  <button class="btn ghost" onclick="wgGuessReset()">🔄 Naya word</button>
+  <div class="result" id="wgGuessResult"></div>
+</div>
+
+<!-- ============ RPS ============ -->
+<div class="screen" id="rps">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>✂️ Rock Paper Scissors</h2>
+  <p class="sub">Bot ke saath — jeeto to +50 coins!</p>
+  <div class="bigbtns">
+    <button onclick="rpsPlay('rock')">🪨</button>
+    <button onclick="rpsPlay('paper')">📄</button>
+    <button onclick="rpsPlay('scissors')">✂️</button>
+  </div>
+  <div class="score" id="rpsScore">Tum 0 — 0 Bot</div>
+  <div class="score" id="rpsLast">Chuno: 🪨 📄 ya ✂️</div>
+  <div class="result" id="rpsResult"></div>
+</div>
+
+<!-- ============ MATH RUSH ============ -->
+<div class="screen" id="math">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>🧮 Math Rush</h2>
+  <p class="sub">60 second me jitne ho sake utne sawaal — har sahi jawaab +20 coins!</p>
+  <div class="score">⏱️ <b id="mathTime">60</b>s &nbsp;•&nbsp; ✅ <b id="mathScore">0</b> sahi</div>
+  <div class="center" style="font-size:34px;font-weight:800;margin:14px 0" id="mathQ">Start dabao!</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px" id="mathOpts"></div>
+  <button class="btn" id="mathStart" onclick="mathStart()">▶️ Start karo</button>
+  <div class="result" id="mathResult"></div>
+</div>
+
+<!-- ============ CARD DRAW ============ -->
+<div class="screen" id="card">
+  <button class="back" onclick="show('menu')">← Wapas</button>
+  <h2>🎴 Card Draw</h2>
+  <p class="sub">Tum aur bot ek-ek card khichte ho — bada card jeetega! Jeeto to +100 coins.</p>
+  <div class="center">
+    <button class="btn" onclick="cardDraw()">🎴 Card khincho</button>
+  </div>
+  <div class="score" id="cardLast">Abhi tak koi card nahi khincha</div>
+  <div class="score" id="cardScore">Tum 0 — 0 Bot</div>
+  <div class="result" id="cardResult"></div>
+</div>
+
+<script>
+// ================= Telegram WebApp =================
+const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+
+let unclaimed = 0, lastGame = "miniapp";
+function updateCoins() {
+  document.getElementById("unclaimed").textContent = unclaimed;
+  document.getElementById("claimBtn").disabled = unclaimed <= 0;
+}
+function addCoins(n, game) {
+  unclaimed = Math.min(500, unclaimed + n);
+  lastGame = game;
+  updateCoins();
+}
+function claimCoins() {
+  if (unclaimed <= 0) return;
+  const payload = JSON.stringify({ game: lastGame, result: "win", coins: unclaimed });
+  if (tg && tg.sendData) { tg.sendData(payload); }
+  else { toast("Coins tab milenge jab Mini App Telegram ke andar kholo 🙂"); return; }
+  unclaimed = 0; updateCoins();
+  toast("Coins bhej diye — bot reply karega! 🎉");
+}
+function showResult(id, win, html) {
+  const el = document.getElementById(id);
+  el.className = "result show" + (win ? "" : " lose");
+  el.innerHTML = "<div class='big'>" + html + "</div>" +
+    (win ? "<br><button class='btn gold' onclick='claimCoins()'>🎁 Coins claim karo</button>" : "");
+}
+let toastTimer = null;
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = "none"; }, 2200);
+}
+function show(id) {
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  document.getElementById(id).classList.add("active");
+  document.getElementById("vcBox").style.display = id === "menu" ? "" : "none";
+  window.scrollTo(0, 0);
+  if (id === "chess" && !chess) chessReset();
+  if (id === "uno" && !unoTop) unoStart();
+  if (id === "mines" && mineSet.size === 0 && !mineOver) minesReset();
+  if (id === "wordgrid" && !wgWord) wgReset();
+  if (id === "wordguess" && !wg4Secret) wgGuessReset();
+}
+
+// ================= Chess (bundled chess.js) =================
+let chess = null, chessSel = null, chessLast = null, chessModeV = "2p", chessRewarded = false;
+const PIECES = { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚", P: "♙", N: "♘", B: "♗", R: "♖", Q: "♕", K: "♔" };
+function chessReset() {
+  if (typeof Chess === "undefined") {
+    document.getElementById("chessStatus").textContent = "Chess engine load nahi hua — dobara kholo 🙂";
+    return;
+  }
+  chess = new Chess(); chessSel = null; chessLast = null; chessRewarded = false;
+  document.getElementById("chessResult").className = "result";
+  renderChess();
+}
+function chessMode(m) {
+  chessModeV = m; chessReset();
+  toast(m === "bot" ? "Bot se khelo — tum Safed ho 🙂" : "2 Player — dono ek hi phone pe khelo 🙂");
+}
+function renderChess() {
+  const board = document.getElementById("chessBoard");
+  board.innerHTML = "";
+  const pos = chess.board();
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    const sq = document.createElement("div");
+    sq.className = "sq " + (((r + c) % 2 === 0) ? "light" : "dark");
+    const sqName = "abcdefgh"[c] + (8 - r);
+    if (chessSel === sqName) sq.classList.add("sel");
+    if (chessLast && (chessLast.from === sqName || chessLast.to === sqName)) sq.classList.add("last");
+    const p = pos[r][c];
+    if (p) {
+      const span = document.createElement("span");
+      span.className = p.color === "w" ? "w" : "b";
+      span.textContent = PIECES[p.color === "w" ? p.type.toUpperCase() : p.type];
+      sq.appendChild(span);
+    }
+    sq.onclick = () => chessTap(sqName);
+    board.appendChild(sq);
+  }
+  let status;
+  if (chess.in_checkmate()) status = (chess.turn() === "w" ? "Kaala" : "Safed") + " jeet gaya — CHECKMATE! 🏆";
+  else if (chess.in_draw() || chess.in_stalemate()) status = "Draw ho gaya 🤝";
+  else status = (chess.turn() === "w" ? "Safed" : "Kaala") + " ki baari" + (chess.in_check() ? " — CHECK! ⚠️" : "");
+  document.getElementById("chessStatus").textContent = status;
+  if (chess.game_over() && !chessRewarded) {
+    chessRewarded = true;
+    if (chess.in_checkmate()) {
+      const whiteWon = chess.turn() === "b";
+      const coins = (chessModeV === "bot" && whiteWon) ? 200 : 0;
+      if (coins) addCoins(coins, "chess");
+      showResult("chessResult", coins, (whiteWon ? "🏆 Safed jeet gaya!" : "🏆 Kaala jeet gaya!") + (coins ? " +200 coins!" : ""));
+    } else {
+      const coins = chessModeV === "bot" ? 50 : 0;
+      if (coins) addCoins(coins, "chess");
+      showResult("chessResult", coins, "🤝 Draw!" + (coins ? " +50 coins!" : ""));
+    }
+  }
+}
+function chessTap(sq) {
+  if (!chess || chess.game_over()) return;
+  if (chessModeV === "bot" && chess.turn() === "b") return;
+  if (chessSel) {
+    const mv = chess.move({ from: chessSel, to: sq, promotion: "q" });
+    if (mv) {
+      chessLast = mv; chessSel = null; renderChess();
+      if (chessModeV === "bot" && !chess.game_over()) setTimeout(botChessMove, 450);
+      return;
+    }
+    chessSel = null;
+  }
+  const piece = chess.get(sq);
+  if (piece && piece.color === chess.turn()) { chessSel = sq; renderChess(); }
+  else renderChess();
+}
+function botChessMove() {
+  if (!chess || chess.game_over()) return;
+  const moves = chess.moves({ verbose: true });
+  if (!moves.length) return;
+  chessLast = chess.move(moves[Math.floor(Math.random() * moves.length)]);
+  renderChess();
+}
+
+// ================= UNO (simplified, bot ke saath) =================
+const UNO_COLORS = ["red", "green", "blue", "yellow"];
+const UNO_HEX = { red: "#e53935", green: "#43a047", blue: "#1e88e5", yellow: "#fdd835", wild: "#5e35b1" };
+let unoDeck = [], unoHand = [], unoBot = [], unoTop = null, unoColor = null, unoOver = false, unoTurn = "you", unoPendingWild = null;
+function unoBuildDeck() {
+  const d = [];
+  for (const col of UNO_COLORS) {
+    d.push({ color: col, val: "0" });
+    for (let i = 0; i < 2; i++) for (const v of ["1","2","3","4","5","6","7","8","9","Skip","Reverse","+2"]) d.push({ color: col, val: v });
+  }
+  for (let i = 0; i < 4; i++) { d.push({ color: "wild", val: "Wild" }); d.push({ color: "wild", val: "+4" }); }
+  return d.sort(() => Math.random() - 0.5);
+}
+function unoDrawCard() { if (!unoDeck.length) unoDeck = unoBuildDeck(); return unoDeck.pop(); }
+function unoStart() {
+  unoDeck = unoBuildDeck(); unoHand = []; unoBot = [];
+  for (let i = 0; i < 7; i++) { unoHand.push(unoDrawCard()); unoBot.push(unoDrawCard()); }
+  unoTop = unoDrawCard();
+  let guard = 0;
+  while (unoTop.color === "wild" && guard++ < 10) { unoDeck.unshift(unoTop); unoTop = unoDrawCard(); }
+  unoColor = unoTop.color === "wild" ? "red" : unoTop.color;
+  unoOver = false; unoTurn = "you"; unoPendingWild = null;
+  document.getElementById("unoColorPick").style.display = "none";
+  document.getElementById("unoResult").className = "result";
+  renderUno();
+}
+function unoPlayable(c) { return c.color === "wild" || c.color === unoColor || c.val === unoTop.val; }
+function unoCardLabel(c) { return c.val + " (" + (c.color === "wild" ? "WILD" : c.color) + ")"; }
+function renderUno() {
+  document.getElementById("unoTop").innerHTML = "Top card: <b>" + unoCardLabel(unoTop) + "</b> &nbsp;•&nbsp; Bot ke cards: <b>" + unoBot.length + "</b> &nbsp;•&nbsp; Color: <b>" + unoColor + "</b>";
+  document.getElementById("unoCount").textContent = unoHand.length;
+  const hand = document.getElementById("unoHand");
+  hand.innerHTML = "";
+  unoHand.forEach((c, i) => {
+    const d = document.createElement("button");
+    d.className = "uno-card" + ((unoPlayable(c) && unoTurn === "you" && !unoOver) ? " playable" : "");
+    d.style.background = UNO_HEX[c.color];
+    d.innerHTML = c.val + "<small>" + (c.color === "wild" ? "WILD" : c.color.toUpperCase()) + "</small>";
+    d.onclick = () => unoPlay(i);
+    hand.appendChild(d);
+  });
+}
+function unoPlay(i) {
+  if (unoOver || unoTurn !== "you") return;
+  const c = unoHand[i];
+  if (!unoPlayable(c)) { toast("Ye card nahi chalega — color ya number match karo 🙂"); return; }
+  if (c.color === "wild") {
+    unoPendingWild = i;
+    document.getElementById("unoColorPick").style.display = "flex";
+    return;
+  }
+  unoHand.splice(i, 1);
+  unoTop = c; unoColor = c.color;
+  unoAfterPlay(c, "you");
+}
+function unoPickColor(col) {
+  document.getElementById("unoColorPick").style.display = "none";
+  if (unoPendingWild === null) return;
+  const c = unoHand.splice(unoPendingWild, 1)[0];
+  unoPendingWild = null;
+  unoTop = c; unoColor = col;
+  unoAfterPlay(c, "you");
+}
+function unoAfterPlay(c, who) {
+  if (who === "you" && unoHand.length === 0) {
+    unoOver = true; addCoins(200, "uno"); renderUno();
+    showResult("unoResult", 200, "🏆 Tum jeet gaye! UNO khatam — +200 coins!");
+    return;
+  }
+  if (who === "bot" && unoBot.length === 0) {
+    unoOver = true; renderUno();
+    showResult("unoResult", 0, "😅 Bot jeet gaya — uske cards khatam ho gaye!");
+    return;
+  }
+  const v = c.val;
+  if (v === "Skip" || v === "Reverse") {
+    renderUno();
+    if (who === "you") toast("Skip! Bot ki baari gayi — dobara tum khelo 🙂");
+    else { toast("Bot ne Skip khela — woh dobara khelega"); setTimeout(unoBotTurn, 700); }
+    return;
+  }
+  if (v === "+2" || v === "+4") {
+    const n = v === "+2" ? 2 : 4;
+    if (who === "you") { for (let i = 0; i < n; i++) unoBot.push(unoDrawCard()); toast("Bot ne " + n + " cards liye!"); }
+    else { for (let i = 0; i < n; i++) unoHand.push(unoDrawCard()); toast("Tumne " + n + " cards liye! 😅"); }
+    renderUno();
+    if (who === "you") return;
+    setTimeout(unoBotTurn, 700);
+    return;
+  }
+  renderUno();
+  if (who === "you") { unoTurn = "bot"; setTimeout(unoBotTurn, 700); }
+  else { unoTurn = "you"; renderUno(); }
+}
+function unoBotTurn() {
+  if (unoOver) return;
+  const idx = unoBot.findIndex(unoPlayable);
+  if (idx === -1) { unoBot.push(unoDrawCard()); toast("Bot ne card liya"); unoTurn = "you"; renderUno(); return; }
+  const c = unoBot.splice(idx, 1)[0];
+  unoTop = c;
+  if (c.color === "wild") { unoColor = UNO_COLORS[Math.floor(Math.random() * 4)]; toast("Bot ne Wild khela — color: " + unoColor); }
+  else unoColor = c.color;
+  unoAfterPlay(c, "bot");
+}
+function unoDraw() {
+  if (unoOver || unoTurn !== "you") return;
+  unoHand.push(unoDrawCard());
+  unoTurn = "bot"; renderUno();
+  setTimeout(unoBotTurn, 700);
+}
+
+// ================= Mines =================
+let mineSet = new Set(), mineRevealed = new Set(), mineOver = false;
+function minesReset() {
+  mineSet = new Set();
+  while (mineSet.size < 3) mineSet.add(Math.floor(Math.random() * 25));
+  mineRevealed = new Set(); mineOver = false;
+  document.getElementById("minesResult").className = "result";
+  renderMines();
+}
+function renderMines() {
+  const g = document.getElementById("mineGrid");
+  g.innerHTML = "";
+  for (let i = 0; i < 25; i++) {
+    const b = document.createElement("button");
+    b.className = "tile";
+    if (mineRevealed.has(i)) { b.classList.add("safe"); b.textContent = "✅"; }
+    else if (mineOver && mineSet.has(i)) { b.classList.add("boom"); b.textContent = "💣"; }
+    else b.textContent = "⬜";
+    b.onclick = () => minesTap(i);
+    g.appendChild(b);
+  }
+  const n = mineRevealed.size;
+  document.getElementById("minesScore").textContent = n + "/22 tiles • Cashout: " + (50 * n) + " coins";
+  document.getElementById("minesCashout").disabled = mineOver || n === 0;
+}
+function minesTap(i) {
+  if (mineOver || mineRevealed.has(i)) return;
+  if (mineSet.has(i)) {
+    mineOver = true; renderMines();
+    showResult("minesResult", 0, "💥 BOOM! Mine mil gayi — koi coins nahi 😭");
+    return;
+  }
+  mineRevealed.add(i);
+  if (mineRevealed.size >= 22) {
+    mineOver = true; addCoins(500, "mines"); renderMines();
+    showResult("minesResult", 500, "🎉 Saare safe tiles khol diye! +500 coins!");
+    return;
+  }
+  renderMines();
+}
+function minesCashout() {
+  if (mineOver || mineRevealed.size === 0) return;
+  const win = 50 * mineRevealed.size;
+  mineOver = true; addCoins(win, "mines"); renderMines();
+  showResult("minesResult", win, "💰 Cashout! +" + win + " coins!");
+}
+
+// ================= Word Grid =================
+const WG_WORDS = ["SANJI", "CHULBULI", "MOON", "CRICKET", "ROAST", "GAMING", "FRIEND", "DOSTI", "PIZZA", "MUSIC", "TELEGRAM", "BHARAT"];
+let wgWord = "", wgPos = [], wgGridLetters = [], wgNext = 0, wgOver = false;
+function wgReset() {
+  wgWord = WG_WORDS[Math.floor(Math.random() * WG_WORDS.length)];
+  const dir = Math.random() < 0.5 ? "h" : "v";
+  const maxStart = 5 - wgWord.length;
+  const s = Math.floor(Math.random() * (maxStart + 1));
+  const fixed = Math.floor(Math.random() * 5);
+  wgPos = [];
+  for (let i = 0; i < wgWord.length; i++) wgPos.push(dir === "h" ? [fixed, s + i] : [s + i, fixed]);
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  wgGridLetters = [];
+  for (let r = 0; r < 5; r++) {
+    const row = [];
+    for (let c = 0; c < 5; c++) {
+      const wi = wgPos.findIndex(p => p[0] === r && p[1] === c);
+      row.push(wi >= 0 ? wgWord[wi] : letters[Math.floor(Math.random() * 26)]);
+    }
+    wgGridLetters.push(row);
+  }
+  wgNext = 0; wgOver = false;
+  document.getElementById("wgTarget").textContent = wgWord;
+  document.getElementById("wgResult").className = "result";
+  renderWg();
+}
+function renderWg() {
+  const g = document.getElementById("wgGrid");
+  g.innerHTML = "";
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 5; c++) {
+    const b = document.createElement("button");
+    b.className = "wg-tile";
+    b.textContent = wgGridLetters[r][c];
+    const wi = wgPos.findIndex(p => p[0] === r && p[1] === c);
+    if (wi >= 0 && wi < wgNext) b.classList.add("hit");
+    b.onclick = () => wgTap(wi);
+    g.appendChild(b);
+  }
+}
+function wgTap(wi) {
+  if (wgOver) return;
+  if (wi === wgNext) {
+    wgNext++;
+    if (wgNext >= wgWord.length) {
+      wgOver = true; addCoins(100, "wordgrid"); renderWg();
+      showResult("wgResult", 100, "🎉 Word mil gaya — " + wgWord + "! +100 coins!");
+      return;
+    }
+    renderWg();
+  } else {
+    wgNext = 0; renderWg();
+    toast("Galat order — phir se shuru se tap karo 🙂");
+  }
+}
+
+// ================= Word Guess (4-letter, chat jaisa) =================
+const WG4_WORDS = ["game","play","word","chat","love","moon","star","king","cool","fire","gold","luck","song","book","rain","tree","fish","bird","cake","door","ball","fast","slow","dark","jump","walk","talk","read","rose","lily","snow","wind","sand","rock","milk","rice","salt","iron","lion","bear","wolf","goat","duck","frog","crab","ship","boat","bike","road","town","city","home","room"];
+let wg4Secret = "", wg4Row = 0, wg4Cur = [], wg4Guesses = [], wg4Over = false;
+function wg4Score(secret, guess) {
+  const s = secret.split(""), g = guess.split(""), res = ["x", "x", "x", "x"];
+  const rem = {};
+  for (let i = 0; i < 4; i++) { if (g[i] === s[i]) res[i] = "g"; else rem[s[i]] = (rem[s[i]] || 0) + 1; }
+  for (let i = 0; i < 4; i++) { if (res[i] === "g") continue; if (rem[g[i]]) { res[i] = "b"; rem[g[i]]--; } }
+  return res;
+}
+function wgGuessReset() {
+  wg4Secret = WG4_WORDS[Math.floor(Math.random() * WG4_WORDS.length)];
+  wg4Row = 0; wg4Cur = []; wg4Guesses = []; wg4Over = false;
+  document.getElementById("wgGuessResult").className = "result";
+  renderWg4();
+}
+function renderWg4() {
+  const board = document.getElementById("wgBoard");
+  board.innerHTML = "";
+  for (let r = 0; r < 6; r++) {
+    const row = document.createElement("div");
+    row.className = "wg-row";
+    const guess = wg4Guesses[r];
+    for (let c = 0; c < 4; c++) {
+      const cell = document.createElement("div");
+      cell.className = "wg-cell";
+      if (guess) { cell.textContent = guess.word[c]; cell.classList.add(guess.score[c]); }
+      else if (r === wg4Row && c < wg4Cur.length) cell.textContent = wg4Cur[c];
+      row.appendChild(cell);
+    }
+    board.appendChild(row);
+  }
+  const kb = document.getElementById("wgKb");
+  kb.innerHTML = "";
+  "QWERTYUIOPASDFGHJKLZXCVBNM".split("").forEach(ch => {
+    const b = document.createElement("button");
+    b.textContent = ch;
+    b.onclick = () => wg4Key(ch);
+    kb.appendChild(b);
+  });
+  const ent = document.createElement("button");
+  ent.textContent = "⏎"; ent.className = "wide"; ent.onclick = wg4Enter;
+  kb.appendChild(ent);
+  const del = document.createElement("button");
+  del.textContent = "⌫"; del.className = "wide"; del.onclick = wg4Del;
+  kb.appendChild(del);
+}
+function wg4Key(ch) {
+  if (wg4Over || wg4Cur.length >= 4) return;
+  wg4Cur.push(ch.toLowerCase());
+  renderWg4();
+}
+function wg4Del() { if (!wg4Over) { wg4Cur.pop(); renderWg4(); } }
+function wg4Enter() {
+  if (wg4Over) return;
+  if (wg4Cur.length < 4) { toast("4 letters likho 🙂"); return; }
+  const word = wg4Cur.join("");
+  const score = wg4Score(wg4Secret, word);
+  wg4Guesses.push({ word, score });
+  wg4Cur = [];
+  if (word === wg4Secret) {
+    wg4Over = true; addCoins(500, "wordguess"); renderWg4();
+    showResult("wgGuessResult", 500, "🎉 Sahi jawaab — " + wg4Secret.toUpperCase() + "! +500 coins!");
+    return;
+  }
+  wg4Row++;
+  if (wg4Row >= 6) {
+    wg4Over = true; renderWg4();
+    showResult("wgGuessResult", 0, "😅 6 guesses khatam! Word tha: " + wg4Secret.toUpperCase());
+    return;
+  }
+  renderWg4();
+}
+
+// ================= RPS =================
+let rpsW = 0, rpsL = 0;
+function rpsPlay(pick) {
+  const opts = ["rock", "paper", "scissors"];
+  const bot = opts[Math.floor(Math.random() * 3)];
+  const emoji = { rock: "🪨", paper: "📄", scissors: "✂️" };
+  let res;
+  if (pick === bot) res = "draw";
+  else if ((pick === "rock" && bot === "scissors") || (pick === "paper" && bot === "rock") || (pick === "scissors" && bot === "paper")) res = "win";
+  else res = "lose";
+  if (res === "win") { rpsW++; addCoins(50, "rps"); }
+  else if (res === "lose") rpsL++;
+  document.getElementById("rpsScore").textContent = "Tum " + rpsW + " — " + rpsL + " Bot";
+  document.getElementById("rpsLast").textContent = "Tum: " + emoji[pick] + "  •  Bot: " + emoji[bot] + " — " +
+    (res === "win" ? "Tum jeete! 🎉 +50 coins" : res === "lose" ? "Bot jeet gaya 😅" : "Draw! 🤝");
+  if (res === "win") showResult("rpsResult", 50, "🎉 Jeet gaye! +50 coins!");
+  else document.getElementById("rpsResult").className = "result";
+}
+
+// ================= Math Rush =================
+let mathTimer = null, mathLeft = 60, mathCorrect = 0, mathAns = 0, mathRunning = false;
+function mathStart() {
+  mathCorrect = 0; mathLeft = 60; mathRunning = true;
+  document.getElementById("mathScore").textContent = "0";
+  document.getElementById("mathTime").textContent = "60";
+  document.getElementById("mathResult").className = "result";
+  document.getElementById("mathStart").disabled = true;
+  mathNext();
+  mathTimer = setInterval(() => {
+    mathLeft--;
+    document.getElementById("mathTime").textContent = mathLeft;
+    if (mathLeft <= 0) mathEnd();
+  }, 1000);
+}
+function mathNext() {
+  const a = 2 + Math.floor(Math.random() * 12), b = 2 + Math.floor(Math.random() * 12);
+  const ops = ["+", "-", "×"];
+  const op = ops[Math.floor(Math.random() * 3)];
+  mathAns = op === "+" ? a + b : op === "-" ? a - b : a * b;
+  document.getElementById("mathQ").textContent = a + " " + op + " " + b + " = ?";
+  const opts = new Set([mathAns]);
+  while (opts.size < 4) opts.add(mathAns + (Math.floor(Math.random() * 11) - 5));
+  const arr = [...opts].sort(() => Math.random() - 0.5);
+  const box = document.getElementById("mathOpts");
+  box.innerHTML = "";
+  arr.forEach(v => {
+    const btn = document.createElement("button");
+    btn.className = "btn ghost";
+    btn.textContent = v;
+    btn.onclick = () => mathPick(v);
+    box.appendChild(btn);
+  });
+}
+function mathPick(v) {
+  if (!mathRunning) return;
+  if (v === mathAns) {
+    mathCorrect++;
+    document.getElementById("mathScore").textContent = mathCorrect;
+    addCoins(20, "math");
+  }
+  mathNext();
+}
+function mathEnd() {
+  clearInterval(mathTimer);
+  mathRunning = false;
+  document.getElementById("mathStart").disabled = false;
+  document.getElementById("mathQ").textContent = "Time khatam!";
+  const win = 20 * mathCorrect;
+  showResult("mathResult", win, "⏱️ Time khatam! " + mathCorrect + " sahi jawaab — +" + win + " coins!");
+}
+
+// ================= Card Draw =================
+let cardW = 0, cardL = 0;
+const CARD_NAMES = { 11: "J", 12: "Q", 13: "K", 14: "A" };
+function cardDraw() {
+  const you = 2 + Math.floor(Math.random() * 13), bot = 2 + Math.floor(Math.random() * 13);
+  const nm = v => CARD_NAMES[v] || v;
+  let msg;
+  if (you > bot) {
+    cardW++; addCoins(100, "card");
+    msg = "🏆 Tum jeete! Tumhara " + nm(you) + " > Bot ka " + nm(bot) + " — +100 coins!";
+    showResult("cardResult", 100, msg);
+  } else if (you < bot) {
+    cardL++;
+    msg = "😅 Bot jeet gaya! Tumhara " + nm(you) + " < Bot ka " + nm(bot);
+    document.getElementById("cardResult").className = "result";
+  } else {
+    msg = "🤝 Draw! Dono ka " + nm(you) + " — dobara khincho";
+    document.getElementById("cardResult").className = "result";
+  }
+  document.getElementById("cardLast").textContent = "Tum: " + nm(you) + "  •  Bot: " + nm(bot) + " — " + msg;
+  document.getElementById("cardScore").textContent = "Tum " + cardW + " — " + cardL + " Bot";
+}
+</script>
+</body>
+</html>
