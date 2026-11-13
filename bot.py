@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -3842,6 +3842,92 @@ def _music_apply_send_shim(user_client) -> None:
         print("[chulbuli] music: pyrogram1 send shim applied (send -> invoke)")
 
 
+_BRIDGE_LAYER158_PATCHED = False
+
+
+def _music_apply_group_call_bridge_patch() -> bool:
+    """Patch pytgcalls 2.1.0's PyrogramBridge for Telegram layer 158.
+
+    ROOT CAUSE (live /play 2026-11-13 12:08 IST, Railway logs): the song
+    downloaded fine (7.61 MiB, 100%) and the assistant joined the VC, but
+    ~1s later pytgcalls crashed in its own update handler:
+        File ".../pytgcalls/mtproto/pyrogram_bridge.py", line 75,
+            in _process_group_call_update
+        call = GroupCallWrapper(update.call.id, update.call.params)
+        AttributeError: 'GroupCall' object has no attribute 'params'
+    and no audio ever started; the assistant left ~10s later. Verified
+    against the real wheel (pytgcalls 2.1.0) and Pyrogram 2.0.106 (layer
+    158): the TL constructor groupCall no longer carries a `params` field
+    — its __slots__ are id/access_hash/participants_count/
+    unmuted_video_limit/version/... with NO params. Telegram moved the
+    join response payload to a separate update,
+    updateGroupCallConnection#b783982 (params: DataJSON) — "pass params
+    to the local tgcalls group-call engine as its join response payload"
+    (core.telegram.org). pytgcalls 2.1.0 never learned this: its Pyrogram
+    bridge only maps UpdateGroupCallParticipants + UpdateGroupCall, so
+    the connection update is ignored AND every UpdateGroupCall crashes
+    it. Its own Telethon bridge already has the shape of the fix
+    (_process_group_call_connection, "TODO update to new layer when
+    pyrogram will release new stable version") — GroupCallWrapper with
+    placeholder ids fed to the same group_call_update_callback.
+    This patch mirrors that handler onto the Pyrogram bridge:
+      * UpdateGroupCallConnection -> GroupCallWrapper('placeholder',
+        update.params) -> callback, so tgcalls gets its join payload and
+        the RTC connection can actually establish.
+      * UpdateGroupCall -> GroupCallWrapper(update.call.id, None) (the
+        payload now arrives separately; None is falsy so the callback
+        just skips setting one) instead of crashing on .params; a
+        discarded call still maps to GroupCallDiscardedWrapper.
+    Applied once, before the GroupCallFactory is built. If the patch
+    cannot be applied (pytgcalls missing/changed), it logs and returns
+    False — /play then keeps failing the old way, loudly, instead of
+    dying silently inside the assistant.
+    """
+    global _BRIDGE_LAYER158_PATCHED
+    if _BRIDGE_LAYER158_PATCHED:
+        return True
+    try:
+        from pyrogram import ContinuePropagation
+        from pyrogram.raw import types as _raw_types
+        from pytgcalls.mtproto.data import (
+            GroupCallDiscardedWrapper,
+            GroupCallWrapper,
+        )
+        from pytgcalls.mtproto.data.update import UpdateGroupCallWrapper
+        from pytgcalls.mtproto.pyrogram_bridge import PyrogramBridge
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music: bridge patch skipped: {exc!r}")
+        return False
+    _orig_process_update = PyrogramBridge._process_update
+
+    async def _patched_process_update(self, _, update, users, chats):
+        if isinstance(update, _raw_types.UpdateGroupCallConnection):
+            if self.group_call is None:
+                raise ContinuePropagation
+            call = GroupCallWrapper("placeholder", update.params)
+            wrapped = UpdateGroupCallWrapper("placeholder", call)
+            await self.group_call_update_callback(wrapped)
+            return
+        if isinstance(update, _raw_types.UpdateGroupCall):
+            if (self.group_call is None or update.call is None
+                    or update.call.id != self.group_call.id):
+                raise ContinuePropagation
+            self.group_call = update.call
+            if isinstance(update.call, _raw_types.GroupCallDiscarded):
+                call = GroupCallDiscardedWrapper()
+            else:
+                call = GroupCallWrapper(update.call.id, None)
+            wrapped = UpdateGroupCallWrapper(update.chat_id, call)
+            await self.group_call_update_callback(wrapped)
+            return
+        return await _orig_process_update(self, _, update, users, chats)
+
+    PyrogramBridge._process_update = _patched_process_update
+    _BRIDGE_LAYER158_PATCHED = True
+    print("[chulbuli] music: layer-158 group-call bridge patch applied")
+    return True
+
+
 async def _music_ensure_assistant() -> bool:
     """Start the assistant client + GroupCallFactory once; log its identity
     via get_me so a live deploy proves which account is connected."""
@@ -3867,6 +3953,12 @@ async def _music_ensure_assistant() -> bool:
             # factory is built, or every gc.start dies with
             # AttributeError: 'Client' object has no attribute 'send'.
             _music_apply_send_shim(user_client)
+            # Layer 158 moved the RTC join payload out of groupCall.params
+            # into UpdateGroupCallConnection; the stock bridge crashes on
+            # every UpdateGroupCall (live /play 2026-11-13 12:08 IST) and
+            # never feeds tgcalls its payload, so no audio ever starts.
+            # Patch it BEFORE the factory is built, or /play stays silent.
+            _music_apply_group_call_bridge_patch()
             factory = _GroupCallFactory(user_client)
             _ASSISTANT.update({"client": user_client, "factory": factory,
                                "started": True, "me": me})
