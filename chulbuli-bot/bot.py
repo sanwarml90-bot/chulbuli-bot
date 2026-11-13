@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from pyrogram import Client, filters, raw, utils
@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.11"
+VERSION = "2.6.12"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -844,7 +844,7 @@ START_TEXT = """hiee {name} 💕 main Chulbuli hun — games, masti aur economy,
 🎮 Games: /wordguess /wordgrid /wordchain /rps /cricket /math /bbet /card /number /uno /chess /mines /tap /crash /jumble /charades /bingo /xoxo /mafia /hack /bomb /roulette /bluff /subway /scribble
 💬 Mujhse baat karo — main hamesha reply dungi!
 💞 Romance: /propose /marry /ship /divorce
-🛡️ Mods (admins): /warn /mute /ban /kick /pin /purge /utag
+🛡️ Mods (admins): /warn /mute /ban /kick /pin /purge /del /tmute /tban /lock /unlock /slowmode /zombies /link /ginfo /utag
 📊 Rank: /rank /toprank /mystats
 
 Group me add karo aur khelna shuru karo — type /help for details!"""
@@ -921,6 +921,8 @@ Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
 
 **🛡️ Mods (sirf admins)**
 /warn /unwarn /mute /unmute /ban /unban /kick /pin /purge
+/del /tmute /tban — delete karo, time ke liye mute/ban karo
+/lock /unlock /slowmode /zombies /link /ginfo — lock, slow mode, safai, link, info
 /warns /promote /demote /title — warns dekho, admin banao/hatao
 /utag /atag — sabko tag karo
 /nolinks — link filter on/off
@@ -3322,6 +3324,210 @@ async def cmd_purge(client: Client, message: Message):
         await safe_reply(message, f"🧹 {deleted} messages delete kar diye!")
     except Exception:  # noqa: BLE001
         await safe_reply(message, "Purge nahi kar payi — mujhe admin banao (delete permission) 🙂")
+
+
+def _parse_duration(text: str) -> int | None:
+    """'10s'/'10m'/'1h'/'2d' (bare number = minutes) -> seconds, else None."""
+    m = re.fullmatch(r"(\d+)\s*([smhd]?)", (text or "").strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2) or "m"]
+
+
+def _fmt_dur(secs: int) -> str:
+    if secs >= 86400:
+        return f"{secs // 86400} din"
+    if secs >= 3600:
+        return f"{secs // 3600} ghante"
+    if secs >= 60:
+        return f"{secs // 60} minute"
+    return f"{secs} second"
+
+
+@app.on_message(filters.command(["del"]))
+async def cmd_del(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins delete kar sakte hain 🙂")
+        return
+    target = message.reply_to_message
+    if not target:
+        await safe_reply(message, "Kisko delete karna hai? Message pe reply karke /del likho 🙂")
+        return
+    try:
+        await client.delete_messages(message.chat.id, [target.id, message.id])
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Delete nahi kar payi — mujhe admin banao (delete permission) 🙂")
+
+
+@app.on_message(filters.command(["tmute"]))
+async def cmd_tmute(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins mute kar sakte hain 🙂")
+        return
+    target = _target_user(message)
+    if not target:
+        await safe_reply(message, "Kisko mute karna hai? Reply karke /tmute 10m likho 🙂")
+        return
+    arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
+    secs = _parse_duration(arg)
+    if not secs:
+        await safe_reply(message, "Time batao — /tmute 10m, /tmute 1h, /tmute 1d 🙂")
+        return
+    try:
+        until = datetime.now(timezone.utc) + timedelta(seconds=secs)
+        await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions(), until_date=until)
+        await safe_reply(message, f"🔇 {display_name(target)} {_fmt_dur(secs)} ke liye mute ho gaya! 🙂")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Mute nahi kar payi — mujhe admin banao (restrict permission ke saath) 🙂")
+
+
+@app.on_message(filters.command(["tban"]))
+async def cmd_tban(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins ban kar sakte hain 🙂")
+        return
+    target = _target_user(message)
+    if not target:
+        await safe_reply(message, "Kisko ban karna hai? Reply karke /tban 1h likho 🙂")
+        return
+    arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
+    secs = _parse_duration(arg)
+    if not secs:
+        await safe_reply(message, "Time batao — /tban 1h, /tban 1d, /tban 10m 🙂")
+        return
+    try:
+        until = datetime.now(timezone.utc) + timedelta(seconds=secs)
+        await client.ban_chat_member(message.chat.id, target.id, until_date=until)
+        await safe_reply(message, f"🔨 {display_name(target)} {_fmt_dur(secs)} ke liye ban ho gaya!")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Ban nahi kar payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["lock"]))
+async def cmd_lock(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins lock kar sakte hain 🙂")
+        return
+    try:
+        await client.set_chat_permissions(message.chat.id, ChatPermissions())
+        await safe_reply(message, "🔒 Group lock ho gaya — ab sirf admins message bhej sakte hain. /unlock se kholo 🙂")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Lock nahi kar payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["unlock"]))
+async def cmd_unlock(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins unlock kar sakte hain 🙂")
+        return
+    try:
+        await client.set_chat_permissions(
+            message.chat.id,
+            ChatPermissions(can_send_messages=True, can_send_media_messages=True,
+                            can_send_polls=True, can_send_other_messages=True,
+                            can_add_web_page_previews=True, can_change_info=True,
+                            can_invite_users=True, can_pin_messages=True))
+        await safe_reply(message, "🔓 Group unlock ho gaya — sab message bhej sakte hain 🙂")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Unlock nahi kar payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["slowmode"]))
+async def cmd_slowmode(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins slow mode set kar sakte hain 🙂")
+        return
+    arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
+    if arg.lower() in ("off", "0"):
+        secs = 0
+    else:
+        try:
+            secs = int(arg)
+        except (TypeError, ValueError):
+            secs = -1
+    if secs < 0:
+        await safe_reply(message, "Slow mode seconds me batao — /slowmode 10, ya off karne ke liye /slowmode off 🙂")
+        return
+    try:
+        await client.set_slow_mode(message.chat.id, secs)
+        if secs:
+            await safe_reply(message, f"🐢 Slow mode ON — har message ke beech {secs} second ka gap 🙂")
+        else:
+            await safe_reply(message, "🐢 Slow mode OFF kar diya 🙂")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Slow mode set nahi kar payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["zombies"]))
+async def cmd_zombies(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins zombies nikaal sakte hain 🙂")
+        return
+    try:
+        removed = 0
+        async for member in client.get_chat_members(message.chat.id):
+            if getattr(member.user, "is_deleted", False):
+                try:
+                    await client.ban_chat_member(message.chat.id, member.user.id)
+                    await client.unban_chat_member(message.chat.id, member.user.id)
+                    removed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        if removed:
+            await safe_reply(message, f"🧟 {removed} deleted accounts nikaal diye! 🙂")
+        else:
+            await safe_reply(message, "🧟 Koi deleted account nahi mila 🙂")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Zombies check nahi kar payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["link"]))
+async def cmd_link(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins link nikaal sakte hain 🙂")
+        return
+    try:
+        link = await client.export_chat_invite_link(message.chat.id)
+        await safe_reply(message, f"🔗 Group link: {link}")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, "Link nahi nikaal payi — mujhe admin banao 🙂")
+
+
+@app.on_message(filters.command(["ginfo"]))
+async def cmd_ginfo(client: Client, message: Message):
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    try:
+        count = await client.get_chat_members_count(message.chat.id)
+        await safe_reply(message, f"👥 **{message.chat.title or 'Group'}**\nID: `{message.chat.id}`\nMembers: {count}")
+    except Exception:  # noqa: BLE001
+        await safe_reply(message, f"👥 **{message.chat.title or 'Group'}**\nID: `{message.chat.id}`")
 
 
 @app.on_message(filters.command(["staff"]))
