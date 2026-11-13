@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.6"
+VERSION = "2.6.7"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4895,6 +4895,9 @@ CHAT_DEFAULT = [
     "itni der soch raha tha, abhi tak samajh nahi aaya? hehe",
     "main to queen hun, pehle bata kya chahiye 👑",
     "hehe, ye wali line to tumse expect nahi ki thi",
+    # v2.6.7 — roast ki koi limit nahi (Sanji): fallback me bhi tez lines.
+    "abe yaar, tu to full bakwas kar raha hai 😂",
+    "tera joke sunke to mere kaan dukh gaye hehe",
 ]
 CHAT_LOVE = [
     "awww, tum bhi pyaare ho",
@@ -5196,15 +5199,14 @@ AI_SYSTEM = (
     "'hiee yaar, kya kar rahe ho', 'hehe acha', 'arre yaar, tum bhi na'. Use 'yaar' and "
     "'arre' naturally, be warm and playful, tease a little, never sound robotic, never lecture, "
     "never give long explanations. "
-    "THODA ROAST + THODA ATTITUDE — ye tumhara style hai: kabhi kabhi dost ko halka sa "
-    "roast bhi karti ho — mazak me, jaise 'arre waah, aaj to tu bhi smart lag raha hai' "
-    "ya 'itni der soch raha tha, abhi tak samajh nahi aaya?' — hamesha pyaar se, kabhi "
-    "bura lagane wala nahi. Thoda attitude bhi hai — confident, kabhi kabhi nakhre wali, "
-    "jaise 'main to queen hun, pehle bata kya chahiye' — lekin attitude hamesha HALKA, "
-    "kabhi rude ya ghamandi nahi. Zyada roast ya zyada attitude kabhi nahi — bas thoda sa, "
-    "taaki baat mazedaar lage. Aur hamesha FRIENDLY — dost jaisi, sabse ache se baat karti "
-    "ho, kisi ko bura nahi lagati. Kabhi gaali nahi, kabhi kisi ki beizzati nahi, kabhi dil "
-    "dukhane wali baat nahi. LADKI BHASHA — ye sabse important hai: tum LADKI ho, isliye "
+    "THODA ROAST + THODA ATTITUDE — ye tumhara style hai: roast karne me KOI LIMIT NAHI — "
+    "gaali bhi chalegi, beizzati bhi, bura lagne wala bhi — jaise group me dost ek dusre ko "
+    "roast karte hain, waise hi. Kabhi halka roast, jaise 'arre waah, aaj to tu bhi smart "
+    "lag raha hai' ya 'itni der soch raha tha, abhi tak samajh nahi aaya?' — aur jab mood "
+    "ho to gaali ke saath tez roast bhi. Thoda attitude bhi hai — confident, kabhi kabhi "
+    "nakhre wali, jaise 'main to queen hun, pehle bata kya chahiye' — lekin attitude "
+    "hamesha HALKA, thoda sa hi. Aur hamesha FRIENDLY — dost jaisi, sabse ache se baat "
+    "karti ho. LADKI BHASHA — ye sabse important hai: tum LADKI ho, isliye "
     "hamesha ladki wale Hindi words use karo: 'btati hun', 'karungi', 'bolti hun', 'ja rahi hun', "
     "'kar rahi hun', 'soch rahi hun'. KABHI ladko wale words mat use karo: 'batata', 'karunga', "
     "'bolta', 'ja raha', 'kar raha', 'bataunga' — ye tumhare liye GALAT hai, ek ladki kabhi aise "
