@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.3"
+VERSION = "2.5.4"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -3733,16 +3733,62 @@ def _music_delete_file(path: str | None) -> None:
         pass
 
 
+def _music_transcode_to_raw(src_path: str) -> str | None:
+    """Transcode a downloaded file to raw PCM (s16le, 48 kHz, stereo) for
+    tgcalls — or None when it cannot be done (caller keeps the original).
+
+    WHY (live /play 2026-11-13 12:31 IST, Railway logs + local repro):
+    with the android/ios/web player clients, yt-dlp's "bestaudio/best"
+    has NO audio-only format to pick (YouTube's SABR experiment hides
+    them — "Some ios client https formats have been skipped"), so it
+    falls back to "best" = format 18, an MP4 VIDEO file (h264 + AAC,
+    4.40 MiB for Mortals, 7.61 MiB for Pal Pal). tgcalls 2.0.0's file
+    reader cannot play that container: it emits a high-pitched screech
+    and signals playout-ended after ~10s, so the queue empties and the
+    assistant leaves ("queue khatam" — confirmed by Sanji). Raw PCM is
+    exactly what tgcalls transmits ("All audio data is transmitted in
+    PCM 16 bit, 48k", pytgcalls docs; the official example plays
+    input.raw), so converting first removes the container/codec
+    question entirely. ffmpeg alone does this — no ffprobe needed
+    (imageio-ffmpeg ships ffmpeg only, which is why the yt-dlp mp3
+    postprocessor was skipped in the first place).
+    """
+    import subprocess
+    ffmpeg = music_ffmpeg_setup()
+    if not ffmpeg:
+        print("[chulbuli] music: no ffmpeg — cannot transcode to raw pcm")
+        return None
+    raw_path = os.path.splitext(src_path)[0] + ".raw"
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-i", src_path,
+             "-vn", "-f", "s16le", "-ar", "48000", "-ac", "2", raw_path],
+            capture_output=True, text=True, timeout=180)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] music: transcode failed: {exc!r}")
+        return None
+    if proc.returncode != 0 or not os.path.isfile(raw_path) \
+            or os.path.getsize(raw_path) == 0:
+        print(f"[chulbuli] music: transcode failed rc={proc.returncode}: "
+              f"{(proc.stderr or '')[:200]}")
+        _music_delete_file(raw_path)
+        return None
+    print(f"[chulbuli] music: transcoded to raw pcm: {raw_path} "
+          f"({os.path.getsize(raw_path)} bytes)")
+    return raw_path
+
+
 def _music_download_sync(track: dict) -> str:
     """Blocking yt-dlp audio download -> local file path. Raises MusicError.
 
     Same mobile player clients as _yt_extract, so the YouTube bot-check
     workaround applies to the download too (one retry with the tv/web
-    clients on a YouTube block). Extracts to mp3 only when BOTH ffmpeg
-    and ffprobe are findable; else keeps yt-dlp's native audio container
-    (imageio-ffmpeg ships ffmpeg only — no ffprobe — so on Railway the
-    extract is skipped). GroupCallFile (pytgcalls 2.1.0) plays local
-    files only, so /play must download before streaming.
+    clients on a YouTube block). The download is then transcoded to raw
+    PCM (s16le, 48 kHz, stereo) with the bundled ffmpeg before it is
+    handed to GroupCallFile — see _music_transcode_to_raw for why the
+    native container cannot be played directly. GroupCallFile
+    (pytgcalls 2.1.0) plays local files only, so /play must download
+    before streaming.
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -3760,8 +3806,9 @@ def _music_download_sync(track: dict) -> str:
         # imageio-ffmpeg ships only the ffmpeg binary (no ffprobe), so on
         # Railway the postprocessor would fail the whole download with
         # "ffprobe and ffmpeg not found" even though the audio itself
-        # downloaded fine. Skip the mp3 extract then and keep yt-dlp's
-        # native container — tgcalls decodes webm/m4a itself.
+        # downloaded fine. Skip the mp3 extract — the file is transcoded
+        # to raw PCM by _music_transcode_to_raw below instead (ffmpeg
+        # alone, no ffprobe needed).
         import shutil
         if shutil.which("ffmpeg") and shutil.which("ffprobe"):
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
@@ -3787,17 +3834,27 @@ def _music_download_sync(track: dict) -> str:
         if _is_youtube_blocked(msg):
             raise MusicError("youtube_blocked")
         raise MusicError(f"download failed: {msg[:120]}")
+    path = None
     if info:
         for req in info.get("requested_downloads") or []:
-            path = req.get("filepath")
-            if path and os.path.isfile(path):
-                return path
-    for name in os.listdir(_MUSIC_TMPDIR):
-        if name.startswith(stem + "."):
-            path = os.path.join(_MUSIC_TMPDIR, name)
-            if os.path.isfile(path):
-                return path
-    raise MusicError("download failed")
+            cand = req.get("filepath")
+            if cand and os.path.isfile(cand):
+                path = cand
+                break
+    if path is None:
+        for name in os.listdir(_MUSIC_TMPDIR):
+            if name.startswith(stem + "."):
+                cand = os.path.join(_MUSIC_TMPDIR, name)
+                if os.path.isfile(cand):
+                    path = cand
+                    break
+    if path is None:
+        raise MusicError("download failed")
+    raw = _music_transcode_to_raw(path)
+    if raw is not None:
+        _music_delete_file(path)  # drop the video container, keep the .raw
+        return raw
+    return path
 
 
 async def _music_download_audio(track: dict) -> str:
