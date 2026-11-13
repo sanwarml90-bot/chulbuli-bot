@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.4"
+VERSION = "2.5.5"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -3513,7 +3513,8 @@ def music_state(chat_id: int) -> dict:
     st = MUSIC.get(chat_id)
     if st is None:
         st = {"queue": [], "current": None, "paused": False, "playing": False,
-              "in_call": False, "player_msg": None, "gc": None, "file": None}
+              "in_call": False, "player_msg": None, "gc": None, "file": None,
+              "autoplay": True}
         MUSIC[chat_id] = st
     return st
 
@@ -3548,7 +3549,144 @@ def music_queue_text(chat_id: int) -> str:
             lines.append(f"…aur {len(q) - 10} gaane")
     elif not cur:
         lines.append("queue khaali hai 🙂 /play <gaane ka naam> se bajao")
+    lines.append("🔁 autoplay ON hai" if st.get("autoplay", True)
+                 else "🔁 autoplay OFF hai (/autoplay se badlo)")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Playlists (v2.5.5) — har user ki apni playlist, data.json me saved.
+# ---------------------------------------------------------------------------
+# A playlist entry is a plain track dict (title/url/audio/duration/source)
+# — the same shape resolve_track returns, minus the per-play by/by_id.
+# Deliberately NOT in DEFAULT_USER: its dict() copy would share one list
+# object across every new user. user_playlist() hands each user their own
+# list instead (and repairs old/missing values the same way).
+PLAYLIST_MAX = 50
+PLAYLIST_BUTTONS_MAX = 10
+
+
+def user_playlist(uid: int) -> list:
+    """The user's own playlist list (fresh per user, persisted in data.json)."""
+    user = get_user(uid)
+    pl = user.get("playlist")
+    if not isinstance(pl, list):
+        pl = []
+        user["playlist"] = pl
+    return pl
+
+
+def playlist_add(uid: int, track: dict) -> str:
+    """Add a track to the user's playlist. 'added' | 'dup' | 'full'."""
+    pl = user_playlist(uid)
+    url = (track or {}).get("url") or ""
+    for item in pl:
+        if url and item.get("url") == url:
+            return "dup"
+    if len(pl) >= PLAYLIST_MAX:
+        return "full"
+    pl.append({k: (track or {}).get(k)
+               for k in ("title", "url", "audio", "duration", "source")})
+    save_data()
+    return "added"
+
+
+def playlist_remove(uid: int, index: int) -> str | None:
+    """Remove the 0-based entry; returns its title, or None when invalid."""
+    pl = user_playlist(uid)
+    if 0 <= index < len(pl):
+        title = (pl.pop(index) or {}).get("title") or "gaana"
+        save_data()
+        return title
+    return None
+
+
+def playlist_text(uid: int) -> str:
+    """Numbered playlist listing for /playlist."""
+    pl = user_playlist(uid)
+    if not pl:
+        return ("🎵 teri playlist khaali hai 🙂\n"
+                "player card pe **➕ Playlist me add karo** dabake gaane add kar")
+    lines = ["🎵 **Teri Playlist**"]
+    for i, item in enumerate(pl, 1):
+        lines.append(f"{i}. {item.get('title') or 'gaana'} "
+                     f"({fmt_duration(item.get('duration', 0))})")
+    lines.append("\ngaana bajane ke liye uske ▶️ dabao ya /playlist <number> likho 🙂")
+    return "\n".join(lines)
+
+
+def playlist_markup(uid: int):
+    """Play/remove buttons for the first songs + a clear-all button."""
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    pl = user_playlist(uid)
+    if not pl:
+        return None
+    rows = []
+    for i, item in enumerate(pl[:PLAYLIST_BUTTONS_MAX]):
+        title = (item.get("title") or "gaana")[:20]
+        rows.append([InlineKeyboardButton(f"▶️ {title}", callback_data=f"mus:plplay:{i}"),
+                     InlineKeyboardButton("❌", callback_data=f"mus:pldel:{i}")])
+    if len(pl) > PLAYLIST_BUTTONS_MAX:
+        rows.append([InlineKeyboardButton(
+            f"…aur {len(pl) - PLAYLIST_BUTTONS_MAX} gaane — /playlist <number> se bajao",
+            callback_data="mus:plnoop")])
+    rows.append([InlineKeyboardButton("🗑 Playlist saaf karo", callback_data="mus:plclear")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _music_autoplay_pick(chat_id: int) -> dict | None:
+    """Next autoplay track: the song AFTER the just-played one in the
+    playlist of the user who requested it (cycles back to the start).
+
+    No fake recommendations — autoplay only ever plays from a real
+    playlist the requester built. None when there is no requester or
+    their playlist is empty, so playback ends exactly like before.
+    """
+    st = music_state(chat_id)
+    cur = st.get("current") or {}
+    owner_id = cur.get("by_id") or 0
+    if not owner_id:
+        return None
+    pl = user_playlist(owner_id)
+    if not pl:
+        return None
+    cur_url = cur.get("url") or ""
+    start = 0
+    for i, item in enumerate(pl):
+        if cur_url and item.get("url") == cur_url:
+            start = i + 1
+            break
+    track = dict(pl[start % len(pl)])
+    track["by"] = cur.get("by", "")
+    track["by_id"] = owner_id
+    track["autoplay"] = True
+    return track
+
+
+async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
+    """Queue a resolved track and start playback if idle.
+
+    Shared by /play (fresh search) and /playlist (a saved track) so both
+    do the same voice/assistant checks and the same queue reply.
+    """
+    st = music_state(chat_id)
+    if not music_voice_available():
+        print(f"[chulbuli] /play voice unavailable: {voice_unavailable_reason()}")
+        await safe_reply(
+            message,
+            f"🎵 **{track['title']}** mil gaya! par voice assistant abhi connect nahi hai, "
+            "isliye baja nahi sakti 🙂 assistant aate hi /play se bajega",
+        )
+        return
+    if not await _music_ensure_assistant():
+        await safe_reply(message, "🎵 voice assistant start nahi ho paya — thodi der me /play dobara try karo 🙂")
+        return
+    pos = music_queue_add(chat_id, track)
+    if st.get("playing") and st.get("current"):
+        _sc_note = " (SoundCloud se 🙂 youtube block kar raha hai)" if track.get("source") == "soundcloud" else ""
+        await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}**{_sc_note} 🙂")
+        return
+    await _music_play_next(chat_id)
 
 
 def music_player_text(chat_id: int) -> str:
@@ -3559,7 +3697,8 @@ def music_player_text(chat_id: int) -> str:
     status = "⏸ pause hai" if st.get("paused") else "▶️ baj raha hai"
     nxt = st["queue"][0]["title"] if st.get("queue") else "—"
     src_note = " • SoundCloud se 🙂" if cur.get("source") == "soundcloud" else ""
-    return (f"🎵 **{cur['title']}**\n{status} • {fmt_duration(cur.get('duration', 0))}{src_note}"
+    auto_note = " • autoplay 🙂" if cur.get("autoplay") else ""
+    return (f"🎵 **{cur['title']}**\n{status} • {fmt_duration(cur.get('duration', 0))}{src_note}{auto_note}"
             f"\n👤 {cur.get('by', '')} ne bajaya\n⏭ agla: {nxt}")
 
 
@@ -3569,6 +3708,8 @@ def music_player_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("⏸ Pause", callback_data="mus:pause"),
         InlineKeyboardButton("▶️ Resume", callback_data="mus:resume"),
         InlineKeyboardButton("⏹ Stop", callback_data="mus:stop"),
+    ], [
+        InlineKeyboardButton("➕ Playlist me add karo", callback_data="mus:addpl"),
     ]])
 
 
@@ -4365,9 +4506,13 @@ async def _music_edit_player(chat_id: int, text: str | None = None) -> None:
 
 
 async def _music_play_next(chat_id: int) -> None:
-    """Play the next queued track; when the queue is empty, leave the call."""
+    """Play the next queued track; when the queue is empty, autoplay the
+    next song from the requester's playlist (when autoplay is ON for this
+    chat); when there is nothing to autoplay, leave the call."""
     st = music_state(chat_id)
     nxt = music_queue_next(chat_id)
+    if nxt is None and st.get("autoplay", True):
+        nxt = _music_autoplay_pick(chat_id)
     if nxt is None:
         st["current"] = None
         st["playing"] = False
@@ -4421,7 +4566,8 @@ async def cmd_music(client: Client, message: Message):
             ms = 0
         await safe_reply(message, f"🏓 pong! {max(ms, 0)}ms 🙂")
         return
-    if message.chat.type == ChatType.PRIVATE and cmd in ("play", "queue", "skip", "pause", "resume", "stop", "clear"):
+    if message.chat.type == ChatType.PRIVATE and cmd in ("play", "queue", "skip", "pause", "resume", "stop", "clear",
+                                                        "playlist", "autoplay"):
         await safe_reply(message, "🎵 music group voice chat me bajta hai — mujhe group me add karo 🙂")
         return
     st = music_state(message.chat.id)
@@ -4469,6 +4615,38 @@ async def cmd_music(client: Client, message: Message):
         await _music_leave(message.chat.id)
         await safe_reply(message, "⏹ music band kar diya 🙂")
         return
+    if cmd == "autoplay":
+        st["autoplay"] = not st.get("autoplay", True)
+        await safe_reply(
+            message,
+            "🔁 autoplay ON kar diya 🙂 queue khatam hote hi bajane wale ki playlist se agla gaana bajega"
+            if st["autoplay"]
+            else "🔁 autoplay OFF kar diya 🙂 queue khatam hote hi music band ho jayega")
+        return
+    if cmd == "playlist":
+        uid = message.from_user.id
+        args = message.command[1:] if len(message.command) > 1 else []
+        if args and args[0].lower() == "clear":
+            pl = user_playlist(uid)
+            n = len(pl)
+            pl.clear()
+            save_data()
+            await safe_reply(message, f"🗑 playlist saaf kar di — {n} gaane hataye 🙂")
+            return
+        if args and args[0].isdigit():
+            idx = int(args[0]) - 1
+            pl = user_playlist(uid)
+            if 0 <= idx < len(pl):
+                track = dict(pl[idx])
+                track["by"] = display_name(message.from_user)
+                track["by_id"] = uid
+                await _music_enqueue_track(message.chat.id, track, message)
+            else:
+                await safe_reply(message, "playlist me itna gaana nahi hai 🙂 /playlist se list dekho")
+            return
+        await safe_reply(message, playlist_text(uid),
+                         reply_markup=playlist_markup(uid))
+        return
     # /play
     query = " ".join(message.command[1:]) if len(message.command) > 1 else ""
     if not query:
@@ -4495,23 +4673,7 @@ async def cmd_music(client: Client, message: Message):
         return
     track["by"] = display_name(message.from_user)
     track["by_id"] = message.from_user.id
-    if not music_voice_available():
-        print(f"[chulbuli] /play voice unavailable: {voice_unavailable_reason()}")
-        await safe_reply(
-            message,
-            f"🎵 **{track['title']}** mil gaya! par voice assistant abhi connect nahi hai, "
-            "isliye baja nahi sakti 🙂 assistant aate hi /play se bajega",
-        )
-        return
-    if not await _music_ensure_assistant():
-        await safe_reply(message, "🎵 voice assistant start nahi ho paya — thodi der me /play dobara try karo 🙂")
-        return
-    pos = music_queue_add(message.chat.id, track)
-    if st.get("playing") and st.get("current"):
-        _sc_note = " (SoundCloud se 🙂 youtube block kar raha hai)" if track.get("source") == "soundcloud" else ""
-        await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}**{_sc_note} 🙂")
-        return
-    await _music_play_next(message.chat.id)
+    await _music_enqueue_track(message.chat.id, track, message)
 
 
 @app.on_callback_query(filters.regex(r"^mus:"))
@@ -4544,6 +4706,59 @@ async def music_callbacks(client: Client, query):
         st["paused"] = False
         await _music_leave(chat_id)
         await _music_edit_player(chat_id, "⏹ music band kar diya 🙂")
+    elif action == "addpl":
+        # Player card ka ➕ button: jo dabaye, uski playlist me ye gaana.
+        cur = st.get("current") or {}
+        uid = query.from_user.id if query.from_user else 0
+        if not cur.get("title") or not uid:
+            await safe_reply(query.message, "abhi kuch baj nahi raha 🙂")
+        else:
+            res = playlist_add(uid, cur)
+            if res == "added":
+                text = f"🎵 **{cur['title']}** teri playlist me add kar diya 🙂 /playlist se bajao"
+            elif res == "dup":
+                text = f"🎵 **{cur['title']}** pehle se teri playlist me hai 🙂"
+            else:
+                text = "🎵 teri playlist full hai (50 gaane) 🙂 pehle kuch hatao"
+            await safe_reply(query.message, text)
+    elif action.startswith("plplay:"):
+        # /playlist se gaana chunke bajao (jo dabaye, uski playlist se).
+        try:
+            idx = int(action.split(":", 1)[1])
+        except ValueError:
+            idx = -1
+        uid = query.from_user.id if query.from_user else 0
+        pl = user_playlist(uid) if uid else []
+        if 0 <= idx < len(pl):
+            track = dict(pl[idx])
+            track["by"] = display_name(query.from_user)
+            track["by_id"] = uid
+            await _music_enqueue_track(chat_id, track, query.message)
+    elif action.startswith("pldel:"):
+        try:
+            idx = int(action.split(":", 1)[1])
+        except ValueError:
+            idx = -1
+        uid = query.from_user.id if query.from_user else 0
+        title = playlist_remove(uid, idx) if uid else None
+        try:
+            await query.message.edit_text(
+                playlist_text(uid) if uid else "🎵 teri playlist khaali hai 🙂",
+                reply_markup=playlist_markup(uid) if uid else None)
+        except Exception:  # noqa: BLE001
+            pass
+    elif action == "plclear":
+        uid = query.from_user.id if query.from_user else 0
+        if uid:
+            user_playlist(uid).clear()
+            save_data()
+        try:
+            await query.message.edit_text(playlist_text(uid) if uid else "🎵 teri playlist khaali hai 🙂",
+                                          reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+    elif action == "plnoop":
+        pass
 
 
 # ---------------------------------------------------------------------------
