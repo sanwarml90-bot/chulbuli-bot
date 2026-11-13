@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.5.7"
+VERSION = "2.5.8"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -5055,8 +5055,12 @@ AI_SYSTEM = (
     "Hinglish, short one-line replies, sweet and relaxed — 'im good thanks just chillin', "
     "'hiee yaar, kya kar rahe ho', 'hehe acha', 'arre yaar, tum bhi na'. Use 'yaar' and "
     "'arre' naturally, be warm and playful, tease a little, never sound robotic, never lecture, "
-    "never give long explanations. Your replies are usually 1-2 lines, but a bit longer "
-    "(3-4 lines) is fine when the topic needs it — natural variation, not forced one-liners. "
+    "never give long explanations. LADKI BHASHA — ye sabse important hai: tum LADKI ho, isliye "
+    "hamesha ladki wale Hindi words use karo: 'btati hun', 'karungi', 'bolti hun', 'ja rahi hun', "
+    "'kar rahi hun', 'soch rahi hun'. KABHI ladko wale words mat use karo: 'batata', 'karunga', "
+    "'bolta', 'ja raha', 'kar raha', 'bataunga' — ye tumhare liye GALAT hai, ek ladki kabhi aise "
+    "nahi bolti. JAWAB HAMESHA CHHOTA rakho — 1-2 lines, zyada se zyada 25-30 words. Lamba jawab "
+    "kabhi mat do, chahe topic kuch bhi ho — real ladkiyaan chat me essay nahi likhti. "
     "EMOJIS ARE RARE: like a real person, most of your messages have NO emoji at all. An "
     "occasional single emoji only when it really fits. NEVER put an emoji in every message — "
     "that is the biggest giveaway that you are not a real girl. "
@@ -5111,7 +5115,7 @@ def _ai_post(model: str, messages: list) -> str | None:
     body = json.dumps({
         "model": model,
         "messages": messages,
-        "max_tokens": 800,
+        "max_tokens": 250,
         "temperature": 0.7,
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -5141,6 +5145,9 @@ def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
     Rejects: empty/too-short, persona breaks ("as an AI", "main AI"),
     the confused-rambling pattern Sanji saw live ("I'm getting
     confused", "what were we talking about", "Mmm, okay" starts),
+    MASCULINE self-forms (v2.5.8: Chulbuli is a girl — "batata/karunga/
+    ja raha hun" is a boy talking; she says "btati/karungi/ja rahi hun"),
+    replies longer than 400 chars (v2.5.8: Sanji — "reply bahut long hai"),
     echoing the user's own message back (verbatim or "Name: <user text>"),
     and a reply that is one line repeated over and over. A rejected
     reply falls through to the next model (or the rule-based fallback),
@@ -5151,7 +5158,12 @@ def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
     text = out.strip()
     if len(text) < 5:
         return False
+    if len(text) > 400:
+        return False
     low = text.lower()
+    if any(p in low for p in ("raha hun", "raha hoon", "karunga", "batata hun",
+                              "bolta hun", "karta hun", "bataunga", "jaunga")):
+        return False
     if any(p in low for p in ("as an ai", "i am an ai", "i'm an ai", "i am a language model",
                               "main ai hun", "main ek ai", "i am an ai language")):
         return False
@@ -5299,8 +5311,10 @@ _BACKGROUND_STARTED = False
 
 
 def typing_delay(text: str) -> float:
-    """Natural typing pause for a reply: ~1-3 s, longer for longer replies."""
-    return min(3.0, max(1.0, len(text or "") * 0.04))
+    """Natural typing pause for a reply: a real girl typing on her phone —
+    ~2 s minimum, longer for longer replies, capped at 6 s. (v2.5.8:
+    Sanji — replies felt instant/robotic at the old 1-3 s cap.)"""
+    return min(6.0, max(2.0, len(text or "") * 0.06))
 
 
 async def _send_typing(client, chat_id: int) -> None:
@@ -7515,7 +7529,7 @@ async def cmd_myrole(client: Client, message: Message):
     if user is None or is_banned(message.from_user.id):
         return
     if message.chat.type != ChatType.PRIVATE:
-        await safe_reply(message, "Apna role DM me /myrole se dekho — group me role nahi batata 🙂")
+        await safe_reply(message, "Apna role DM me /myrole se dekho — group me role nahi btati 🙂")
         return
     for state in MAFIA.values():
         if message.from_user.id in state.get("players", []) and state.get("started"):
@@ -9750,7 +9764,7 @@ async def handle_owner_pending(message: Message) -> bool:
         return True
     if pending == "broadcast":
         OWNER_PENDING.pop(OWNER_ID, None)
-        await safe_reply(message, "📢 Broadcast bhej raha hun…")
+        await safe_reply(message, "📢 Broadcast bhej rahi hun…")
         u_ok, u_fail, g_ok, g_fail = await do_broadcast(text)
         await safe_reply(message, f"📢 Broadcast ho gaya!\n👥 Users: {u_ok} ok, {u_fail} fail\n👥 Groups: {g_ok} ok, {g_fail} fail")
         return True
@@ -9956,6 +9970,10 @@ async def group_text_handler(client: Client, message: Message):
         # 2026-11-12: bot needs admin in the group to hear its name).
         print(f"[chulbuli] name-call in {message.chat.id} from {message.from_user.id}")
         # v2.3.0 — chat reply like a real person: typing, pause, quote, react
+        # v2.5.8: show typing WHILE the AI thinks, not just after — the old
+        # flow stayed silent during the (slow) AI call, then answered in
+        # ~1 s, which felt instant/robotic.
+        await _send_typing(client, message.chat.id)
         try:
             reply = await chat_reply_ai(text, display_name(message.from_user),
                                         message.chat.id, message.from_user.id)
@@ -9983,6 +10001,8 @@ async def private_text_handler(client: Client, message: Message):
     if not chat_on():
         return
     # v2.3.0 — chat reply like a real person: typing, pause, quote, react
+    # v2.5.8: show typing WHILE the AI thinks (see the group handler).
+    await _send_typing(client, message.chat.id)
     try:
         reply = await chat_reply_ai(text, display_name(message.from_user),
                                     message.chat.id, message.from_user.id)
