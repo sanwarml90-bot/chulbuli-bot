@@ -88,7 +88,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.16"
+VERSION = "2.6.18"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -840,7 +840,7 @@ START_TEXT = """hiee {name} 💕 main Chulbuli hun — games, masti aur economy,
 💰 Economy: /bal /daily /give /deposit /withdraw /toprich
 ⚔️ Actions: /rob /kill /protect /shield /revive
 ✨ Powers: /powers /act /mypowers
-🎵 Music: /play /queue /skip /pause /resume /stop
+🎵 Music: /play /queue /skip /pause /resume /stop /playlist /autoplay
 🎮 Games: /wordguess /wordgrid /wordchain /rps /cricket /math /bbet /card /number /uno /chess /mines /tap /crash /jumble /charades /bingo /xoxo /mafia /hack /bomb /roulette /bluff /subway /scribble
 💬 Mujhse baat karo — main hamesha reply dungi!
 💞 Romance: /propose /marry /ship /divorce
@@ -907,6 +907,9 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 /skip /pause /resume /stop — player controls
 /clear — queue clear karo
 /ping — bot ki speed check karo
+/playlist — teri playlist dikhao, koi bhi gaana chunke bajao
+/playlist <number> — playlist ka gaana bajao
+/autoplay — autoplay ON/OFF (queue khatam hote hi playlist se agla gaana)
 
 **💬 Mujhse baat karo**
 Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
@@ -1817,7 +1820,9 @@ async def cmd_extend(client: Client, message: Message):
 
 # ---------------------------------------------------------------------------
 # Word Guess — EXACTLY per approved spec (word-guess-spec.md)
-# /wordguess (/wg) group-only. Reply to the board message to guess.
+# /wordguess (/wg) group-only. WordSeek-style (v2.6.17): just type the
+# 4-letter word directly in the group — no reply needed. Replying to the
+# board message still works too.
 # 6 guesses/round, winner +500 coins, NEW message per guess (spam is fine),
 # 🟩 right place / 🟦 in word wrong place / ⬜ not in word.
 # ---------------------------------------------------------------------------
@@ -1857,7 +1862,7 @@ async def cmd_wordguess(client: Client, message: Message):
     msg = await safe_reply(
         message,
         "🔤 **WORD GUESS** — 4-letter word guess karo!\n"
-        "Board message pe **reply** karke apna guess bhejo.\n"
+        "Seedha group me **4-letter word likho** — reply ki zarurat nahi 🙂\n"
         "🟩 = sahi jagah | 🟦 = word me hai, galat jagah | ⬜ = word me nahi\n"
         "6 guesses, jeetne wale ko **+500 coins**! Round 0/6",
         reply_markup=InlineKeyboardMarkup([[
@@ -1873,13 +1878,18 @@ async def handle_wordguess_reply(message: Message) -> bool:
     state = game_state(message.chat.id)
     if not state or state.get("kind") != "wordguess":
         return False
-    reply = message.reply_to_message
-    if not reply or reply.id != state.get("board_msg_id"):
-        return False
     text = (message.text or "").strip().lower()
-    if not re.fullmatch(r"[a-z]{4}", text):
-        await safe_reply(message, "4-letter word bhejo 🙂")
-        return True
+    reply = message.reply_to_message
+    is_board_reply = bool(reply and reply.id == state.get("board_msg_id"))
+    if is_board_reply:
+        if not re.fullmatch(r"[a-z]{4}", text):
+            await safe_reply(message, "4-letter word bhejo 🙂")
+            return True
+    else:
+        # WordSeek-style direct typing (v2.6.17): only an exact 4-letter
+        # word counts as a guess — anything else flows on to normal chat.
+        if not re.fullmatch(r"[a-z]{4}", text):
+            return False
     state["last_active"] = time.time()
     state["guesses"] += 1
     secret = state["secret"]
@@ -1904,7 +1914,7 @@ async def handle_wordguess_reply(message: Message) -> bool:
     else:
         msg = await safe_reply(
             message,
-            f"{board}\n\n*{display_name(message.from_user)}* ka guess — {6 - state['guesses']} guesses baaki! Board pe reply karke guess karo 🙂",
+            f"{board}\n\n*{display_name(message.from_user)}* ka guess — {6 - state['guesses']} guesses baaki! Seedha 4-letter word likho 🙂",
         )
         if msg is not None:
             state["board_msg_id"] = msg.id
@@ -3905,7 +3915,7 @@ def music_state(chat_id: int) -> dict:
     if st is None:
         st = {"queue": [], "current": None, "paused": False, "playing": False,
               "in_call": False, "player_msg": None, "gc": None, "file": None,
-              "autoplay": True}
+              "autoplay": True, "search_msg": None}
         MUSIC[chat_id] = st
     return st
 
@@ -3954,7 +3964,11 @@ def music_queue_text(chat_id: int) -> str:
 # object across every new user. user_playlist() hands each user their own
 # list instead (and repairs old/missing values the same way).
 PLAYLIST_MAX = 50
-PLAYLIST_BUTTONS_MAX = 10
+# v2.6.18 (Sanji): /playlist me SAARE gaane ▶️ button se bajne chahiye —
+# isliye har gaana ek hi button hai (per-song ❌ hataya: Telegram ki
+# 100-button limit — 50 gaane x 2 buttons + clear = 101 hota). Delete ke
+# liye 🗑 saaf-karo button hai.
+PLAYLIST_BUTTONS_MAX = PLAYLIST_MAX
 
 
 def user_playlist(uid: int) -> list:
@@ -3982,16 +3996,6 @@ def playlist_add(uid: int, track: dict) -> str:
     return "added"
 
 
-def playlist_remove(uid: int, index: int) -> str | None:
-    """Remove the 0-based entry; returns its title, or None when invalid."""
-    pl = user_playlist(uid)
-    if 0 <= index < len(pl):
-        title = (pl.pop(index) or {}).get("title") or "gaana"
-        save_data()
-        return title
-    return None
-
-
 def playlist_text(uid: int) -> str:
     """Numbered playlist listing for /playlist."""
     pl = user_playlist(uid)
@@ -4007,20 +4011,15 @@ def playlist_text(uid: int) -> str:
 
 
 def playlist_markup(uid: int):
-    """Play/remove buttons for the first songs + a clear-all button."""
+    """Play buttons for EVERY song + a clear-all button (v2.6.18)."""
     from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     pl = user_playlist(uid)
     if not pl:
         return None
     rows = []
     for i, item in enumerate(pl[:PLAYLIST_BUTTONS_MAX]):
-        title = (item.get("title") or "gaana")[:20]
-        rows.append([InlineKeyboardButton(f"▶️ {title}", callback_data=f"mus:plplay:{i}"),
-                     InlineKeyboardButton("❌", callback_data=f"mus:pldel:{i}")])
-    if len(pl) > PLAYLIST_BUTTONS_MAX:
-        rows.append([InlineKeyboardButton(
-            f"…aur {len(pl) - PLAYLIST_BUTTONS_MAX} gaane — /playlist <number> se bajao",
-            callback_data="mus:plnoop")])
+        title = (item.get("title") or "gaana")[:30]
+        rows.append([InlineKeyboardButton(f"▶️ {title}", callback_data=f"mus:plplay:{i}")])
     rows.append([InlineKeyboardButton("🗑 Playlist saaf karo", callback_data="mus:plclear")])
     return InlineKeyboardMarkup(rows)
 
@@ -4063,6 +4062,7 @@ async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
     st = music_state(chat_id)
     if not music_voice_available():
         print(f"[chulbuli] /play voice unavailable: {voice_unavailable_reason()}")
+        await _music_clear_search_msg(chat_id)
         await safe_reply(
             message,
             f"🎵 **{track['title']}** mil gaya! par voice assistant abhi connect nahi hai, "
@@ -4070,11 +4070,13 @@ async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
         )
         return
     if not await _music_ensure_assistant():
+        await _music_clear_search_msg(chat_id)
         await safe_reply(message, "🎵 voice assistant start nahi ho paya — thodi der me /play dobara try karo 🙂")
         return
     pos = music_queue_add(chat_id, track)
     if st.get("playing") and st.get("current"):
         _sc_note = " (SoundCloud se 🙂 youtube block kar raha hai)" if track.get("source") == "soundcloud" else ""
+        await _music_clear_search_msg(chat_id)
         await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}**{_sc_note} 🙂")
         return
     await _music_play_next(chat_id)
@@ -4089,11 +4091,19 @@ def music_player_text(chat_id: int) -> str:
     nxt = st["queue"][0]["title"] if st.get("queue") else "—"
     src_note = " • SoundCloud se 🙂" if cur.get("source") == "soundcloud" else ""
     auto_note = " • autoplay 🙂" if cur.get("autoplay") else ""
+    auto_state = "🔁 autoplay ON hai" if st.get("autoplay", True) else "🔁 autoplay OFF hai"
     return (f"🎵 **{cur['title']}**\n{status} • {fmt_duration(cur.get('duration', 0))}{src_note}{auto_note}"
-            f"\n👤 {cur.get('by', '')} ne bajaya\n⏭ agla: {nxt}")
+            f"\n👤 {cur.get('by', '')} ne bajaya\n⏭ agla: {nxt}\n{auto_state}")
 
 
-def music_player_markup() -> InlineKeyboardMarkup:
+def music_player_markup(chat_id=None) -> InlineKeyboardMarkup:
+    """Player card buttons + the autoplay toggle (v2.6.18).
+
+    chat_id=None keeps the old no-arg calls working (autoplay shown ON,
+    the default) — the live card always passes the chat id so the button
+    shows the real state.
+    """
+    auto_on = True if chat_id is None else music_state(chat_id).get("autoplay", True)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⏭ Skip", callback_data="mus:skip"),
         InlineKeyboardButton("⏸ Pause", callback_data="mus:pause"),
@@ -4101,6 +4111,9 @@ def music_player_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("⏹ Stop", callback_data="mus:stop"),
     ], [
         InlineKeyboardButton("➕ Playlist me add karo", callback_data="mus:addpl"),
+    ], [
+        InlineKeyboardButton("🔁 Autoplay: ON" if auto_on else "🔁 Autoplay: OFF",
+                             callback_data="mus:autoplay"),
     ]])
 
 
@@ -4973,11 +4986,30 @@ async def _music_leave(chat_id: int) -> None:
     st["file"] = None
 
 
+# /play "searching…" status (v2.6.18) — /play ke turant baad user ko ye
+# reply milta hai, taaki search/download ke dauraan silence na lage.
+# Outcome aate hi status delete ho jata hai (player card aaye to
+# _music_send_player se, baaki outcomes se _music_enqueue_track /
+# cmd_music se), isliye chat me sirf final reply rehta hai.
+async def _music_clear_search_msg(chat_id: int) -> None:
+    """Delete the /play 'searching…' status message, if one is showing."""
+    st = music_state(chat_id)
+    sm = st.pop("search_msg", None)
+    if not sm:
+        return
+    try:
+        await app.delete_messages(sm[0], [sm[1]])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _music_send_player(chat_id: int) -> None:
+    # Player card hi outcome hai — status ka kaam khatam, use hatao.
+    await _music_clear_search_msg(chat_id)
     st = music_state(chat_id)
     try:
         msg = await app.send_message(chat_id, music_player_text(chat_id),
-                                     reply_markup=music_player_markup())
+                                     reply_markup=music_player_markup(chat_id))
         st["player_msg"] = (chat_id, msg.id)
     except Exception:  # noqa: BLE001
         st["player_msg"] = None
@@ -4990,7 +5022,7 @@ async def _music_edit_player(chat_id: int, text: str | None = None) -> None:
         return
     try:
         await app.edit_message_text(pm[0], pm[1], text or music_player_text(chat_id),
-                                    reply_markup=music_player_markup())
+                                    reply_markup=music_player_markup(chat_id))
     except Exception:  # noqa: BLE001
         pass
 
@@ -5041,6 +5073,7 @@ async def _music_play_next(chat_id: int) -> None:
         text = ("🎵 youtube ne block kar diya (bot-check) — ye gaana baj nahi paya 🙂"
                 if reason == "youtube_blocked"
                 else f"🎵 ye gaana baj nahi paya: {reason} 🙂")
+        await _music_clear_search_msg(chat_id)
         try:
             await app.send_message(chat_id, text)
         except Exception:  # noqa: BLE001
@@ -5050,7 +5083,8 @@ async def _music_play_next(chat_id: int) -> None:
     await _music_send_mp3(chat_id, nxt, music_state(chat_id).get("file"))
 
 
-@app.on_message(filters.command(["play", "queue", "skip", "pause", "resume", "stop", "clear", "ping", "end"]))
+@app.on_message(filters.command(["play", "queue", "skip", "pause", "resume", "stop", "clear", "ping", "end",
+                                   "playlist", "autoplay"]))
 async def cmd_music(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -5164,10 +5198,21 @@ async def cmd_music(client: Client, message: Message):
     if _yt_dlp is None:
         await safe_reply(message, "🎵 music search abhi available nahi hai — thodi der me try karo 🙂")
         return
+    # v2.6.18 — /play ke turant baad "searching… downloading" reply, taaki
+    # user ko pata chale kaam chal raha hai (pehle search/download ke
+    # dauraan koi reply nahi aata tha). Outcome aate hi ye status delete
+    # ho jata hai — player card aaye to _music_send_player se, baaki
+    # outcomes se neeche / _music_enqueue_track se.
+    await _music_clear_search_msg(message.chat.id)
+    _status = await safe_reply(
+        message, f"🔎 **{query[:60]}** search kar rahi hu… download ho raha hai 🙂")
+    if _status is not None:
+        st["search_msg"] = (message.chat.id, _status.id)
     try:
         track = resolve_track(query)
     except MusicError as exc:
         reason = str(exc)
+        await _music_clear_search_msg(message.chat.id)
         if reason == "youtube_blocked":
             await safe_reply(
                 message,
@@ -5178,6 +5223,7 @@ async def cmd_music(client: Client, message: Message):
         return
     except Exception as exc:  # noqa: BLE001 - /play must NEVER go silent
         print(f"[chulbuli] /play resolve failed: {exc!r}")
+        await _music_clear_search_msg(message.chat.id)
         await safe_reply(message, "🎵 gaana dhundhte waqt error aaya — thodi der me dobara try karo 🙂")
         return
     track["by"] = display_name(message.from_user)
@@ -5215,6 +5261,13 @@ async def music_callbacks(client: Client, query):
         st["paused"] = False
         await _music_leave(chat_id)
         await _music_edit_player(chat_id, "⏹ music band kar diya 🙂")
+    elif action == "autoplay":
+        # Player card ka 🔁 button: is chat ka autoplay ON/OFF karo aur
+        # card ko nayi state ke saath refresh karo (v2.6.18). ON hote hi
+        # queue khatam hone par bajane wale ki playlist se agla gaana
+        # apne aap bajega; OFF hote hi queue khatam hote hi music band.
+        st["autoplay"] = not st.get("autoplay", True)
+        await _music_edit_player(chat_id)
     elif action == "addpl":
         # Player card ka ➕ button: jo dabaye, uski playlist me ye gaana.
         cur = st.get("current") or {}
@@ -5243,19 +5296,6 @@ async def music_callbacks(client: Client, query):
             track["by"] = display_name(query.from_user)
             track["by_id"] = uid
             await _music_enqueue_track(chat_id, track, query.message)
-    elif action.startswith("pldel:"):
-        try:
-            idx = int(action.split(":", 1)[1])
-        except ValueError:
-            idx = -1
-        uid = query.from_user.id if query.from_user else 0
-        title = playlist_remove(uid, idx) if uid else None
-        try:
-            await query.message.edit_text(
-                playlist_text(uid) if uid else "🎵 teri playlist khaali hai 🙂",
-                reply_markup=playlist_markup(uid) if uid else None)
-        except Exception:  # noqa: BLE001
-            pass
     elif action == "plclear":
         uid = query.from_user.id if query.from_user else 0
         if uid:
@@ -5266,8 +5306,6 @@ async def music_callbacks(client: Client, query):
                                           reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
-    elif action == "plnoop":
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -10021,7 +10059,7 @@ async def cmd_guide(client: Client, message: Message):
     await safe_reply(message, "📖 **Chulbuli Guide**\n\n"
                      "💰 Paise: /bal se balance, /daily se roz coins, /give se dost ko do\n"
                      "🎮 Games: group me /wordguess, /uno, /chess, /mafia, /cricket khelo\n"
-                     "🎵 Music: /play <gaane ka naam> — voice chat me bajega\n"
+                     "🎵 Music: /play <gaane ka naam> — voice chat me bajega, /playlist se apne gaane bajao\n"
                      "💞 Romance: kisi ke message pe reply karke /propose karo\n"
                      "🛡️ Mods: admins /warn, /mute, /ban, /pin use kar sakte hain\n"
                      "💬 Baat: mujhe tag karo ya 'chulbuli' likho — main jawab dungi!\n"
