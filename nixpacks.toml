@@ -1,7 +1,11 @@
 # v2.6.27: the YouTube JS-challenge solver needs a JS runtime.
 # yt-dlp's remote_components ejs:github (see bot.py) runs with Deno by
-# default (yt-dlp's js_runtimes default is {"deno": {}}). This adds Deno
-# to the Nixpacks setup phase; the Python provider (python 3.9 via
-# NIXPACKS_PYTHON_VERSION) still runs as before.
+# default (yt-dlp's js_runtimes default is {"deno": {}}).
+# WARNING (learned 2026-11-15, build d47693b2): a [phases.setup] in this
+# file REPLACES the Python provider's setup phase — it does NOT append
+# to it. Listing only "deno" removed Python entirely and the build died
+# with "python: command not found". So Python 3.9 (the version the
+# service runs — NIXPACKS_PYTHON_VERSION=3.9, for pytgcalls voice) must
+# be listed here too, exactly as the provider would install it.
 [phases.setup]
-nixPkgs = ["deno"]
+nixPkgs = ["python39", "deno"]
