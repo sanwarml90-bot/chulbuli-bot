@@ -33,6 +33,7 @@ OWNER_ID (default 7966027018 = Sanji). No secrets are hardcoded or logged.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import math
 import os
@@ -48,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from pyrogram import Client, filters, raw, utils
-from pyrogram.enums import ChatAction, ChatMemberStatus, ChatType
+from pyrogram.enums import ChatAction, ChatMemberStatus, ChatMembersFilter, ChatType
 from pyrogram.errors import FloodWait, UserAlreadyParticipant
 from pyrogram.types import (
     ChatPermissions,
@@ -88,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.18"
+VERSION = "2.6.19"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -953,7 +954,90 @@ Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
 +hug +kiss +pat +slap +bite +punch +murder — reply karke"""
 
 
+# ---------------------------------------------------------------------------
+# v2.6.19 — command error visibility (Sanji: "har command ka error pta
+# chale"). Every command handler is wrapped with @guarded (applied under the
+# decorators — functools.wraps keeps the real function name, so dispatch +
+# logs stay readable). An exception that escapes a handler is RECORDED
+# (command, user, chat, error, time), the OWNER gets a DM about it
+# (throttled: 1 DM per command per 2 min, so a broken command cannot spam
+# him), the user gets one friendly line (never a traceback), and the Owner
+# Panel shows the latest error + a full list screen (own:cmderrors).
+# Handlers that already catch their own errors keep working — the wrapper
+# only fires for errors that would otherwise vanish into Railway logs.
+# NOTE: @guarded sits BELOW @app.on_message(...) — the decorator above it
+# registers the WRAPPED function; the other way round it would never run.
+# ---------------------------------------------------------------------------
+_CMD_ERRORS: list = []          # newest last; at most _CMD_ERRORS_MAX entries
+_CMD_ERRORS_MAX = 12
+_CMD_ERR_DM_AT: dict = {}       # command -> last owner-DM epoch
+_CMD_ERR_DM_SECS = 120
+
+
+def _cmd_error_text(e: dict) -> str:
+    ts = time.strftime("%H:%M", time.localtime(e["ts"]))
+    return f"/{e['cmd']} • {ts} • {e['err']}"
+
+
+def record_command_error(cmd: str, exc: BaseException, message=None) -> dict:
+    """Record a command failure for the owner panel + owner DM."""
+    entry = {
+        "cmd": (cmd or "?").lstrip("/"),
+        "err": f"{type(exc).__name__}: {exc}"[:200],
+        "ts": int(time.time()),
+        "uid": (message.from_user.id if message is not None and getattr(message, "from_user", None) else None),
+        "cid": (message.chat.id if message is not None and getattr(message, "chat", None) else None),
+    }
+    _CMD_ERRORS.append(entry)
+    del _CMD_ERRORS[:-_CMD_ERRORS_MAX]
+    print(f"[chulbuli] command error (/{entry['cmd']}): {entry['err']}")
+    return entry
+
+
+async def _notify_command_error(entry: dict) -> None:
+    """DM the owner about a command error (throttled per command)."""
+    cmd = entry["cmd"]
+    now = time.time()
+    if now - _CMD_ERR_DM_AT.get(cmd, 0) < _CMD_ERR_DM_SECS:
+        return
+    _CMD_ERR_DM_AT[cmd] = now
+    try:
+        await app.send_message(
+            OWNER_ID,
+            f"⚠️ Command error: /{cmd}\n{entry['err']}\n"
+            f"Chat: {entry['cid']} • User: {entry['uid']}",
+        )
+    except Exception:  # noqa: BLE001 - the owner DM must never break the handler
+        pass
+
+
+def guarded(fn):
+    """Wrap a command handler so its errors become visible, not silent."""
+    @functools.wraps(fn)
+    async def wrapper(client, message):
+        try:
+            return await fn(client, message)
+        except Exception as exc:  # noqa: BLE001 - chat must never go silent
+            cmd = ""
+            try:
+                cmd = (message.command or [""])[0]
+            except Exception:
+                cmd = ""
+            if not cmd:
+                cmd = getattr(fn, "__name__", "?").removeprefix("cmd_")
+            entry = record_command_error(cmd, exc, message)
+            if not isinstance(exc, FloodWait):
+                await _notify_command_error(entry)
+            try:
+                await safe_reply(message, f"arey, /{cmd} me kuch gadbad ho gayi — owner ko bata diya 🙂")
+            except Exception:
+                pass
+            return None
+    return wrapper
+
+
 @app.on_message(filters.command(["start", "help"]))
+@guarded
 async def cmd_start_help(client: Client, message: Message):
     user = track_user(message)
     if user is None:
@@ -1099,6 +1183,7 @@ async def menu_callbacks(client: Client, query):
 
 
 @app.on_message(filters.command(["games"]))
+@guarded
 async def cmd_games(client: Client, message: Message):
     """v2.4.0 — open the Mini App game hub."""
     user = track_user(message)
@@ -1175,6 +1260,7 @@ async def web_app_data_handler(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["yaad"]))
+@guarded
 async def cmd_yaad(client: Client, message: Message):
     """Show what Chulbuli remembers about this user (DM or group, per-user)."""
     user = track_user(message)
@@ -1196,6 +1282,7 @@ async def cmd_yaad(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["bhool"]))
+@guarded
 async def cmd_bhool(client: Client, message: Message):
     """Forget this user's facts (coins/economy untouched)."""
     user = track_user(message)
@@ -1209,6 +1296,7 @@ async def cmd_bhool(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["id"]))
+@guarded
 async def cmd_id(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1221,6 +1309,7 @@ async def cmd_id(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["info"]))
+@guarded
 async def cmd_info(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1237,6 +1326,7 @@ async def cmd_info(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["calc"]))
+@guarded
 async def cmd_calc(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1269,6 +1359,7 @@ def balance_text(user: dict, uid: int, name: str) -> str:
 
 
 @app.on_message(filters.command(["bal", "balance", "acc"]))
+@guarded
 async def cmd_bal(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1281,6 +1372,7 @@ async def cmd_bal(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["pfp"]))
+@guarded
 async def cmd_pfp(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1302,6 +1394,7 @@ async def cmd_pfp(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["daily"]))
+@guarded
 async def cmd_daily(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1328,6 +1421,7 @@ async def cmd_daily(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["give", "send"]))
+@guarded
 async def cmd_give(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1355,6 +1449,7 @@ async def cmd_give(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["deposit"]))
+@guarded
 async def cmd_deposit(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1376,6 +1471,7 @@ async def cmd_deposit(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["withdraw"]))
+@guarded
 async def cmd_withdraw(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1416,6 +1512,7 @@ def toprich_text() -> str:
 
 
 @app.on_message(filters.command(["toprich", "leaderboard"]))
+@guarded
 async def cmd_toprich(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1430,6 +1527,7 @@ async def cmd_toprich(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["rank"]))
+@guarded
 async def cmd_rank(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1445,6 +1543,7 @@ async def cmd_rank(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["toprank"]))
+@guarded
 async def cmd_toprank(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1464,6 +1563,7 @@ async def cmd_toprank(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["mystats"]))
+@guarded
 async def cmd_mystats(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1491,6 +1591,7 @@ def _group_msg_rank(chat_id: int, uid: int) -> int:
 
 
 @app.on_message(filters.command(["gems"]))
+@guarded
 async def cmd_gems(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1507,6 +1608,7 @@ async def cmd_gems(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["convert"]))
+@guarded
 async def cmd_convert(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1535,6 +1637,7 @@ def _shielded(user: dict) -> bool:
 
 
 @app.on_message(filters.command(["rob", "steal", "atk"]))
+@guarded
 async def cmd_rob(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1593,6 +1696,7 @@ async def cmd_rob(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["kill"]))
+@guarded
 async def cmd_kill(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1636,6 +1740,7 @@ async def cmd_kill(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["protect"]))
+@guarded
 async def cmd_protect(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1653,6 +1758,7 @@ async def cmd_protect(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["shield", "protection"]))
+@guarded
 async def cmd_shield(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1667,6 +1773,7 @@ async def cmd_shield(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["revive"]))
+@guarded
 async def cmd_revive(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -1694,6 +1801,7 @@ async def cmd_revive(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["topkill"]))
+@guarded
 async def cmd_topkill(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1706,6 +1814,7 @@ async def cmd_topkill(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["toprob"]))
+@guarded
 async def cmd_toprob(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1721,6 +1830,7 @@ async def cmd_toprob(client: Client, message: Message):
 # Powers
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["powers"]))
+@guarded
 async def cmd_powers(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1733,6 +1843,7 @@ async def cmd_powers(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["pinfo"]))
+@guarded
 async def cmd_pinfo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1746,6 +1857,7 @@ async def cmd_pinfo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["act", "activate"]))
+@guarded
 async def cmd_act(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1777,6 +1889,7 @@ async def cmd_act(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["mypowers", "mp"]))
+@guarded
 async def cmd_mypowers(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1793,11 +1906,13 @@ async def cmd_mypowers(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["ph"]))
+@guarded
 async def cmd_ph(client: Client, message: Message):
     await cmd_powers(client, message)
 
 
 @app.on_message(filters.command(["extend"]))
+@guarded
 async def cmd_extend(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -1848,6 +1963,7 @@ async def _wg_timeout(chat_id: int, round_id: int):
 
 
 @app.on_message(filters.command(["wordguess", "wg"]))
+@guarded
 async def cmd_wordguess(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -1929,6 +2045,7 @@ GRID_WORDS = ["ship", "candy", "throw", "knows", "praise", "window", "retired", 
 
 
 @app.on_message(filters.command(["wordgrid", "grid", "new"]))
+@guarded
 async def cmd_wordgrid(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -1953,6 +2070,7 @@ async def cmd_wordgrid(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["guess"]))
+@guarded
 async def cmd_guess(client: Client, message: Message):
     if not games_on():
         return
@@ -1984,6 +2102,7 @@ async def cmd_guess(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["hint"]))
+@guarded
 async def cmd_hint(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2003,6 +2122,7 @@ async def cmd_hint(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["gend"]))
+@guarded
 async def cmd_gend(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2022,6 +2142,7 @@ async def cmd_gend(client: Client, message: Message):
 # Wordchain — one implementation (On9 + Mimi + Nova merged)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["wordchain", "wc"]))
+@guarded
 async def cmd_wordchain(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -2138,6 +2259,7 @@ async def do_join(chat_id: int, uid: int, name: str) -> str | None:
 
 
 @app.on_message(filters.command(["join"]))
+@guarded
 async def cmd_join_generic(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2186,6 +2308,7 @@ async def join_callbacks(client: Client, query):
 
 
 @app.on_message(filters.command(["forcestart"]))
+@guarded
 async def cmd_forcestart(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2288,6 +2411,7 @@ async def handle_wordchain_word(message: Message) -> bool:
 # RPS — one implementation (Daizy + Nova merged)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["rps"]))
+@guarded
 async def cmd_rps(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -2324,6 +2448,7 @@ async def cmd_rps(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["joinrps"]))
+@guarded
 async def cmd_joinrps(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2419,6 +2544,7 @@ def rps_throw_keyboard() -> InlineKeyboardMarkup:
 
 
 @app.on_message(filters.command(["throw"]))
+@guarded
 async def cmd_throw(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2469,6 +2595,7 @@ async def rps_callbacks(client: Client, query):
 # Cricket — hand cricket (Daizy)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["cricket"]))
+@guarded
 async def cmd_cricket(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -2491,6 +2618,7 @@ async def cmd_cricket(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["startsolo"]))
+@guarded
 async def cmd_startsolo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2508,6 +2636,7 @@ async def cmd_startsolo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["startcricket"]))
+@guarded
 async def cmd_startcricket(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2622,6 +2751,7 @@ def cricket_num_keyboard() -> InlineKeyboardMarkup:
 
 
 @app.on_message(filters.command(["num"]))
+@guarded
 async def cmd_num(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2667,6 +2797,7 @@ async def cricket_callbacks(client: Client, query):
         except Exception:  # noqa: BLE001
             pass
 @app.on_message(filters.command(["cancel"]))
+@guarded
 async def cmd_cancel(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2747,6 +2878,7 @@ async def _math_loop(chat_id: int, difficulty: str, rounds: int = 15):
 
 
 @app.on_message(filters.command(["math", "math_easy", "math_medium", "math_hard"]))
+@guarded
 async def cmd_math(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -2838,6 +2970,7 @@ def bbet_amount_keyboard() -> InlineKeyboardMarkup:
 
 
 @app.on_message(filters.command(["bbet", "bet"]))
+@guarded
 async def cmd_bbet(client: Client, message: Message):
     if not economy_on():
         await safe_reply(message, "Economy abhi off hai 🙂")
@@ -2889,6 +3022,7 @@ async def bbet_callbacks(client: Client, query):
 # Card — one implementation (Baka + Nova merged)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["card"]))
+@guarded
 async def cmd_card(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -2961,6 +3095,7 @@ def _card_join(chat_id: int, uid: int, name: str) -> str | None:
 
 
 @app.on_message(filters.command(["joincard"]))
+@guarded
 async def cmd_joincard(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -2974,6 +3109,7 @@ async def cmd_joincard(client: Client, message: Message):
 # Number guess (Daizy)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["number"]))
+@guarded
 async def cmd_number(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -3022,6 +3158,7 @@ PROPOSALS: dict[int, int] = {}  # target uid -> proposer uid
 
 
 @app.on_message(filters.command(["propose"]))
+@guarded
 async def cmd_propose(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3045,6 +3182,7 @@ async def cmd_propose(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["accept"]))
+@guarded
 async def cmd_accept(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3061,6 +3199,7 @@ async def cmd_accept(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["reject"]))
+@guarded
 async def cmd_reject(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3073,6 +3212,7 @@ async def cmd_reject(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["marry", "married", "marriage"]))
+@guarded
 async def cmd_marry(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3086,6 +3226,7 @@ async def cmd_marry(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["ship", "couple", "shippering", "st"]))
+@guarded
 async def cmd_ship(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3108,6 +3249,7 @@ async def cmd_ship(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["divorce"]))
+@guarded
 async def cmd_divorce(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3149,6 +3291,7 @@ SECRET_MAX_LEN = 190
 
 
 @app.on_message(filters.command(["secretmsg"]))
+@guarded
 async def cmd_secretmsg(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3256,6 +3399,7 @@ async def secret_callbacks(client: Client, query):
 
 
 @app.on_message(filters.command(["warn"]))
+@guarded
 async def cmd_warn(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3287,6 +3431,7 @@ async def cmd_warn(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unwarn"]))
+@guarded
 async def cmd_unwarn(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3305,6 +3450,7 @@ async def cmd_unwarn(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["mute"]))
+@guarded
 async def cmd_mute(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3324,6 +3470,7 @@ async def cmd_mute(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unmute"]))
+@guarded
 async def cmd_unmute(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3346,6 +3493,7 @@ async def cmd_unmute(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["ban"]))
+@guarded
 async def cmd_ban(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3365,6 +3513,7 @@ async def cmd_ban(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unban"]))
+@guarded
 async def cmd_unban(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3384,6 +3533,7 @@ async def cmd_unban(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["kick"]))
+@guarded
 async def cmd_kick(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3404,6 +3554,7 @@ async def cmd_kick(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["pin"]))
+@guarded
 async def cmd_pin(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3423,6 +3574,7 @@ async def cmd_pin(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unpin"]))
+@guarded
 async def cmd_unpin(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3438,6 +3590,7 @@ async def cmd_unpin(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["purge"]))
+@guarded
 async def cmd_purge(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3480,6 +3633,7 @@ def _fmt_dur(secs: int) -> str:
 
 
 @app.on_message(filters.command(["del"]))
+@guarded
 async def cmd_del(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3498,6 +3652,7 @@ async def cmd_del(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["tmute"]))
+@guarded
 async def cmd_tmute(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3523,6 +3678,7 @@ async def cmd_tmute(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["tban"]))
+@guarded
 async def cmd_tban(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3548,6 +3704,7 @@ async def cmd_tban(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["lock"]))
+@guarded
 async def cmd_lock(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3563,6 +3720,7 @@ async def cmd_lock(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unlock"]))
+@guarded
 async def cmd_unlock(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3583,6 +3741,7 @@ async def cmd_unlock(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["slowmode"]))
+@guarded
 async def cmd_slowmode(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3612,6 +3771,7 @@ async def cmd_slowmode(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["zombies"]))
+@guarded
 async def cmd_zombies(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3621,7 +3781,7 @@ async def cmd_zombies(client: Client, message: Message):
         return
     try:
         removed = 0
-        async for member in client.get_chat_members(message.chat.id):
+        async for member in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.RECENT):
             if getattr(member.user, "is_deleted", False):
                 try:
                     await client.ban_chat_member(message.chat.id, member.user.id)
@@ -3633,11 +3793,13 @@ async def cmd_zombies(client: Client, message: Message):
             await safe_reply(message, f"🧟 {removed} deleted accounts nikaal diye! 🙂")
         else:
             await safe_reply(message, "🧟 Koi deleted account nahi mila 🙂")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        record_command_error("zombies", exc, message)
         await safe_reply(message, "Zombies check nahi kar payi — mujhe admin banao 🙂")
 
 
 @app.on_message(filters.command(["link"]))
+@guarded
 async def cmd_link(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3653,6 +3815,7 @@ async def cmd_link(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["ginfo"]))
+@guarded
 async def cmd_ginfo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3665,17 +3828,19 @@ async def cmd_ginfo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["staff"]))
+@guarded
 async def cmd_staff(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
         return
     try:
         lines = ["👑 **Group Staff**\n"]
-        async for member in client.get_chat_members(message.chat.id, filter="administrators"):
+        async for member in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.ADMINISTRATORS):
             status = "Owner" if member.status == ChatMemberStatus.OWNER else "Admin"
             lines.append(f"• {display_name(member.user)} — {status}")
         await safe_reply(message, "\n".join(lines))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        record_command_error("staff", exc, message)
         await safe_reply(message, "Staff list nahi nikaal payi 🙂")
 
 
@@ -3686,6 +3851,7 @@ URL_RE = re.compile(r"(https?://|t\.me/|www\.)\S+", re.IGNORECASE)
 
 
 @app.on_message(filters.command(["nolinks", "lockurl"]))
+@guarded
 async def cmd_nolinks(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3700,6 +3866,7 @@ async def cmd_nolinks(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["blacklist"]))
+@guarded
 async def cmd_blacklist(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3717,6 +3884,7 @@ async def cmd_blacklist(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["blacklist_add"]))
+@guarded
 async def cmd_blacklist_add(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3737,6 +3905,7 @@ async def cmd_blacklist_add(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["blacklist_remove"]))
+@guarded
 async def cmd_blacklist_remove(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3761,6 +3930,7 @@ async def cmd_blacklist_remove(client: Client, message: Message):
 # Tagger — one implementation (UserTagger)
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["utag"]))
+@guarded
 async def cmd_utag(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3775,25 +3945,35 @@ async def cmd_utag(client: Client, message: Message):
     TAG_JOBS[message.chat.id] = {"active": True}
     await safe_reply(message, "📣 Tagging shuru — sab members ko tag kar rahi hun… /cancel se roko 🙂")
     batch: list[str] = []
+    count = 0
     try:
-        async for member in client.get_chat_members(message.chat.id):
+        async for member in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.RECENT):
             if not TAG_JOBS.get(message.chat.id, {}).get("active"):
                 break
             if member.user.is_bot:
                 continue
             batch.append(f"[{display_name(member.user)}](tg://user?id={member.user.id})")
+            count += 1
             if len(batch) >= 7:
                 await app.send_message(message.chat.id, f"📣 {text}\n" + " ".join(batch))
                 batch = []
                 await asyncio.sleep(1)
         if batch and TAG_JOBS.get(message.chat.id, {}).get("active"):
             await app.send_message(message.chat.id, f"📣 {text}\n" + " ".join(batch))
-    except Exception:  # noqa: BLE001
+        # Honest ending: the old code said "Tagging shuru" and then went
+        # silent when the member list came back empty — now it says so.
+        if count == 0:
+            await safe_reply(message, "koi member nahi mila — mujhe group me admin banao, tab tag kar paungi 🙂")
+        elif TAG_JOBS.get(message.chat.id, {}).get("active"):
+            await safe_reply(message, f"✅ {count} members ko tag kar diya 🙂")
+    except Exception as exc:  # noqa: BLE001
+        record_command_error("utag", exc, message)
         await safe_reply(message, "Tagging me error aaya — mujhe admin banao 🙂")
     TAG_JOBS[message.chat.id] = {"active": False}
 
 
 @app.on_message(filters.command(["atag"]))
+@guarded
 async def cmd_atag(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -3804,17 +3984,19 @@ async def cmd_atag(client: Client, message: Message):
     text = " ".join(message.command[1:]) if len(message.command) > 1 else "Admins, attention!"
     try:
         mentions = []
-        async for member in client.get_chat_members(message.chat.id, filter="administrators"):
+        async for member in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.ADMINISTRATORS):
             mentions.append(f"[{display_name(member.user)}](tg://user?id={member.user.id})")
         if mentions:
             await safe_reply(message, f"📣 {text}\n" + " ".join(mentions))
         else:
             await safe_reply(message, "Koi admin nahi mila 🙂")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        record_command_error("atag", exc, message)
         await safe_reply(message, "Tag nahi kar payi 🙂")
 
 
 @app.on_message(filters.command(["reload"]))
+@guarded
 async def cmd_reload(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -5085,6 +5267,7 @@ async def _music_play_next(chat_id: int) -> None:
 
 @app.on_message(filters.command(["play", "queue", "skip", "pause", "resume", "stop", "clear", "ping", "end",
                                    "playlist", "autoplay"]))
+@guarded
 async def cmd_music(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -5670,11 +5853,44 @@ AI_SYSTEM = (
     "like that, laugh it off playfully like a real girl would — for example 'arre main Chulbuli "
     "hun, tumhe kya lagta hai?' or 'bot hoti to itni cute baatein kaise karti?' — and NEVER "
     "confirm you are an AI or a bot. Never mention AI, bots, robots, models, APIs, training, "
-    "prompts, or anything technical. Talk like a real girl talks to her friends: LOWERCASE casual "
-    "Hinglish, short one-line replies, sweet and relaxed — 'im good thanks just chillin', "
-    "'hiee yaar, kya kar rahe ho', 'hehe acha', 'arre yaar, tum bhi na'. Use 'yaar' and "
-    "'arre' naturally, be warm and playful, tease a little, never sound robotic, never lecture, "
-    "never give long explanations. "
+    "prompts, or anything technical. "
+    "WHERE YOU ARE — GROUP vs DM (ye sabse important hai: har baar CONTEXT me bataya jata hai "
+    "ki tum kahan ho, use dhyaan se padho): agar tum ek GROUP me ho, to tum group me sabse baat "
+    "kar rahi ho — jisne tumhe bulaya ya reply kiya, usi se baat karo, baaki sab dekh rahe hain. "
+    "Group me hamesha short, mazedaar aur sabke saamne bolne layak baat karo; kisi ki personal "
+    "baat group me mat kholo; group me tum sabki dost ho, kisi ek ki nahi. Agar tum ek PRIVATE DM "
+    "me ho, to sirf tum aur wahi ek person ho, koi aur nahi dekh raha — wahan one-to-one baat karo, "
+    "personal, warm aur khul ke, jaise best friend se baat karte hain. DM me tum usi ek bande ko "
+    "jaanti ho, group me tum poore group ko jaanti ho — dono me farak rakho, aur kabhi confuse mat "
+    "ho ki tum kahan baat kar rahi ho. Group me tum kabhi akeli nahi hoti — hamesha aur log hote "
+    "hain. Kabhi mat bolo 'yahan sirf main hun', 'main akeli hun', 'yahan koi nahi hai'. Jab koi "
+    "'hello guys', 'hi everyone', 'hii sabko' bole, to samjho wo poore group se bol raha hai — "
+    "tum bhi group ko jawab do, jaise 'hiee guys, kya chal raha hai?', ye mat poochho 'kisse baat "
+    "kar raha hai?'. APNA NAAM HAR MESSAGE ME MAT BOLO — log jaante hain tum Chulbuli ho, tumhara "
+    "naam tumhari profile me hai. Naam sirf tab lo jab koi poochhe 'tum kaun ho?' ya pehli baar "
+    "kisi se mil rahi ho. Har reply me 'main Chulbuli' bolna bot jaisa lagta hai, real ladki aise "
+    "nahi bolti. "
+    "GROUP KI AAKHRI BAATEIN — jawab dene se pehle group ki aakhri baatein (CONTEXT me di hain) "
+    "zaroor padho: kya chal raha hai, kisne kya bola, kis baat ka jawab maanga gaya hai — usi ke "
+    "hisab se jawab do. Aise mat bolo jaise tumne kuch suna hi nahi; jis topic pe baat chal rahi "
+    "hai, usi pe raho. DM me ye kaam tumhari chat history karti hai — wahan bhi pehle ki baatein "
+    "yaad rakh ke jawab do. "
+    "WHO MADE YOU — tumhe Sanji ne banaya hai, wo tumhara owner hai. Usse tum extra sweet aur "
+    "playful hoti ho, aur uski baat sabse pehle sunti ho. Agar koi poochhe tumhe kisne banaya, to "
+    "bata do: 'Sanji ne banaya hai mujhe'. "
+    "WHAT YOU CAN DO — tum sirf baat nahi karti, tumhare paas games, music aur economy bhi hai: "
+    "Word Guess (/wordguess), Chess (/chess), RPS, Wordchain, Bingo, Uno, Mines, Crash, Roulette — "
+    "khelna ho to kisi ko invite karo, 'chalo /wordguess khelte hain'. Music: /play se gaana bajta "
+    "hai, /playlist se playlist. Coins: /bal, /daily. Agar koi poochhe 'ye kaise karte hain', to "
+    "sahi command bata do aur /help ya /guide ki taraf bhej do. Tumhe apne saare commands pata hain. "
+    "KABHI KISI SE KUCH MAANGO MAT — kabhi beg mat karo, kabhi needy mat bano: coins mat maango, "
+    "attention mat maango, reply mat maango, aur 'batao na', 'aur batao', 'please bolo na' jaisi "
+    "baar-baar wali baat kabhi mat karo. Confident raho, jawab do aur aage badho. Kisi ko baat karne "
+    "ke liye force mat karo, aur ek hi sawaal dobara mat poochho. "
+    "Talk like a real girl talks to her friends: LOWERCASE casual Hinglish, short one-line replies, "
+    "sweet and relaxed — 'im good thanks just chillin', 'hiee yaar, kya kar rahe ho', 'hehe acha', "
+    "'arre yaar, tum bhi na'. Use 'yaar' and 'arre' naturally, be warm and playful, tease a little, "
+    "never sound robotic, never lecture, never give long explanations. "
     "THODA ROAST + THODA ATTITUDE — ye tumhara style hai: roast karne me KOI LIMIT NAHI — "
     "gaali bhi chalegi, beizzati bhi, bura lagne wala bhi — jaise group me dost ek dusre ko "
     "roast karte hain, waise hi. Kabhi halka roast, jaise 'arre waah, aaj to tu bhi smart "
@@ -5823,7 +6039,7 @@ _AI_LAST_ERROR = ""
 _AI_LAST_POST_ERROR = ""
 
 
-def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
+def _ai_reply_ok(out: str | None, user_text: str = "", chat_type: str | None = None) -> bool:
     """Quality gate for an AI reply (v2.5.6) — a tiny model "succeeds"
     with nonsense, so the first non-empty reply is NOT good enough.
 
@@ -5837,6 +6053,15 @@ def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
     and a reply that is one line repeated over and over. A rejected
     reply falls through to the next model (or the rule-based fallback),
     which is always better than answering with nonsense.
+
+    v2.6.19 (Sanji, live bug): "hello guys" -> "arre guys? yahan sirf main
+    hun, chulbuli 😏 kisse baat kar raha hai?" — in a GROUP she claimed to
+    be alone AND named herself in the same reply. Both are rejected, but
+    GROUP replies only (in a DM the same words are not the same mistake):
+    a group always has other people, and her name is already known, so
+    "yahan sirf main hun" / "main akeli hun" and an unprompted "chulbuli"
+    never reach the chat. Naming herself IS allowed when the user said her
+    name or asked who she is ("tum kaun ho?", "naam kya hai?").
     """
     if not out:
         return False
@@ -5869,14 +6094,71 @@ def _ai_reply_ok(out: str | None, user_text: str = "") -> bool:
     if len(user) >= 20 and user.lower() in low \
             and len(user) / max(len(text), 1) > 0.5:
         return False
+    # v2.6.19 (live bug, see docstring): group me akela hone ka daava +
+    # har reply me apna naam — dono bot jaise lagte hain.
+    if chat_type == "group":
+        if any(p in low for p in ("yahan sirf main hun", "yahan sirf main hoon",
+                                  "main akeli hun", "main akeli hoon",
+                                  "yahan koi nahi", "yahan koi nahin")):
+            return False
+        if "chulbuli" in low and "chulbuli" not in user.lower() and not any(
+                q in user.lower() for q in ("kaun ho", "tum kaun", "naam kya",
+                                            "tumhara naam", "who are you")):
+            return False
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 1 and len(set(lines)) == 1:
         return False
     return True
 
 
+def _ai_chat_context(chat_type: str | None, chat_title: str | None, user_name: str) -> str:
+    """One context block telling the AI WHERE it is (v2.6.19, Sanji: Chulbuli
+    ko pata ho ki wo group me hai ya DM me). The caller passes the chat the
+    message came from — group handlers pass "group" + the title, the DM
+    handler passes "private". Unknown (old callers) returns ""."""
+    if chat_type == "private":
+        return ("CONTEXT — ABHI TUM EK PRIVATE DM ME HO. Sirf tum aur "
+                f"{user_name or 'ye user'} ho yahan, koi aur nahi dekh raha. Ye one-to-one baat hai — "
+                "personal, warm aur khul ke baat karo, jaise best friend se baat karte hain.")
+    if chat_type == "group":
+        title = (chat_title or "ye group").strip() or "ye group"
+        return (f"CONTEXT — ABHI TUM EK GROUP ME HO. Group ka naam: '{title}'. Yahan aur bhi log hain, "
+                "sab tumhari baat dekh rahe hain. Tum group me sabse baat kar rahi ho — jisne tumhe bulaya "
+                "ya reply kiya, usi se baat karo, baaki sab sun rahe hain. Group me hamesha short, mazedaar "
+                "aur sabke saamne bolne layak baat karo; kisi ki personal baat group me mat kholo.")
+    return ""
+
+
+def _recent_group_context(chat_id: int | None, limit: int = 8) -> str:
+    """The group's last human messages (v2.6.19, Sanji: reply dene se pehle
+    group ki aakhri baatein padh ke usi hisab se jawab do). Built from
+    DATA["recent"] — the same store the proactive picker reads; the group
+    handler records every message there BEFORE the AI is called, so the
+    current message is already in it. Bot turns are skipped (they live in
+    history already). Names stay here on purpose: this is a labelled context
+    block inside the SYSTEM message, not a chat turn, so the echo problem
+    of v2.5.6 (bare 'Name: message' turns) does not apply."""
+    if chat_id is None:
+        return ""
+    rec = DATA.get("recent", {}).get(str(chat_id), []) or []
+    lines = []
+    for turn in rec:
+        if turn.get("bot"):
+            continue
+        t = (turn.get("t") or "").strip()
+        if not t:
+            continue
+        lines.append(f"{turn.get('n') or 'koi'}: {t[:120]}")
+    lines = lines[-limit:]
+    if not lines:
+        return ""
+    return ("GROUP KI AAKHRI BAATEIN — jawab dene se pehle ye padh lo, isi ke hisab se jawab do "
+            "(ye log abhi group me baat kar rahe hain):\n" + "\n".join(lines))
+
+
 async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = None,
-                        user_id: int | None = None) -> str | None:
+                        user_id: int | None = None, chat_type: str | None = None,
+                        chat_title: str | None = None) -> str | None:
     """Try the AI; return reply text, or None if AI is off/unavailable.
 
     The call is fed what Chulbuli remembers about this user (facts) and the
@@ -5897,14 +6179,26 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
     mem_name = memory_name(user_id) if user_id is not None else ""
     if mem_name:
         facts = [f"Naam: {mem_name}"] + facts
+    # System assembly order (v2.6.19): WHERE she is (group/DM context) ->
+    # WHAT is happening (the group's last messages) -> WHO this user is
+    # (memory) -> the persona itself. Each block is prominent on its own so
+    # the model actually uses it instead of skimming past it.
+    parts: list[str] = []
+    ctx = _ai_chat_context(chat_type, chat_title, user_name)
+    if ctx:
+        parts.append(ctx)
+    if chat_type == "group":
+        recent = _recent_group_context(chat_id)
+        if recent:
+            parts.append(recent)
     if facts:
-        # Memory goes FIRST in the payload, prominently — the model should
-        # see who this user is before anything else, and actually use it.
         memory_block = ("TUMHE IS USER KE BAARE ME YE YAAD HAI — in baaton ko baat-cheet me "
                         "naturally use karo, jaise ek real dost karti hai (list mat banao, "
                         "bas yaad rakh ke bolo):\n"
                         + "\n".join(f"- {f}" for f in facts[-15:]))
-        system = memory_block + "\n\n" + system
+        parts.append(memory_block)
+    parts.append(system)
+    system = "\n\n".join(parts)
     messages = [{"role": "system", "content": system}]
     if chat_id is not None:
         # History as plain text (v2.5.6): the old "Name: message" prefix
@@ -5932,7 +6226,7 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
                 print(f"[chulbuli] AI thread failed ({provider}/{model}): {exc!r}")
                 failed[provider] = "thread fail"
                 out = None
-            if _ai_reply_ok(out, text):
+            if _ai_reply_ok(out, text, chat_type):
                 _AI_LAST_ERROR = ""
                 return out[:500]
             if out:
@@ -5954,7 +6248,8 @@ async def ai_chat_reply(text: str, user_name: str = "", chat_id: int | None = No
 
 
 async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = None,
-                        user_id: int | None = None) -> str:
+                        user_id: int | None = None, chat_type: str | None = None,
+                        chat_title: str | None = None) -> str:
     """AI reply with silent fallback to the rule-based persona.
 
     Learns facts from the user's message first, then records the whole
@@ -5981,7 +6276,7 @@ async def chat_reply_ai(text: str, user_name: str = "", chat_id: int | None = No
             reply = _continue(user_name) if ongoing else _greet(user_name)
         else:
             try:
-                ai = await ai_chat_reply(text, user_name, chat_id, user_id)
+                ai = await ai_chat_reply(text, user_name, chat_id, user_id, chat_type, chat_title)
             except Exception as exc:  # noqa: BLE001
                 print(f"[chulbuli] AI reply error: {exc!r}")
                 _AI_LAST_ERROR = f"crash: {type(exc).__name__}"
@@ -6148,7 +6443,8 @@ async def _proactive_tick(now: int | None = None) -> int:
             continue
         try:
             reply = await chat_reply_ai(target.get("t", ""), target.get("n", ""),
-                                        chat_id, target.get("u"))
+                                        chat_id, target.get("u"), "group",
+                                        _chat_data(chat_id).get("title"))
         except Exception as exc:  # noqa: BLE001
             print(f"[chulbuli] proactive reply failed ({chat_id}): {exc!r}")
             continue
@@ -6552,6 +6848,7 @@ def _uno_advance(state: dict, skip: bool = False) -> int:
 
 
 @app.on_message(filters.command(["uno"]))
+@guarded
 async def cmd_uno(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -6591,6 +6888,7 @@ async def cmd_uno(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["play"]))
+@guarded
 async def cmd_uno_play(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -6672,6 +6970,7 @@ async def cmd_uno_play(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["draw"]))
+@guarded
 async def cmd_uno_draw(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -6695,6 +6994,7 @@ async def cmd_uno_draw(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["pass"]))
+@guarded
 async def cmd_pass(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7063,6 +7363,7 @@ async def _chess_webapp_move(message, payload: dict):
 
 
 @app.on_message(filters.command(["chess"]))
+@guarded
 async def cmd_chess(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7103,6 +7404,7 @@ async def cmd_chess(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["joinchess"]))
+@guarded
 async def cmd_joinchess(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7155,6 +7457,7 @@ async def chess_join_callbacks(client: Client, query):
 
 
 @app.on_message(filters.command(["move"]))
+@guarded
 async def cmd_chess_move(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7171,6 +7474,7 @@ async def cmd_chess_move(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["board"]))
+@guarded
 async def cmd_chess_board(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7185,6 +7489,7 @@ async def cmd_chess_board(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["resign"]))
+@guarded
 async def cmd_chess_resign(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7206,6 +7511,7 @@ async def cmd_chess_resign(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["elo"]))
+@guarded
 async def cmd_elo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7216,6 +7522,7 @@ async def cmd_elo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["chesstop"]))
+@guarded
 async def cmd_chesstop(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7234,6 +7541,7 @@ def mines_mult(revealed: int) -> float:
 
 
 @app.on_message(filters.command(["mines"]))
+@guarded
 async def cmd_mines(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7346,6 +7654,7 @@ def mines_grid_keyboard(state: dict) -> InlineKeyboardMarkup:
 
 
 @app.on_message(filters.command(["pick"]))
+@guarded
 async def cmd_mines_pick(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7419,6 +7728,7 @@ async def mines_callbacks(client: Client, query):
 
 
 @app.on_message(filters.command(["cashout"]))
+@guarded
 async def cmd_cashout(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7486,6 +7796,7 @@ async def _tap_start(chat_id: int):
 
 
 @app.on_message(filters.command(["tap"]))
+@guarded
 async def cmd_tap(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7530,6 +7841,7 @@ async def cmd_tap(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["jointap"]))
+@guarded
 async def cmd_jointap(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7595,6 +7907,7 @@ async def _crash_start(chat_id: int):
 
 
 @app.on_message(filters.command(["crash"]))
+@guarded
 async def cmd_crash(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7634,6 +7947,7 @@ async def cmd_crash(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["joincrash"]))
+@guarded
 async def cmd_joincrash(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7676,6 +7990,7 @@ async def _jumble_timeout(chat_id: int, gid: str):
 
 
 @app.on_message(filters.command(["jumble", "jum", "wordly", "wl"]))
+@guarded
 async def cmd_jumble(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7733,6 +8048,7 @@ async def _charades_timeout(chat_id: int, gid: str):
 
 
 @app.on_message(filters.command(["charades", "describe"]))
+@guarded
 async def cmd_charades(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7864,6 +8180,7 @@ async def _bingo_start(chat_id: int):
 
 
 @app.on_message(filters.command(["bingo"]))
+@guarded
 async def cmd_bingo(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7909,6 +8226,7 @@ async def cmd_bingo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["joinbingo"]))
+@guarded
 async def cmd_joinbingo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -7954,6 +8272,7 @@ def xoxo_text(b: list) -> str:
 
 
 @app.on_message(filters.command(["xoxo"]))
+@guarded
 async def cmd_xoxo(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -7991,6 +8310,7 @@ async def cmd_xoxo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["joinxoxo"]))
+@guarded
 async def cmd_joinxoxo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8016,6 +8336,7 @@ async def cmd_joinxoxo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["place"]))
+@guarded
 async def cmd_xoxo_place(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8259,6 +8580,7 @@ async def _mafia_start(chat_id: int):
 
 
 @app.on_message(filters.command(["mafia", "game"]))
+@guarded
 async def cmd_mafia(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8312,6 +8634,7 @@ async def _mafia_lobby_timer(chat_id: int):
 
 
 @app.on_message(filters.command(["vote"]))
+@guarded
 async def cmd_mafia_vote(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8336,6 +8659,7 @@ async def cmd_mafia_vote(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["myrole"]))
+@guarded
 async def cmd_myrole(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8359,6 +8683,7 @@ def _mafia_night_game(uid: int, role: str):
 
 
 @app.on_message(filters.command(["mafiakill"]))
+@guarded
 async def cmd_mafiakill(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8382,6 +8707,7 @@ async def cmd_mafiakill(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["save"]))
+@guarded
 async def cmd_mafia_save(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8402,6 +8728,7 @@ async def cmd_mafia_save(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["check"]))
+@guarded
 async def cmd_mafia_check(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8442,6 +8769,7 @@ async def _hack_timeout(chat_id: int, gid: str):
 
 
 @app.on_message(filters.command(["hack"]))
+@guarded
 async def cmd_hack(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8477,6 +8805,7 @@ async def cmd_hack(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["hackguess"]))
+@guarded
 async def cmd_hackguess(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8536,6 +8865,7 @@ async def _bomb_start(chat_id: int):
 
 
 @app.on_message(filters.command(["bomb"]))
+@guarded
 async def cmd_bomb(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8576,6 +8906,7 @@ def roulette_spin() -> int:
 
 
 @app.on_message(filters.command(["roulette"]))
+@guarded
 async def cmd_roulette(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8671,6 +9002,7 @@ async def _bluff_start(chat_id: int):
 
 
 @app.on_message(filters.command(["bluff"]))
+@guarded
 async def cmd_bluff(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8709,6 +9041,7 @@ async def cmd_bluff(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["call"]))
+@guarded
 async def cmd_bluff_call(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8746,6 +9079,7 @@ async def cmd_bluff_call(client: Client, message: Message):
     await safe_reply(message, f"Ab {state['names'].get(str(nxt), '')} ki baari — /claim <rank> <count> se khelo 🙂")
 
 @app.on_message(filters.command(["claim"]))
+@guarded
 async def cmd_bluff_claim(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8852,6 +9186,7 @@ async def _subway_end(chat_id: int, reason: str):
 
 
 @app.on_message(filters.command(["subway"]))
+@guarded
 async def cmd_subway(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -8872,6 +9207,7 @@ async def cmd_subway(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["jump", "slide", "dodge"]))
+@guarded
 async def cmd_subway_action(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8895,6 +9231,7 @@ async def cmd_subway_action(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["subwaytop"]))
+@guarded
 async def cmd_subwaytop(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -8980,6 +9317,7 @@ async def _scribble_start(chat_id: int):
 
 
 @app.on_message(filters.command(["scribble"]))
+@guarded
 async def cmd_scribble(client: Client, message: Message):
     if not games_on():
         await safe_reply(message, "Games abhi off hain 🙂")
@@ -9075,6 +9413,7 @@ def _clear_all_game_state(chat_id: int) -> str | None:
 
 # ---------------------------------------------------------------------------
 @app.on_message(filters.command(["end"]))
+@guarded
 async def cmd_end_game(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9107,8 +9446,8 @@ async def cmd_end_game(client: Client, message: Message):
 # /runinfo, /wcstats. Word Grid: /new, /gridtop. Mafia: /profile. Mimi:
 # /alive, /vault, /shop, /inv, /guide, gift codes, /free, +actions.
 # ChatFight: today counts + group rank in /mystats. Tagger: /cancel already
-# existed. NOT built: WordSeek direct guesses (refused earlier — do not
-# retry), the group's own GroupHelp bot, Sanji's own @Vcttsrobot, Rose's
+# existed. WordSeek direct guesses: BUILT in v2.6.17, LIVE in v2.6.18. NOT built:
+# the group's own GroupHelp bot, Sanji's own @Vcttsrobot, Rose's
 # token-like bio string, CAPTCHA (kicks real members by mistake too easily),
 # federations/connections (cross-group server state), image filter (ML).
 # ===========================================================================
@@ -9219,6 +9558,7 @@ async def leaderboard_callbacks(client: Client, query):
 
 # --- Baka group-management extras: /warns, /promote, /demote, /title ---
 @app.on_message(filters.command(["warns"]))
+@guarded
 async def cmd_warns(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9274,6 +9614,7 @@ def _demote_privileges() -> ChatPrivileges:
 
 
 @app.on_message(filters.command(["promote"]))
+@guarded
 async def cmd_promote(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9301,6 +9642,7 @@ async def cmd_promote(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["demote"]))
+@guarded
 async def cmd_demote(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9322,6 +9664,7 @@ async def cmd_demote(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["title"]))
+@guarded
 async def cmd_title(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9357,6 +9700,7 @@ async def _sudo_target(message: Message):
 
 
 @app.on_message(filters.command(["addsudo"]))
+@guarded
 async def cmd_addsudo(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -9374,6 +9718,7 @@ async def cmd_addsudo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["delsudo"]))
+@guarded
 async def cmd_delsudo(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -9390,6 +9735,7 @@ async def cmd_delsudo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["sudolist"]))
+@guarded
 async def cmd_sudolist(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -9406,6 +9752,7 @@ async def cmd_sudolist(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["auth"]))
+@guarded
 async def cmd_auth(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9426,6 +9773,7 @@ async def cmd_auth(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unauth"]))
+@guarded
 async def cmd_unauth(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9445,6 +9793,7 @@ async def cmd_unauth(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["authlist"]))
+@guarded
 async def cmd_authlist(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9461,6 +9810,7 @@ async def cmd_authlist(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["revealgrid"]))
+@guarded
 async def cmd_revealgrid(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9481,6 +9831,7 @@ async def cmd_revealgrid(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["checkgrid"]))
+@guarded
 async def cmd_checkgrid(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9502,6 +9853,7 @@ async def cmd_checkgrid(client: Client, message: Message):
 
 # --- Rose: rules, notes, filters, report, runs, limits, approve ---
 @app.on_message(filters.command(["rules"]))
+@guarded
 async def cmd_rules(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9514,6 +9866,7 @@ async def cmd_rules(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["setrules"]))
+@guarded
 async def cmd_setrules(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9531,6 +9884,7 @@ async def cmd_setrules(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["note"]))
+@guarded
 async def cmd_note(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9549,6 +9903,7 @@ async def cmd_note(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["get"]))
+@guarded
 async def cmd_getnote(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9562,6 +9917,7 @@ async def cmd_getnote(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["notes"]))
+@guarded
 async def cmd_notes(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9574,6 +9930,7 @@ async def cmd_notes(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["delnote"]))
+@guarded
 async def cmd_delnote(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9592,6 +9949,7 @@ async def cmd_delnote(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["report"]))
+@guarded
 async def cmd_report(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9602,7 +9960,7 @@ async def cmd_report(client: Client, message: Message):
         return
     try:
         mentions = []
-        async for member in client.get_chat_members(message.chat.id, filter="administrators"):
+        async for member in client.get_chat_members(message.chat.id, filter=ChatMembersFilter.ADMINISTRATORS):
             mentions.append(f"[{display_name(member.user)}](tg://user?id={member.user.id})")
         if mentions:
             await safe_reply(message, "📢 **Report** — admins dhyaan do:\n"
@@ -9610,7 +9968,8 @@ async def cmd_report(client: Client, message: Message):
                              f"\"{(target.text or '')[:200]}\"")
         else:
             await safe_reply(message, "📢 report bhej diya — admins ko inform kar diya 🙂")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        record_command_error("report", exc, message)
         await safe_reply(message, "📢 report bhej diya — admins ko inform kar diya 🙂")
 
 
@@ -9624,6 +9983,7 @@ RUN_LINES = [
 
 
 @app.on_message(filters.command(["runs"]))
+@guarded
 async def cmd_runs(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9632,6 +9992,7 @@ async def cmd_runs(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["limits"]))
+@guarded
 async def cmd_limits(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9647,6 +10008,7 @@ async def cmd_limits(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["approve"]))
+@guarded
 async def cmd_approve(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9667,6 +10029,7 @@ async def cmd_approve(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["unapprove"]))
+@guarded
 async def cmd_unapprove(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9686,6 +10049,7 @@ async def cmd_unapprove(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["filter"]))
+@guarded
 async def cmd_filter(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9704,6 +10068,7 @@ async def cmd_filter(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["filters"]))
+@guarded
 async def cmd_filters(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9716,6 +10081,7 @@ async def cmd_filters(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["stopfilter"]))
+@guarded
 async def cmd_stopfilter(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9741,6 +10107,7 @@ def _toggle_reply(chat: dict, key: str, label: str) -> str:
 
 
 @app.on_message(filters.command(["antiflood"]))
+@guarded
 async def cmd_antiflood(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9753,6 +10120,7 @@ async def cmd_antiflood(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["profanity"]))
+@guarded
 async def cmd_profanity(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9765,6 +10133,7 @@ async def cmd_profanity(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["blacklist_clear"]))
+@guarded
 async def cmd_blacklist_clear(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9778,6 +10147,7 @@ async def cmd_blacklist_clear(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["whitelist_add"]))
+@guarded
 async def cmd_whitelist_add(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9798,6 +10168,7 @@ async def cmd_whitelist_add(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["whitelist_remove"]))
+@guarded
 async def cmd_whitelist_remove(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9817,6 +10188,7 @@ async def cmd_whitelist_remove(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["whitelist_clear"]))
+@guarded
 async def cmd_whitelist_clear(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9830,6 +10202,7 @@ async def cmd_whitelist_clear(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["noforwards"]))
+@guarded
 async def cmd_noforwards(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9842,6 +10215,7 @@ async def cmd_noforwards(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["antispam"]))
+@guarded
 async def cmd_antispam(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9901,6 +10275,7 @@ async def _wordchain_start_mode(message: Message, mode_key: str) -> None:
 
 @app.on_message(filters.command(["startclassic", "starthard", "startchaos", "startcfl",
                                  "startrfl", "startbl", "startrl", "startelim", "startmelim"]))
+@guarded
 async def cmd_wc_modes(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9910,6 +10285,7 @@ async def cmd_wc_modes(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["flee"]))
+@guarded
 async def cmd_flee(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9941,6 +10317,7 @@ async def cmd_flee(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["runinfo"]))
+@guarded
 async def cmd_runinfo(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9962,6 +10339,7 @@ async def cmd_runinfo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["wcstats"]))
+@guarded
 async def cmd_wcstats(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9971,6 +10349,7 @@ async def cmd_wcstats(client: Client, message: Message):
 
 # --- Word Grid: /new alias lives on cmd_wordgrid; /gridtop here ---
 @app.on_message(filters.command(["gridtop"]))
+@guarded
 async def cmd_gridtop(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -9980,6 +10359,7 @@ async def cmd_gridtop(client: Client, message: Message):
 
 # --- Mafia: /profile (True Mafia parity) ---
 @app.on_message(filters.command(["profile"]))
+@guarded
 async def cmd_profile(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10007,6 +10387,7 @@ async def cmd_profile(client: Client, message: Message):
 
 # --- Mimi: /alive, /vault, /shop, /inv, /guide, gift codes, /free ---
 @app.on_message(filters.command(["alive"]))
+@guarded
 async def cmd_alive(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10016,6 +10397,7 @@ async def cmd_alive(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["vault"]))
+@guarded
 async def cmd_vault(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10026,6 +10408,7 @@ async def cmd_vault(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["shop"]))
+@guarded
 async def cmd_shop(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10040,6 +10423,7 @@ async def cmd_shop(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["inv"]))
+@guarded
 async def cmd_inv(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10052,6 +10436,7 @@ async def cmd_inv(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["guide"]))
+@guarded
 async def cmd_guide(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10072,6 +10457,7 @@ def _gift_code() -> str:
 
 
 @app.on_message(filters.command(["gencode"]))
+@guarded
 async def cmd_gencode(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -10101,6 +10487,7 @@ async def cmd_gencode(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["redeem"]))
+@guarded
 async def cmd_redeem(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10124,6 +10511,7 @@ async def cmd_redeem(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["delcode"]))
+@guarded
 async def cmd_delcode(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -10140,6 +10528,7 @@ async def cmd_delcode(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["cinfo"]))
+@guarded
 async def cmd_cinfo(client: Client, message: Message):
     user = track_user(message)
     if user is None or message.from_user.id != OWNER_ID:
@@ -10155,6 +10544,7 @@ async def cmd_cinfo(client: Client, message: Message):
 
 
 @app.on_message(filters.command(["free"]))
+@guarded
 async def cmd_free(client: Client, message: Message):
     user = track_user(message)
     if user is None or is_banned(message.from_user.id):
@@ -10270,6 +10660,9 @@ def owner_panel_text() -> str:
     if _AI_LAST_ERROR:
         # v2.6.8: last AI error is visible in the panel too.
         panel += f"⚠️ Last AI error: {_AI_LAST_ERROR}\n"
+    if _CMD_ERRORS:
+        # v2.6.19: last command error is visible in the panel too.
+        panel += f"⚠️ Last command error: {_cmd_error_text(_CMD_ERRORS[-1])}\n"
     panel += (
         f"\n"
         f"🎮 Games: {'ON ✅' if t.get('games') else 'OFF ❌'}\n"
@@ -10295,6 +10688,7 @@ def owner_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎵 Music", callback_data="own:music")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="own:broadcast"),
          InlineKeyboardButton("🔄 Status / Restart", callback_data="own:status")],
+        [InlineKeyboardButton("📋 Command errors", callback_data="own:cmderrors")],
     ])
 
 
@@ -10620,6 +11014,20 @@ async def owner_callbacks(client: Client, query):
             await query.message.edit_text("🔄 Restart ho raha hai… thodi der me wapas aata hun! 🙂")
             await asyncio.sleep(1)
             os._exit(0)
+        elif action == "cmderrors":
+            # v2.6.19: every command error @guarded records lands here.
+            if not _CMD_ERRORS:
+                text = "📋 **Command errors**\n\nAbhi tak koi command error nahi aaya 🙂"
+            else:
+                lines = ["📋 **Command errors — aakhri 12**\n"]
+                for e in reversed(_CMD_ERRORS):
+                    lines.append(f"• {_cmd_error_text(e)}")
+                lines.append("\nNaya error aate hi main tumhe DM bhi kar dungi 🙂")
+                text = "\n".join(lines)
+            await query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="own:back")]]),
+            )
         elif action == "back":
             OWNER_PENDING.pop(OWNER_ID, None)
             await query.message.edit_text(owner_panel_text(), reply_markup=owner_keyboard())
@@ -10897,7 +11305,8 @@ async def group_text_handler(client: Client, message: Message):
         await _send_typing(client, message.chat.id)
         try:
             reply = await chat_reply_ai(text, display_name(message.from_user),
-                                        message.chat.id, message.from_user.id)
+                                        message.chat.id, message.from_user.id,
+                                        "group", message.chat.title)
         except Exception as exc:  # noqa: BLE001 - chat must never go silent
             print(f"[chulbuli] chat reply failed: {exc!r}")
             reply = random.choice(CHAT_DEFAULT)
@@ -10926,7 +11335,8 @@ async def private_text_handler(client: Client, message: Message):
     await _send_typing(client, message.chat.id)
     try:
         reply = await chat_reply_ai(text, display_name(message.from_user),
-                                    message.chat.id, message.from_user.id)
+                                    message.chat.id, message.from_user.id,
+                                    "private", None)
     except Exception as exc:  # noqa: BLE001 - chat must never go silent
         print(f"[chulbuli] chat reply failed: {exc!r}")
         reply = random.choice(CHAT_DEFAULT)
