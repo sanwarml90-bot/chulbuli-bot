@@ -6839,54 +6839,87 @@ async def main():
     check("y2633 botapi not-ok falls back to mtproto",
           await _gate2632(_m2633) is False and not _m2633.deleted, str(_m2633.deleted))
     # cache: a second identical check does NOT call the Bot API again
+    # (v2.6.35: only a JOINED result is cached — "left" is re-checked fresh)
     B._botapi_call_sync = _fake_botapi2633
-    _botapi_status2633 = "left"
+    _botapi_status2633 = "member"
     _botapi_calls2633.clear()
     B._FJ_CACHE.clear()
     await B._fj_is_joined(_gclient2632, -100999, 111)
     await B._fj_is_joined(_gclient2632, -100999, 111)
-    check("y2633 botapi result cached", len(_botapi_calls2633) == 1, str(len(_botapi_calls2633)))
+    check("y2633 botapi member result cached", len(_botapi_calls2633) == 1, str(len(_botapi_calls2633)))
     B._botapi_call_sync = _real_botapi2633
 
-    # (z) v2.6.34 — asymmetric membership cache TTL (negative = 60s)
-    _real_botapi2634 = B._botapi_call_sync
-    _botapi_calls2634 = []
-    _botapi_status2634 = "left"
+    # (z) v2.6.35 — NO negative caching + instant unblock on channel join
+    # (search: python-telegram-bot wiki — live get_chat_member per message
+    # is the standard force-subscribe pattern; ChatMember updates track
+    # joins in real time. Subgate caches only successful checks, 10 min.)
+    _real_botapi2635 = B._botapi_call_sync
+    _botapi_calls2635 = []
+    _botapi_status2635 = "left"
 
-    def _fake_botapi2634(method, params):
-        _botapi_calls2634.append((method, params))
-        return {"ok": True, "result": {"status": _botapi_status2634}}
+    def _fake_botapi2635(method, params):
+        _botapi_calls2635.append((method, params))
+        return {"ok": True, "result": {"status": _botapi_status2635}}
 
-    B._botapi_call_sync = _fake_botapi2634
+    B._botapi_call_sync = _fake_botapi2635
     B._FJ_CACHE.clear()
-    # fresh "left" is cached; an immediate re-check uses the cache (no call)
+    # a "left" result is NEVER cached: an immediate re-check calls the API again
     await B._fj_is_joined(_gclient2632, -100999, 111)
-    _calls2634 = len(_botapi_calls2634)
-    await B._fj_is_joined(_gclient2632, -100999, 111)
-    check("z2634 negative result cached briefly", len(_botapi_calls2634) == _calls2634,
-          str(len(_botapi_calls2634)))
-    # ...but a "left" entry 61 s old is re-checked (user may have joined)
-    B._FJ_CACHE[(-100999, 111)] = (False, time.time() - 61)
-    await B._fj_is_joined(_gclient2632, -100999, 111)
-    check("z2634 negative entry older than 60s is re-checked",
-          len(_botapi_calls2634) == _calls2634 + 1, str(len(_botapi_calls2634)))
-    # a "left" entry that is now "member" flips to joined on that re-check
-    _botapi_status2634 = "member"
-    B._FJ_CACHE[(-100999, 111)] = (False, time.time() - 61)
-    check("z2634 stale negative flips to joined after user joins",
+    _calls2635 = len(_botapi_calls2635)
+    check("z2635 negative result is checked fresh every time",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is False
+          and len(_botapi_calls2635) == _calls2635 + 1, str(len(_botapi_calls2635)))
+    # ...and a "left" that is now "member" flips to joined on that fresh check
+    _botapi_status2635 = "member"
+    check("z2635 fresh check flips to joined after user joins",
           await B._fj_is_joined(_gclient2632, -100999, 111) is True)
+    # a "member" result IS cached (15 min): an immediate re-check makes no call
+    _calls2635 = len(_botapi_calls2635)
+    check("z2635 positive result cached",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is True
+          and len(_botapi_calls2635) == _calls2635, str(len(_botapi_calls2635)))
     # a "member" entry 61 s old is NOT re-checked (still inside 15 min)
     B._FJ_CACHE[(-100999, 111)] = (True, time.time() - 61)
-    _calls2634 = len(_botapi_calls2634)
-    check("z2634 positive entry 61s old still cached",
+    _calls2635 = len(_botapi_calls2635)
+    check("z2635 positive entry 61s old still cached",
           await B._fj_is_joined(_gclient2632, -100999, 111) is True
-          and len(_botapi_calls2634) == _calls2634, str(len(_botapi_calls2634)))
+          and len(_botapi_calls2635) == _calls2635, str(len(_botapi_calls2635)))
     # ...but a "member" entry 901 s old is re-checked
     B._FJ_CACHE[(-100999, 111)] = (True, time.time() - 901)
     await B._fj_is_joined(_gclient2632, -100999, 111)
-    check("z2634 positive entry older than 15 min is re-checked",
-          len(_botapi_calls2634) == _calls2634 + 1, str(len(_botapi_calls2634)))
-    B._botapi_call_sync = _real_botapi2634
+    check("z2635 positive entry older than 15 min is re-checked",
+          len(_botapi_calls2635) == _calls2635 + 1, str(len(_botapi_calls2635)))
+    # ChatMemberUpdated: joining the channel clears the cache + drops the warn
+    class _FakeMemberUpdate2635:
+        def __init__(self, chat_id, uid, status):
+            self.chat = type("C", (), {"id": chat_id})()
+            self.from_user = FakeUser(uid, "T")
+            self.new_chat_member = FakeChatMember(FakeUser(uid, "T"), status)
+            self.old_chat_member = FakeChatMember(FakeUser(uid, "T"), B.ChatMemberStatus.LEFT)
+
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time())
+    B._FJ_WARNS[(-100123, 111)] = (555, time.time())
+    _del_before2635 = len(_gclient2632.deleted_msgs)
+    await B.force_join_member_updated(_gclient2632, _FakeMemberUpdate2635(
+        -100999, 111, B.ChatMemberStatus.MEMBER))
+    check("z2635 join event clears cache and drops the warn",
+          (-100999, 111) not in B._FJ_CACHE
+          and (-100123, 111) not in B._FJ_WARNS
+          and len(_gclient2632.deleted_msgs) == _del_before2635 + 1,
+          str(len(_gclient2632.deleted_msgs)))
+    # leaving the channel clears the cached True too (leaver loses access fast)
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time())
+    await B.force_join_member_updated(_gclient2632, _FakeMemberUpdate2635(
+        -100999, 111, B.ChatMemberStatus.LEFT))
+    check("z2635 leave event clears the cached joined entry",
+          (-100999, 111) not in B._FJ_CACHE)
+    # an update for a DIFFERENT channel is ignored
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time())
+    await B.force_join_member_updated(_gclient2632, _FakeMemberUpdate2635(
+        -100888, 111, B.ChatMemberStatus.MEMBER))
+    check("z2635 update for another channel is ignored",
+          (-100999, 111) in B._FJ_CACHE)
+    B._botapi_call_sync = _real_botapi2635
 
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

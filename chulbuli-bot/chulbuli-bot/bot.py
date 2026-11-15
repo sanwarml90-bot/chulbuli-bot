@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.34"
+VERSION = "2.6.35"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -11738,10 +11738,12 @@ async def handle_owner_pending(message: Message) -> bool:
 # admin status + channel membership dono 15 min ke liye RAM me cache hote hain.
 # ---------------------------------------------------------------------------
 _FJ_CACHE: dict = {}        # (channel_id, uid) -> (joined, ts)
-_FJ_CACHE_TTL = 900         # 15 min for a JOINED result
-_FJ_CACHE_TTL_NEG = 60      # 1 min for a NOT-JOINED result (v2.6.34: a user
-                            # who joins right after being blocked must not
-                            # stay blocked for 15 min on stale cache)
+_FJ_CACHE_TTL = 900         # 15 min — only JOINED results are cached (v2.6.35,
+                            # search: Subgate caches only successful checks).
+                            # A NOT-JOINED result is NEVER cached: the gate
+                            # re-checks live on every message, so a user who
+                            # just joined is unblocked on their very next
+                            # message (one Bot API call, ~0.2 s — no delay).
 _FJ_ADMIN_CACHE: dict = {}  # (chat_id, uid) -> (is_admin, ts)
 _FJ_WARNS: dict = {}        # (chat_id, uid) -> (warn_msg_id, ts)
 # No warn throttle since v2.6.34 (owner order): EVERY blocked message gets a
@@ -11785,10 +11787,10 @@ async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = Fa
     now = time.time()
     if not fresh:
         hit = _FJ_CACHE.get(key)
-        if hit is not None:
-            ttl = _FJ_CACHE_TTL if hit[0] else _FJ_CACHE_TTL_NEG
-            if now - hit[1] < ttl:
-                return hit[0]
+        # Only a JOINED result is ever reused from the cache — a cached
+        # "not joined" is ignored so the next message always re-checks live.
+        if hit is not None and hit[0] and now - hit[1] < _FJ_CACHE_TTL:
+            return hit[0]
     joined = await _fj_botapi_is_joined(channel, uid)
     if joined is None:
         try:
@@ -11797,7 +11799,14 @@ async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = Fa
         except Exception as exc:  # noqa: BLE001
             print(f"[chulbuli] force-join: MTProto get_chat_member failed: {exc!r}")
             return None
-    _FJ_CACHE[key] = (joined, now)
+    # Only JOINED is cached; a NOT-JOINED result is never stored (and any
+    # stale True is cleared), so a user who just joined is unblocked on
+    # their very next message. A leave is caught even faster by the
+    # ChatMemberUpdated handler below (force_join_member_updated).
+    if joined:
+        _FJ_CACHE[key] = (True, now)
+    else:
+        _FJ_CACHE.pop(key, None)
     return joined
 
 
@@ -11944,6 +11953,48 @@ async def force_join_check_callback(client: Client, query):
         await query.answer("✅ Ho gaya! Ab tum message kar sakte ho 🙂", show_alert=True)
         return
     await query.answer("❌ Abhi join nahi hua — pehle channel join karo 🙂", show_alert=True)
+
+
+@app.on_chat_member_updated()
+async def force_join_member_updated(client: Client, update):
+    """Instant unblock on channel join/leave (v2.6.35, search: Bot API 5.1+
+    ChatMember updates track users in channels in real time).
+
+    When a user's status in the configured force-join channel changes, the
+    bot gets this update (it is an admin in the channel) and clears that
+    user's cached membership right away — so someone who just joined is
+    unblocked before they even message again, and someone who just left
+    loses their cached "joined" entry at once. On a JOIN it also deletes
+    any warn we sent them in the group(s). Best-effort: even if Telegram
+    never delivers the update, the gate's live check on the next message
+    still unblocks them — this handler only makes it instant."""
+    try:
+        fj = DATA.get("force_join") or {}
+        channel = fj.get("channel") or 0
+        if not channel:
+            return
+        chat = getattr(update, "chat", None)
+        if chat is None or chat.id != channel:
+            return
+        member = getattr(update, "new_chat_member", None)
+        user = getattr(member, "user", None) if member is not None else None
+        if user is None:
+            user = getattr(update, "from_user", None)
+        if user is None:
+            return
+        uid = user.id
+        _FJ_CACHE.pop((channel, uid), None)
+        status = getattr(member, "status", None) if member is not None else None
+        if status in _FJ_JOINED_STATUSES:
+            for key in [k for k in list(_FJ_WARNS.keys()) if k[1] == uid]:
+                try:
+                    await client.delete_messages(key[0], _FJ_WARNS[key][0])
+                except Exception:  # noqa: BLE001
+                    pass
+                _FJ_WARNS.pop(key, None)
+            print(f"[chulbuli] force-join: user {uid} joined channel {channel} — cache cleared")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] force-join: member update failed: {exc!r}")
 
 
 # ---------------------------------------------------------------------------
