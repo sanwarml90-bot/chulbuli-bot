@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.19"
+VERSION = "2.6.20"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -138,9 +138,10 @@ SCRIBBLE_WORDS = ["apple", "rocket", "guitar", "jungle", "dance", "tiger",
                   "moon", "river", "cricket", "school", "friend", "magic"]
 
 # ---------------------------------------------------------------------------
-# Data store (JSON, atomic save). NOTE: the bot-runner wipes the bot dir on
-# every restart, so data.json is best-effort persistence; the bot keeps
-# running fine with a fresh file.
+# Data store (JSON, atomic save). The container filesystem is EPHEMERAL —
+# Railway wipes it on every redeploy — so persistence needs CHULBULI_DATA_FILE
+# pointing at the mounted Railway volume (/data/data.json, v2.6.20). Without
+# the volume the bot still runs fine, but starts with a fresh file each time.
 # ---------------------------------------------------------------------------
 DEFAULT_USER = {
     "name": "", "coins": 1000, "bank": 0, "gems": 0, "xp": 0, "level": 1,
@@ -202,6 +203,10 @@ def load_data() -> dict:
 
 
 DATA = load_data()
+# Startup proof of where the data lives (volume or fresh file) — the
+# deploy-confirm check reads this line from the container logs.
+print(f"[chulbuli] data: {len(DATA.get('users', {}))} users, "
+      f"{len(DATA.get('chats', {}))} chats — file {DATA_FILE}")
 _save_lock = asyncio.Lock()
 
 
