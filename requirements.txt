@@ -10,3 +10,8 @@ imageio-ffmpeg
 # On modern Python it is skipped and the music module degrades honestly
 # (no fake playback).
 pytgcalls==2.1.0; python_version < "3.10"
+# v2.6.25: YouTube search via py-yt-search (VideosSearch) — the Innertube
+# search endpoint only, so a search never touches the player API (the
+# "Requested format is not available" / youtube_blocked search failures).
+# AnonXMusic uses this exact package (py-yt-search 0.8.2).
+py-yt-search==0.8.2
