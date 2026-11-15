@@ -48,7 +48,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from pyrogram import Client, filters, raw, utils
+from pyrogram import Client, StopPropagation, filters, raw, utils
 from pyrogram.enums import ChatAction, ChatMemberStatus, ChatMembersFilter, ChatType
 from pyrogram.errors import FloodWait, UserAlreadyParticipant
 from pyrogram.types import (
@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.31"
+VERSION = "2.6.32"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -283,7 +283,8 @@ def _blank_data() -> dict:
             "banned_users": [], "sudos": [], "gift_codes": {},
             "meta": {"started_at": int(time.time()), "games_played": 0},
             "memory": {}, "history": {}, "recent": {},
-            "ai_model": "auto", "ai_system": ""}
+            "ai_model": "auto", "ai_system": "",
+            "force_join": {"channel": 0, "username": "", "title": "", "invite": ""}}
 
 
 def load_data() -> dict:
@@ -307,6 +308,7 @@ def load_data() -> dict:
         data.setdefault("ai_provider", "openrouter")
         data.setdefault("ai_keys", {})
         data.setdefault("chess_matches", {})
+        data.setdefault("force_join", {"channel": 0, "username": "", "title": "", "invite": ""})
         return data
     except FileNotFoundError:
         return _blank_data()
@@ -974,7 +976,7 @@ START_TEXT = """hiee {name} 💕 main Chulbuli hun — games, masti aur economy,
 🎮 Games: /wordguess /wordgrid /wordchain /rps /cricket /math /bbet /card /number /uno /chess /mines /tap /crash /jumble /charades /bingo /xoxo /mafia /hack /bomb /roulette /bluff /subway /scribble
 💬 Mujhse baat karo — main hamesha reply dungi!
 💞 Romance: /propose /marry /ship /divorce
-🛡️ Mods (admins): /warn /mute /ban /kick /pin /purge /del /tmute /tban /lock /unlock /slowmode /zombies /link /ginfo /utag
+🛡️ Mods (admins): /warn /mute /ban /kick /pin /purge /del /tmute /tban /lock /unlock /slowmode /zombies /link /ginfo /utag /joining
 📊 Rank: /rank /toprank /mystats
 
 Group me add karo aur khelna shuru karo — type /help for details!"""
@@ -9926,6 +9928,7 @@ def _chat_data(chat_id: int) -> dict:
     chat.setdefault("antispam", False)
     chat.setdefault("joined_at", {})
     chat.setdefault("auth", [])
+    chat.setdefault("force_join", False)
     return chat
 
 
@@ -10579,6 +10582,54 @@ async def cmd_antiflood(client: Client, message: Message):
                      "Antiflood (3 messages / 20 sec se zyada = delete)"))
 
 
+@app.on_message(filters.command(["joining"]))
+@guarded
+async def cmd_joining(client: Client, message: Message):
+    """Force-join gate toggle (v2.6.32): /joining on | off | (koi arg nahi = status).
+
+    ON = is group me jo user force-join channel ka member nahi hai, uska
+    har message delete hoga + use channel join karne ka message milega.
+    Channel set nahi hai to ON nahi hota — pehle Owner Panel se channel add karo."""
+    user = track_user(message)
+    if user is None or is_banned(message.from_user.id):
+        return
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await safe_reply(message, "Ye command group me chalti hai 🙂")
+        return
+    if not await is_chat_admin(client, message.chat.id, message.from_user.id):
+        await safe_reply(message, "Sirf admins joining badal sakte hain 🙂")
+        return
+    arg = (message.command[1].lower() if len(message.command) > 1 else "")
+    chat = _chat_data(message.chat.id)
+    fj = DATA.get("force_join") or {}
+    channel = fj.get("channel") or 0
+    if arg in ("on", "off"):
+        if arg == "on" and not channel:
+            await safe_reply(message,
+                             "🔒 Pehle Owner Panel se channel add karo — bina channel ke joining ON nahi hoti 🙂")
+            return
+        chat["force_join"] = (arg == "on")
+        save_data()
+        if chat["force_join"]:
+            await safe_reply(
+                message,
+                f"🔒 Force-join ON ✅ — {fj.get('title') or 'channel'} join kiye bina koi message nahi kar payega 🙂")
+        else:
+            await safe_reply(message, "🔒 Force-join OFF ❌ — ab sab message kar sakte hain 🙂")
+        return
+    if channel:
+        state = "ON ✅" if chat.get("force_join") else "OFF ❌"
+        await safe_reply(
+            message,
+            f"🔒 Force-join: {state}\n📢 Channel: {fj.get('title') or ''} "
+            f"({('@' + fj['username']) if fj.get('username') else channel})\n"
+            f"Badalne ke liye: `/joining on` ya `/joining off` 🙂")
+    else:
+        await safe_reply(message,
+                         "🔒 Force-join: channel set nahi hai ❌\n"
+                         "Pehle Owner Panel → 🔒 Force Join se channel add karo, phir `/joining on` 🙂")
+
+
 @app.on_message(filters.command(["profanity"]))
 @guarded
 async def cmd_profanity(client: Client, message: Message):
@@ -11128,9 +11179,17 @@ def owner_panel_text() -> str:
         f"🎮 Games: {'ON ✅' if t.get('games') else 'OFF ❌'}\n"
         f"💰 Economy: {'ON ✅' if t.get('economy') else 'OFF ❌'}\n"
         f"💬 Chat: {'ON ✅' if t.get('chat') else 'OFF ❌'}\n"
-        f"💬 Baatein: {'ON ✅' if t.get('ai') else 'OFF ❌'}\n\n"
-        f"Neeche se option chuno 👇"
+        f"💬 Baatein: {'ON ✅' if t.get('ai') else 'OFF ❌'}\n"
     )
+    fj = DATA.get("force_join") or {}
+    fj_on = sum(1 for c in DATA["chats"].values() if c.get("force_join"))
+    if fj.get("channel"):
+        panel += (f"🔒 Force Join: {fj.get('title') or ''} "
+                  f"({('@' + fj['username']) if fj.get('username') else fj.get('channel')})"
+                  f" • {fj_on} group(s) ON\n")
+    else:
+        panel += "🔒 Force Join: channel set nahi hai ❌\n"
+    panel += "\nNeeche se option chuno 👇"
     return panel
 
 
@@ -11148,7 +11207,35 @@ def owner_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎵 Music", callback_data="own:music")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="own:broadcast"),
          InlineKeyboardButton("🔄 Status / Restart", callback_data="own:status")],
-        [InlineKeyboardButton("📋 Command errors", callback_data="own:cmderrors")],
+        [InlineKeyboardButton("🔒 Force Join", callback_data="own:fj"),
+         InlineKeyboardButton("📋 Command errors", callback_data="own:cmderrors")],
+    ])
+
+
+def _fj_text() -> str:
+    """Force-join screen (v2.6.32): current channel + which groups have it ON."""
+    fj = DATA.get("force_join") or {}
+    lines = ["🔒 **Force Join — channel join kiye bina koi message nahi**\n"]
+    if fj.get("channel"):
+        lines.append(f"📢 Channel: {fj.get('title') or ''} "
+                     f"({('@' + fj['username']) if fj.get('username') else fj.get('channel')})")
+    else:
+        lines.append("📢 Channel: set nahi hai ❌")
+    on_chats = [c.get("title") or cid for cid, c in DATA["chats"].items() if c.get("force_join")]
+    if on_chats:
+        lines.append(f"✅ ON hai in groups me: {', '.join(on_chats[:10])}")
+    else:
+        lines.append("✅ Kisi group me ON nahi hai — group me `/joining on` karo.")
+    lines.append("\nBot ko group me Delete Messages right aur channel me admin banao — "
+                 "bina iske membership check nahi hoga 🙂")
+    return "\n".join(lines)
+
+
+def _fj_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Channel add karo", callback_data="own:fjchan"),
+         InlineKeyboardButton("🗑️ Channel hatao", callback_data="own:fjdel")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="own:back")],
     ])
 
 
@@ -11474,6 +11561,23 @@ async def owner_callbacks(client: Client, query):
             await query.message.edit_text("🔄 Restart ho raha hai… thodi der me wapas aata hun! 🙂")
             await asyncio.sleep(1)
             os._exit(0)
+        elif action == "fj":
+            await query.message.edit_text(_fj_text(), reply_markup=_fj_keyboard())
+        elif action == "fjchan":
+            OWNER_PENDING[OWNER_ID] = "fjchan"
+            await query.message.edit_text(
+                "🔒 **Force-join channel add karo** — channel ka username, link ya ID bhejo.\n"
+                "Jaise: `@channelname`, `https://t.me/channelname`, ya `-1001234567890`.\n"
+                "Bot ko us channel me admin banana mat bhoolna 🙂\n/cancel se rok sakte ho.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="own:back")]]),
+            )
+        elif action == "fjdel":
+            DATA["force_join"] = {"channel": 0, "username": "", "title": "", "invite": ""}
+            for c in DATA["chats"].values():
+                c["force_join"] = False
+            save_data()
+            await query.answer("Channel hata diya ✅ (saare groups me gate OFF)")
+            await query.message.edit_text(_fj_text(), reply_markup=_fj_keyboard())
         elif action == "cmderrors":
             # v2.6.19: every command error @guarded records lands here.
             if not _CMD_ERRORS:
@@ -11537,6 +11641,46 @@ async def handle_owner_pending(message: Message) -> bool:
             pass
         await safe_reply(message, f"🔑 {AI_PROVIDERS[provider]['label']} ki key save ho gayi (****{text[-4:]}) 🙂")
         return True
+    if pending == "fjchan":
+        OWNER_PENDING.pop(OWNER_ID, None)
+        ref = text.strip()
+        if "t.me/" in ref:
+            ref = ref.split("t.me/")[-1].strip("/").split("/")[0].split("?")[0]
+        ref = ref.lstrip("@")
+        try:
+            chat_id = int(ref) if ref.lstrip("-").isdigit() else ref
+            ch = await app.get_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            await safe_reply(message,
+                             "❌ Ye channel nahi mila — username/link/ID sahi bhejo, "
+                             "aur bot ko channel me admin banao, phir dobara try karo 🙂")
+            return True
+        if getattr(ch, "type", None) != ChatType.CHANNEL:
+            await safe_reply(message, "❌ Ye channel nahi hai — kisi CHANNEL ka username/link bhejo 🙂")
+            return True
+        invite = ""
+        if not getattr(ch, "username", None):
+            try:
+                invite = await app.export_chat_invite_link(ch.id) or ""
+            except Exception:  # noqa: BLE001
+                invite = ""
+        DATA["force_join"] = {
+            "channel": ch.id,
+            "username": getattr(ch, "username", "") or "",
+            "title": getattr(ch, "title", "") or "",
+            "invite": invite,
+        }
+        save_data()
+        extra = ""
+        if not DATA["force_join"]["username"] and not invite:
+            extra = "\n⚠️ Bot channel me admin nahi lag raha — Join button nahi banega aur membership check nahi hoga. Bot ko channel me admin banao aur dobara add karo."
+        await safe_reply(
+            message,
+            f"🔒 Force-join channel set ho gaya 🙂\n"
+            f"📢 {DATA['force_join']['title']} "
+            f"({('@' + DATA['force_join']['username']) if DATA['force_join']['username'] else ch.id})\n"
+            f"Ab kisi group me `/joining on` karo.{extra}")
+        return True
     if pending == "give":
         parts = text.split()
         try:
@@ -11582,6 +11726,189 @@ async def handle_owner_pending(message: Message) -> bool:
             await safe_reply(message, f"✅ User `{uid}` unban ho gaya!")
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Force-join gate (v2.6.32) — group=-1 so it runs BEFORE every command
+# handler (group 0) and the text handler (group 1), and can stop them with
+# StopPropagation. Joined users pass through untouched: no delete, no reply.
+#
+# Setup: bot ko group me Delete Messages right chahiye + channel me admin
+# (membership check ke liye). Har message pe sirf cached checks hote hain:
+# admin status + channel membership dono 15 min ke liye RAM me cache hote hain.
+# ---------------------------------------------------------------------------
+_FJ_CACHE: dict = {}        # (channel_id, uid) -> (joined, ts)
+_FJ_CACHE_TTL = 900         # 15 min
+_FJ_ADMIN_CACHE: dict = {}  # (chat_id, uid) -> (is_admin, ts)
+_FJ_WARNS: dict = {}        # (chat_id, uid) -> (warn_msg_id, ts)
+_FJ_WARN_TTL = 300          # 5 min — ek user ko itni der me ek hi warn
+_FJ_NOTIFY_AT: dict = {}    # "check"/"delete" -> last owner-DM ts (1h throttle)
+
+_FJ_JOINED_STATUSES = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                       ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
+
+
+async def _fj_is_admin(client: Client, chat_id: int, uid: int) -> bool:
+    """Cached admin check — the gate runs on every message, so a fresh
+    get_chat_member per message would waste an API call each time."""
+    key = (chat_id, uid)
+    now = time.time()
+    hit = _FJ_ADMIN_CACHE.get(key)
+    if hit is not None and now - hit[1] < _FJ_CACHE_TTL:
+        return hit[0]
+    admin = await is_chat_admin(client, chat_id, uid)
+    _FJ_ADMIN_CACHE[key] = (admin, now)
+    return admin
+
+
+async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = False) -> bool | None:
+    """True = channel joined, False = not joined, None = check failed (fail-open:
+    message delete nahi hoga, owner ko throttled DM jayega)."""
+    key = (channel, uid)
+    now = time.time()
+    if not fresh:
+        hit = _FJ_CACHE.get(key)
+        if hit is not None and now - hit[1] < _FJ_CACHE_TTL:
+            return hit[0]
+    try:
+        member = await client.get_chat_member(channel, uid)
+        joined = member.status in _FJ_JOINED_STATUSES
+    except Exception:  # noqa: BLE001
+        return None
+    _FJ_CACHE[key] = (joined, now)
+    return joined
+
+
+def _fj_channel_link() -> str:
+    fj = DATA.get("force_join") or {}
+    if fj.get("username"):
+        return f"https://t.me/{fj['username']}"
+    return fj.get("invite") or ""
+
+
+def _fj_is_service(message: Message) -> bool:
+    """Service messages (join/leave/title/photo/pin...) are not user messages."""
+    return bool(
+        getattr(message, "new_chat_members", None)
+        or getattr(message, "left_chat_member", None)
+        or getattr(message, "new_chat_title", None)
+        or getattr(message, "new_chat_photo", None)
+        or getattr(message, "delete_chat_photo", None)
+        or getattr(message, "group_chat_created", None)
+        or getattr(message, "supergroup_chat_created", None)
+        or getattr(message, "channel_chat_created", None)
+        or getattr(message, "migrate_to_chat_id", None)
+        or getattr(message, "migrate_from_chat_id", None)
+        or getattr(message, "pinned_message", None)
+    )
+
+
+async def _fj_notify_owner(kind: str, exc: Exception, chat_id: int, uid: int) -> None:
+    """Throttled (1h) owner DM for a persistent gate failure — setup problems
+    (bot not admin in channel/group) must surface once, not on every message."""
+    if time.time() - _FJ_NOTIFY_AT.get(kind, 0) < 3600:
+        return
+    _FJ_NOTIFY_AT[kind] = time.time()
+    try:
+        entry = record_command_error("forcejoin", exc, note=f"chat: {chat_id}", uid=uid, cid=chat_id)
+        await _notify_command_error(entry)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_message(filters.group, group=-1)
+async def force_join_gate(client: Client, message: Message):
+    """Force-join gate: not-joined user's message -> delete + warn + stop.
+    Joined users, owner and group admins pass through silently."""
+    if message.from_user is None or message.from_user.is_bot:
+        return
+    if _fj_is_service(message):
+        return
+    chat = _chat_data(message.chat.id)
+    if not chat.get("force_join"):
+        return
+    fj = DATA.get("force_join") or {}
+    channel = fj.get("channel") or 0
+    if not channel:
+        return
+    uid = message.from_user.id
+    if await _fj_is_admin(client, message.chat.id, uid):
+        return
+    joined = await _fj_is_joined(client, channel, uid)
+    if joined is None:
+        print(f"[chulbuli] force-join: membership check failed in {message.chat.id} (channel {channel})")
+        await _fj_notify_owner(
+            "check",
+            Exception("force-join membership check failed — bot channel me admin hai?"),
+            message.chat.id, uid)
+        return
+    if joined:
+        return
+    # Not joined: the message goes, a warn goes, and nothing else runs.
+    try:
+        await message.delete()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] force-join: delete failed in {message.chat.id}: {exc!r}")
+        await _fj_notify_owner(
+            "delete",
+            Exception("force-join delete failed — bot ko group me Delete Messages right do"),
+            message.chat.id, uid)
+    key = (message.chat.id, uid)
+    now = time.time()
+    prev = _FJ_WARNS.get(key)
+    if prev is not None and now - prev[1] < _FJ_WARN_TTL:
+        raise StopPropagation
+    if prev is not None:
+        try:
+            await client.delete_messages(message.chat.id, prev[0])
+        except Exception:  # noqa: BLE001
+            pass
+    btns = []
+    link = _fj_channel_link()
+    if link:
+        btns.append([InlineKeyboardButton("📢 Channel join karo", url=link)])
+    btns.append([InlineKeyboardButton("✅ Maine join kar liya — check karo",
+                                     callback_data=f"fjcheck:{uid}")])
+    try:
+        warn = await client.send_message(
+            message.chat.id,
+            f"👋 {display_name(message.from_user)} — pehle "
+            f"{fj.get('title') or 'channel'} ko join karo, tab message kar paoge 🙂",
+            reply_markup=InlineKeyboardMarkup(btns))
+        _FJ_WARNS[key] = (warn.id, now)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] force-join: warn failed in {message.chat.id}: {exc!r}")
+    raise StopPropagation
+
+
+@app.on_callback_query(filters.regex(r"^fjcheck:"))
+async def force_join_check_callback(client: Client, query):
+    """'Maine join kar liya' button: fresh membership check (cache bypass)."""
+    try:
+        target = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Kuch gadbad hui 🙂", show_alert=True)
+        return
+    if query.from_user is None or query.from_user.id != target:
+        await query.answer("Ye button tumhare liye nahi hai 🙂", show_alert=True)
+        return
+    fj = DATA.get("force_join") or {}
+    channel = fj.get("channel") or 0
+    if not channel:
+        await query.answer("Channel abhi set nahi hai 🙂", show_alert=True)
+        return
+    joined = await _fj_is_joined(client, channel, target, fresh=True)
+    if joined is None:
+        await query.answer("Check nahi ho paya — thodi der me dobara try karo 🙂", show_alert=True)
+        return
+    if joined:
+        try:
+            await query.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await query.answer("✅ Ho gaya! Ab tum message kar sakte ho 🙂", show_alert=True)
+        return
+    await query.answer("❌ Abhi join nahi hua — pehle channel join karo 🙂", show_alert=True)
 
 
 # ---------------------------------------------------------------------------

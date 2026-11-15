@@ -23,6 +23,23 @@ from pyrogram.errors import BotMethodInvalid, ButtonTypeInvalid, FloodWait
 
 import bot as B
 
+# ---- v2.6.19 dispatch map: Pyrogram registers handlers on the client's
+# event loop (Dispatcher.add_handler schedules a task), so flush that loop
+# once at import time, then read the REAL command -> handler mapping.
+# This is the pre-deploy proof that /atag, /utag, /playlist... actually
+# reach their handlers (the /playlist bug was a routing bug, invisible to
+# tests that call handlers directly).
+B.app.loop.run_until_complete(asyncio.sleep(0.05))
+DISPATCH_MAP: dict = {}
+HANDLER_GROUPS: dict = {}
+for _grp2619, _handlers2619 in B.app.dispatcher.groups.items():
+    for _h2619 in _handlers2619:
+        HANDLER_GROUPS.setdefault(_grp2619, []).append(getattr(_h2619.callback, "__name__", "?"))
+        _cmds2619 = getattr(_h2619.filters, "commands", None)
+        if _cmds2619:
+            for _c2619 in _cmds2619:
+                DISPATCH_MAP[_c2619] = getattr(_h2619.callback, "__name__", "?")
+
 PASS = []
 FAIL = []
 
@@ -148,7 +165,12 @@ class FakeMessage:
         self.entities = None
         self.date = datetime.now(timezone.utc)
         parts = text.split()
-        self.command = [p.lstrip("/").split("@")[0] for p in parts] if parts and parts[0].startswith("/") else []
+        # Real Pyrogram strips the @BotUsername suffix from the COMMAND
+        # word only ("/start@MyBot" -> "start"); args keep their "@"
+        # ("/secretmsg @ravi hi" -> ["secretmsg", "@ravi", "hi"]). The old
+        # fake split EVERY part on "@", so "@ravi" became "" (v2.6.14).
+        self.command = ([parts[0].lstrip("/").split("@")[0]] + parts[1:]) \
+            if parts and parts[0].startswith("/") else []
 
     async def reply_text(self, text, **kwargs):
         if B._markup_has_web_app(kwargs.get("reply_markup")):
@@ -218,6 +240,16 @@ class FakeApp:
     async def get_me(self):
         return FakeApp.me
 
+    users_by_name = {}
+
+    async def get_users(self, user_ids):
+        if isinstance(user_ids, str):
+            u = FakeApp.users_by_name.get(user_ids.lstrip("@"))
+            if u is None:
+                raise ValueError("user not found")
+            return u
+        return FakeUser(int(user_ids), "User")
+
     async def send_message(self, chat_id, text, **kwargs):
         if B._markup_has_web_app(kwargs.get("reply_markup")):
             # Mirror the real server (v2.4.1): web_app buttons are rejected
@@ -229,6 +261,13 @@ class FakeApp:
         FakeMessage._id += 1
         m.id = FakeMessage._id
         m.text = text
+        return m
+
+    async def send_audio(self, chat_id, audio, **kwargs):
+        FakeApp.calls.append(("send_audio", chat_id, audio, kwargs))
+        m = FakeMessage.__new__(FakeMessage)
+        FakeMessage._id += 1
+        m.id = FakeMessage._id
         return m
 
     async def send_chat_action(self, chat_id, action):
@@ -247,9 +286,24 @@ class FakeApp:
         FakeMessage.edits.append((chat_id, text, kwargs))
         return None
 
+    # Tests set this to a list of FakeChatMember to control who is in the
+    # group (default: the 2 admins below). Mirrors real Pyrogram 2.0.106
+    # get_chunk STRICTLY: filter MUST be a ChatMembersFilter enum — a plain
+    # string crashes on `.value` (the live /atag + /staff + /report bug,
+    # v2.6.19). The old permissive fake hid that completely.
+    members_override = None
+
     async def get_chat_members(self, chat_id, filter=None):
-        yield FakeChatMember(FakeUser(7966027018, "Sanji"), "owner")
-        yield FakeChatMember(FakeUser(222, "Admin2"), "administrator")
+        if isinstance(filter, str):
+            raise AttributeError("'str' object has no attribute 'value'")
+        members = list(FakeApp.members_override) if FakeApp.members_override is not None else [
+            FakeChatMember(FakeUser(7966027018, "Sanji"), "owner"),
+            FakeChatMember(FakeUser(222, "Admin2"), "administrator"),
+        ]
+        if filter is not None and filter == B.ChatMembersFilter.ADMINISTRATORS:
+            members = [m for m in members if m.status in ("administrator", "owner")]
+        for m in members:
+            yield m
 
     async def get_chat_member(self, chat_id, user_id):
         return FakeChatMember(FakeUser(user_id, "Tester"), "administrator",
@@ -270,11 +324,26 @@ class FakeApp:
 
     async def restrict_chat_member(self, chat_id, user_id, permissions=None, **kwargs):
         FakeApp.calls.append(("restrict", chat_id, user_id))
+        FakeApp.last_restrict_kwargs = dict(kwargs)
         return True
 
     async def ban_chat_member(self, chat_id, user_id, **kwargs):
         FakeApp.calls.append(("ban", chat_id, user_id))
+        FakeApp.last_ban_kwargs = dict(kwargs)
         return True
+
+    async def set_chat_permissions(self, chat_id, permissions=None, **kwargs):
+        FakeApp.calls.append(("set_permissions", chat_id, permissions))
+        return True
+
+    async def set_slow_mode(self, chat_id, seconds, **kwargs):
+        FakeApp.calls.append(("slowmode", chat_id, seconds))
+        return True
+
+    member_count = 42
+
+    async def get_chat_members_count(self, chat_id):
+        return FakeApp.member_count
 
     async def unban_chat_member(self, chat_id, user_id, **kwargs):
         FakeApp.calls.append(("unban", chat_id, user_id))
@@ -396,10 +465,16 @@ async def main():
           and B.DATA["users"]["222"]["coins"] == 1000 + 100,
           f"111={B.DATA['users']['111']['coins']} 222={B.DATA['users']['222']['coins']}")
 
-    # /owner from non-owner is refused
-    FakeMessage.outbox.clear()
-    await B.cmd_owner(client, FakeMessage("/owner", uid=111, chat_id=111, ctype="private"))
-    check("/owner refused", any("sirf owner" in t for _, t in FakeMessage.outbox))
+    # /owner command is GONE (v2.5.7, Sanji's order) — no handler at all,
+    # and no mention in help. The Owner Panel opens only from the 👑
+    # button in the main menu now. Typing /owner does nothing.
+    check("/owner handler gone", not hasattr(B, "cmd_owner"))
+    check("/owner not in help", "/owner" not in B.HELP_TEXT
+          and "/panel" not in B.HELP_TEXT)
+    _bot_src_early = open(os.path.join(os.path.dirname(B.__file__), "bot.py")).read()
+    check("/owner command not registered",
+          'filters.command(["owner"])' not in _bot_src_early
+          and 'filters.command(["owner", "panel"])' not in _bot_src_early)
 
     # Word Guess end-to-end in group
     FakeMessage.outbox.clear()
@@ -434,6 +509,39 @@ async def main():
           f"before={before} after={B.DATA['users']['111']['coins']}")
     check("wg win message", any("guess kar liya" in t for _, t in FakeMessage.outbox))
     check("wg round cleared", B.game_state(-100123) is None)
+
+    # ---- v2.6.17: WordSeek-style direct typing — no reply needed (Sanji:
+    # "user just types the guess directly in the group").
+    FakeMessage.outbox.clear()
+    await B.cmd_wordguess(client, FakeMessage("/wordguess", uid=111, chat_id=-100217))
+    check("v2617 direct start", any("WORD GUESS" in t for _, t in FakeMessage.outbox))
+    check("v2617 direct hint", any("reply ki zarurat nahi" in t for _, t in FakeMessage.outbox),
+          str([t[:80] for _, t in FakeMessage.outbox]))
+    state = B.game_state(-100217)
+    check("v2617 direct state", state and len(state["secret"]) == 4)
+    # direct wrong guess (NO reply) is consumed + posts a new board
+    FakeMessage.outbox.clear()
+    wrong = "zzzz" if state["secret"] != "zzzz" else "qqqq"
+    consumed = await B.handle_wordguess_reply(FakeMessage(wrong, uid=111, chat_id=-100217))
+    check("v2617 direct wrong consumed", consumed)
+    check("v2617 direct new board", any("round 1/6" in t for _, t in FakeMessage.outbox),
+          str([t[:60] for _, t in FakeMessage.outbox]))
+    # normal chat is NOT eaten: longer / shorter messages pass through
+    check("v2617 long msg not consumed",
+          await B.handle_wordguess_reply(FakeMessage("hello everyone", uid=111, chat_id=-100217)) is False)
+    check("v2617 short msg not consumed",
+          await B.handle_wordguess_reply(FakeMessage("ok", uid=111, chat_id=-100217)) is False)
+    check("v2617 round still alive", B.game_state(-100217) is not None)
+    # direct correct guess wins +500, round cleared
+    state = B.game_state(-100217)
+    before = B.DATA["users"]["111"]["coins"]
+    FakeMessage.outbox.clear()
+    consumed = await B.handle_wordguess_reply(FakeMessage(state["secret"], uid=111, chat_id=-100217))
+    check("v2617 direct win consumed", consumed)
+    check("v2617 direct win +500", B.DATA["users"]["111"]["coins"] == before + 500,
+          f"before={before} after={B.DATA['users']['111']['coins']}")
+    check("v2617 direct win message", any("guess kar liya" in t for _, t in FakeMessage.outbox))
+    check("v2617 direct round cleared", B.game_state(-100217) is None)
 
     # /rob via reply (force success path by seeding random? just check it replies sanely)
     FakeMessage.outbox.clear()
@@ -814,7 +922,7 @@ async def main():
 
     _real_urlopen = urllib.request.urlopen
     B.DATA["toggles"]["ai"] = False
-    os.environ["OPENROUTER_API_KEY"] = "dummy-test-key"
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-dummytestkey"
     check("ai toggle off", await B.ai_chat_reply("hello ji", "Tester") is None)
     B.DATA["toggles"]["ai"] = True
 
@@ -857,8 +965,12 @@ async def main():
     import re as _re
     _ai_word = _re.compile(r"\bAI\b", _re.IGNORECASE)
     _visible = [B.START_TEXT, B.HELP_TEXT, B.MENU_GAMES_TEXT, B.MENU_ECONOMY_TEXT,
-                B.MENU_WORDGUESS_TEXT, B.MENU_ROMANCE_TEXT, B.owner_panel_text(),
+                B.MENU_WORDGUESS_TEXT, B.MENU_ROMANCE_TEXT,
                 B.balance_text(B.get_user(111), 111, "Tester"), B.toprich_text()]
+    # NOTE (v2.5.6): the OWNER panel is deliberately NOT in _visible — it is
+    # an admin surface only Sanji sees, and it must say "AI Model" plainly
+    # so he can pick the model. The no-AI rule is about what Chulbuli says
+    # to regular users as a "real girl", not about the owner's controls.
     for _lst in (B.CHAT_GREET, B.CHAT_HOW, B.CHAT_DEFAULT, B.CHAT_LOVE, B.CHAT_ANGRY, B.CHAT_REAL):
         _visible += list(_lst)
     for _i in range(30):
@@ -872,7 +984,7 @@ async def main():
           not any(w in s.lower() for s in _visible for w in ("artificial", "openrouter")), "")
     check("no robot emoji user-visible", not any("🤖" in s for s in _visible), "")
     check("owner panel says Baatein", "💬 Baatein:" in B.owner_panel_text()
-          and "AI" not in B.owner_panel_text(), B.owner_panel_text())
+          and "🤖 AI Model:" in B.owner_panel_text(), B.owner_panel_text())
     check("ai system never-ai rule", "NOT an AI" in B.AI_SYSTEM and "NEVER" in B.AI_SYSTEM
           and "unless asked" not in B.AI_SYSTEM, "")
     check("ai system memory instruction", "remember" in B.AI_SYSTEM.lower()
@@ -915,13 +1027,13 @@ async def main():
     _captured = {}
     _real_post = B._ai_post
 
-    def _capture_post(model, messages):
+    def _capture_post(provider, model, messages):
         _captured["messages"] = messages
         return "haan Arjun, yaad hai mujhe 😄"
 
     B._ai_post = _capture_post
     B.DATA["toggles"]["ai"] = True
-    os.environ["OPENROUTER_API_KEY"] = "test-key"
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
     try:
         _r = await B.ai_chat_reply("aur batao", "Arjun", chat_id=-100777, user_id=_mem_uid)
     finally:
@@ -934,9 +1046,49 @@ async def main():
           and all(m["role"] in ("user", "assistant") for m in _mid), str(len(_mid)))
     check("ai payload memory first", _captured["messages"][0]["content"].startswith("TUMHE IS USER"),
           _captured["messages"][0]["content"][:80])
-    check("ai payload current msg", _captured["messages"][-1]["content"] == "Arjun: aur batao",
+    check("ai payload current msg", _captured["messages"][-1]["content"] == "aur batao",
           _captured["messages"][-1]["content"])
     check("ai payload reply", _r == "haan Arjun, yaad hai mujhe 😄", str(_r))
+    # ---- v2.6.1: 429 cooldown — a rate-limited model is skipped, so group
+    # replies stop waiting on dead models one by one (Sanji: "group me
+    # reply bahut time bad de rahi hai") ----
+    # (a) _ai_post records a 429 in _AI_LAST_429 (real fn, stubbed urlopen).
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+    _real_urlopen = _urlreq.urlopen
+    def _raise_429(req, timeout=None):
+        raise _urlerr.HTTPError(req.full_url if hasattr(req, "full_url") else str(req),
+                                429, "Too Many Requests", None, None)
+    _urlreq.urlopen = _raise_429
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
+    try:
+        _r429 = B._ai_post("openrouter", "google/gemma-4-31b-it:free", [{"role": "user", "content": "hi"}])
+    finally:
+        _urlreq.urlopen = _real_urlopen
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    check("ai 429 recorded", _r429 is None
+          and "google/gemma-4-31b-it:free" in B._AI_LAST_429)
+    # (b) ai_chat_reply skips the cooled-down model, tries the next one.
+    _tried = []
+    def _record_post(provider, model, messages):
+        _tried.append(model)
+        return "haan, bolo 🙂"
+    B._ai_post = _record_post
+    B.DATA["toggles"]["ai"] = True
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
+    try:
+        _r2 = await B.ai_chat_reply("aur batao", "Arjun", chat_id=-100777, user_id=_mem_uid)
+    finally:
+        B._ai_post = _real_post
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    check("ai skips cooled model", "google/gemma-4-31b-it:free" not in _tried
+          and len(_tried) >= 1, str(_tried))
+    check("ai cooldown reply ok", _r2 == "haan, bolo 🙂", str(_r2))
+    B._AI_LAST_429.clear()
+    # (c) per-call timeout is 8 s now (was 15 s) — slow models fail fast.
+    _bot_src_261 = open(os.path.join(os.path.dirname(B.__file__), "bot.py")).read()
+    check("ai post timeout 8s", "timeout=8" in _bot_src_261
+          and "timeout=15" not in _bot_src_261)
     # ---- Name call (Baka/Mimi style): bare "chulbuli" gets a short greeting, NO AI call ----
     check("name call plain", B.is_name_call("chulbuli"))
     check("name call caps", B.is_name_call("Chulbuli"))
@@ -952,13 +1104,13 @@ async def main():
     _nc_calls = []
     _real_post2 = B._ai_post
 
-    def _record_post(model, messages):
+    def _record_post(provider, model, messages):
         _nc_calls.append(model)
         return "YEH AI KA LAMBA JAWAB HAI"
 
     B._ai_post = _record_post
     B.DATA["toggles"]["ai"] = True
-    os.environ["OPENROUTER_API_KEY"] = "test-key"
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
     B.DATA["history"].pop(str(889001), None)
     B.DATA["memory"].pop(str(889001), None)
     try:
@@ -1068,25 +1220,31 @@ async def main():
     # ---- AI: chat model first, code model last; persona + memory ----
     # v2.3.2: old llama/qwen/gemma-3 models 404'd on live logs (2026-11-12) —
     # the list is now drawn only from the live OpenRouter free list.
-    check("ai first is chat model", B.AI_MODELS[0] == "liquid/lfm-3-1.7b:free",
+    # v2.5.6: tiny models first was the bug — a 1.7B model "succeeds" with
+    # nonsense. Big chat models first now (gemma-4-31b), tiny ones last.
+    check("ai first is chat model", B.AI_MODELS[0] == "google/gemma-4-31b-it:free",
           str(B.AI_MODELS))
     check("ai no dead models", not any(m in B.AI_MODELS for m in (
         "meta-llama/llama-3.1-8b-instruct:free",
         "qwen/qwen-2.5-7b-instruct:free",
-        "google/gemma-3-4b-it:free")), str(B.AI_MODELS))
+        "google/gemma-3-4b-it:free",
+        "apodex/apodex-1.1-mini:free",  # v2.6.2: 404 ×5 in live logs 21:38–21:45 IST
+        "liquid/lfm-2.5-2.6b:free")), str(B.AI_MODELS))  # v2.6.2: 404 ×5, same window
+    # Live OpenRouter free list re-fetched 2026-11-13 (18 models; the
+    # 2026-11-12 list is stale — llama-3.3-70b/qwen3-235b/gpt-oss-120b
+    # are not free any more, particle-1/apodex are new).
     _live_free = {
-        "baidu/ernie-5.5-flash-preview:free",
-        "thinkingmachines/inkling-2-small:free",
-        "liquid/lfm-3-1.7b:free", "recursive/flint-v1.0:free",
-        "nvidia/nemotron-3.5-super-vl:free",
-        "dots-studio/dots-3-note-preview:free",
-        "liquid/lfm-2.5-2.6b:free",
-        "nvidia/nemotron-3.5-lightning:free",
-        "cohere/north-mini-code:free",
+        "apodex/apodex-1.1-mini:free", "baidu/ernie-5.5-flash-preview:free",
+        "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free",
+        "google/gemma-4-26b-a4b-it:free", "google/gemma-4-31b-it:free",
+        "google/lyria-3-clip-preview", "google/lyria-3-pro-preview",
+        "liquid/lfm-2.5-2.6b:free", "liquid/lfm-3-1.7b:free",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-        "google/gemma-4-26b-a4b-it:free",
-        "google/gemma-4-31b-it:free",
-        "openrouter/free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "nvidia/nemotron-3.5-super-vl:free", "openrouter/free",
+        "particle-ai/particle-1:free", "recursive/flint-v1.0:free",
+        "thinkingmachines/inkling-2-small:free",
     }
     check("ai models from live free list", all(m in _live_free for m in B.AI_MODELS),
           str(B.AI_MODELS))
@@ -1137,7 +1295,7 @@ async def main():
     _saved_ytdlp = B._yt_dlp
     B._yt_dlp = None
     try:
-        B.resolve_track("koi gaana")
+        await B.resolve_track("koi gaana")
         check("music resolve no ytdlp raises", False)
     except B.MusicError:
         check("music resolve no ytdlp raises", True)
@@ -1462,7 +1620,13 @@ async def main():
     _res = subprocess.run([sys.executable, "-c", "import bot"], cwd=_botdir, env=_env,
                           capture_output=True, text=True, timeout=120)
     _imp_out = _res.stdout
-    check("import failure print yt-dlp", "yt-dlp import failed" in _imp_out and "boom-yt" in _imp_out,
+    # v2.6.30: the bot no longer imports the yt_dlp LIBRARY at all — it
+    # shells out to the standalone yt-dlp binary (_CliYtDlp) — so a
+    # broken yt_dlp on PYTHONPATH must NOT break the import or print
+    # anything. The missing-binary degradation is covered by block (v)
+    # ("v2630 shim missing binary" -> MusicError "search unavailable").
+    check("import no longer depends on yt_dlp lib",
+          _res.returncode == 0 and "yt-dlp import failed" not in _imp_out,
           _imp_out[:500])
     check("import failure print pytgcalls", "pytgcalls import failed" in _imp_out and "boom-calls" in _imp_out,
           _imp_out[:500])
@@ -1969,7 +2133,10 @@ async def main():
     check("ai system rare emojis", "rare" in B.AI_SYSTEM.lower()
           and "every message" in B.AI_SYSTEM.lower())
     check("ai system no re-greet", "never greet them again" in B.AI_SYSTEM.lower())
-    check("ai system length variety", "3-4 lines" in B.AI_SYSTEM)
+    # v2.5.8: Sanji — "reply bahut long hai" — the old "3-4 lines is fine"
+    # allowance is GONE; the prompt now demands 1-2 lines, max 25-30 words.
+    check("ai system length variety", "1-2 lines" in B.AI_SYSTEM
+          and "25-30 words" in B.AI_SYSTEM and "3-4 lines" not in B.AI_SYSTEM)
     check("chat default longer lines", any(len(s) > 40 for s in B.CHAT_DEFAULT))
     check("continue lines never greet",
           all(not s.startswith(("hiee", "hlooo", "hello", "hii")) for s in B.CHAT_CONTINUE)
@@ -2039,13 +2206,13 @@ async def main():
         check("typing shown before chat reply", len(_rc.actions) >= 1
               and _rc.actions[0][0] == -100700 and _rc.actions[0][1] == _ChatAction.TYPING,
               str(_rc.actions))
-        check("typing delay 1-3s", len(_sleeps) >= 1 and all(1.0 <= s <= 3.0 for s in _sleeps),
+        check("typing delay 2-6s", len(_sleeps) >= 1 and all(2.0 <= s <= 6.0 for s in _sleeps),
               str(_sleeps))
         check("chat reply quotes user", len(FakeMessage.outbox_full) == 1
               and FakeMessage.outbox_full[0][2].get("reply_to_message_id") == _m.id,
               str(FakeMessage.outbox_full))
-        check("typing delay scales with length", B.typing_delay("x") == 1.0
-              and B.typing_delay("x" * 200) == 3.0 and 1.0 < B.typing_delay("x" * 50) < 3.0)
+        check("typing delay scales with length", B.typing_delay("x") == 2.0
+              and B.typing_delay("x" * 200) == 6.0 and 2.0 < B.typing_delay("x" * 50) < 6.0)
         # reaction: force it on, then force it off
         _real_random = B.random.random
         B.random.random = lambda: 0.0
@@ -2222,7 +2389,7 @@ async def main():
     _saved_ydl = B._yt_dlp
     B._yt_dlp = _FakeYtDlpBlocked
     try:
-        B.resolve_track("test gaana")
+        await B.resolve_track("test gaana")
         check("play youtube_blocked classified", False, "resolve_track did not raise")
     except B.MusicError as _e:
         check("play youtube_blocked classified", str(_e) == "youtube_blocked", str(_e))
@@ -2267,7 +2434,7 @@ async def main():
     _saved_ydl = B._yt_dlp
     B._yt_dlp = type("Y", (), {"YoutubeDL": _ReloadYDL})
     try:
-        B.resolve_track("test gaana")
+        await B.resolve_track("test gaana")
         check("play reload classified blocked", False, "resolve_track did not raise")
     except B.MusicError as _e:
         check("play reload classified blocked", str(_e) == "youtube_blocked", str(_e))
@@ -2277,7 +2444,9 @@ async def main():
           str([t for _, t in FakeMessage.outbox]))
 
     # first attempt uses the mobile player clients; a YouTube block retries
-    # once with the tv/web clients; a generic failure does NOT retry.
+    # once with the tv/web clients; a generic failure does NOT retry the
+    # player clients — but v2.6.21 DOES fall back to SoundCloud once
+    # (Sanji: "waha na mile ya error ho to us ko use kare").
     class _RetryYDL:
         calls = []
 
@@ -2299,15 +2468,15 @@ async def main():
 
     _RetryYDL.calls.clear()
     B._yt_dlp = type("Y", (), {"YoutubeDL": _RetryYDL})
-    _retry_track = B.resolve_track("retry gaana")
+    _retry_track = await B.resolve_track("retry gaana")
     check("play retry succeeds", _retry_track["title"] == "Retry Gaana", str(_retry_track))
     check("play retry two attempts", len(_RetryYDL.calls) == 2, str(len(_RetryYDL.calls)))
-    check("play first attempt mobile clients",
+    check("play first attempt cookie-compatible clients",
           _RetryYDL.calls[0].get("extractor_args", {}).get("youtube", {}).get("player_client")
-          == ["android", "ios", "web"], str(_RetryYDL.calls[0].get("extractor_args")))
+          == ["web_embedded", "tv_samsung", "web"], str(_RetryYDL.calls[0].get("extractor_args")))
     check("play retry alternate clients",
           _RetryYDL.calls[1].get("extractor_args", {}).get("youtube", {}).get("player_client")
-          == ["tv", "web"], str(_RetryYDL.calls[1].get("extractor_args")))
+          == ["mweb", "tv", "web"], str(_RetryYDL.calls[1].get("extractor_args")))
 
     class _GenericYDL:
         calls = []
@@ -2328,12 +2497,16 @@ async def main():
     _GenericYDL.calls.clear()
     B._yt_dlp = type("Y", (), {"YoutubeDL": _GenericYDL})
     try:
-        B.resolve_track("test gaana")
+        await B.resolve_track("test gaana")
         check("play generic failure raises", False, "resolve_track did not raise")
     except B.MusicError as _e:
         check("play generic failure raises", str(_e).startswith("search failed"), str(_e))
-    check("play generic failure no retry", len(_GenericYDL.calls) == 1,
-          str(len(_GenericYDL.calls)))
+    check("play generic failure no client retry",
+          all(c.get("extractor_args", {}).get("youtube", {}).get("player_client")
+              == ["web_embedded", "tv_samsung", "web"] for c in _GenericYDL.calls),
+          str(_GenericYDL.calls))
+    check("play generic failure falls back to soundcloud",
+          len(_GenericYDL.calls) == 2, str(len(_GenericYDL.calls)))
     B._yt_dlp = _saved_ydl
 
     # ---- v2.5.1: YouTube cookies (YTDLP_COOKIES env var) for /play ----
@@ -2392,7 +2565,7 @@ async def main():
     _CookieYDL.calls.clear()
     _saved_ydl = B._yt_dlp
     B._yt_dlp = type("Y", (), {"YoutubeDL": _CookieYDL})
-    _cookie_track = B.resolve_track("cookie gaana")
+    _cookie_track = await B.resolve_track("cookie gaana")
     check("yt cookies extract passes cookiefile",
           bool(_CookieYDL.calls) and _CookieYDL.calls[0].get("cookiefile") == _cookie_path,
           str(_CookieYDL.calls[0] if _CookieYDL.calls else None))
@@ -2419,7 +2592,7 @@ async def main():
         pass
     _CookieYDL.calls.clear()
     B._yt_dlp = type("Y", (), {"YoutubeDL": _CookieYDL})
-    B.resolve_track("no cookie gaana")
+    await B.resolve_track("no cookie gaana")
     check("yt cookies unset no cookiefile",
           bool(_CookieYDL.calls) and "cookiefile" not in _CookieYDL.calls[0],
           str(_CookieYDL.calls[0] if _CookieYDL.calls else None))
@@ -2468,7 +2641,7 @@ async def main():
     B._yt_dlp = type("Y", (), {"YoutubeDL": _ScYDL})
     _ScYDL.calls.clear()
     _ScYDL.mode = "yt_blocked_sc_ok"
-    _sc_track = B.resolve_track("sc test gaana")
+    _sc_track = await B.resolve_track("sc test gaana")
     check("sc fallback track source", _sc_track.get("source") == "soundcloud", str(_sc_track))
     check("sc fallback track title", _sc_track["title"] == "SC Gaana", str(_sc_track))
     check("sc fallback tried youtube first",
@@ -2477,19 +2650,19 @@ async def main():
           any(c.startswith("scsearch1:") for c in _ScYDL.calls), str(_ScYDL.calls))
     _ScYDL.calls.clear()
     _ScYDL.mode = "yt_ok"
-    _yt_track = B.resolve_track("yt test gaana")
+    _yt_track = await B.resolve_track("yt test gaana")
     check("sc fallback youtube wins", _yt_track.get("source") == "youtube", str(_yt_track))
     check("sc fallback no soundcloud when youtube works",
           not any(c.startswith("scsearch1:") for c in _ScYDL.calls), str(_ScYDL.calls))
     _ScYDL.calls.clear()
     _ScYDL.mode = "both_blocked"
     try:
-        B.resolve_track("nope gaana")
+        await B.resolve_track("nope gaana")
         check("sc fallback both blocked raises", False)
     except B.MusicError as _e:
         check("sc fallback both blocked raises", str(_e) == "youtube_blocked", str(_e))
     _ScYDL.mode = "yt_blocked_sc_ok"
-    _link_track = B.resolve_track("https://soundcloud.com/test/sc-gaana")
+    _link_track = await B.resolve_track("https://soundcloud.com/test/sc-gaana")
     check("sc fallback direct link", _link_track.get("source") == "soundcloud"
           and _link_track["title"] == "SC Link Gaana", str(_link_track))
     # /play with the fallback: no blocked reply, track found instead
@@ -2517,6 +2690,1252 @@ async def main():
     check("sc fallback player youtube no note",
           "SoundCloud" not in B.music_player_text(-100501), B.music_player_text(-100501))
     B.MUSIC.clear()
+
+    # ---- v2.5.3: layer-158 group-call bridge patch (the /play silence) ----
+    # Live evidence (Railway logs, /play 2026-11-13 12:08 IST): the song
+    # downloaded 100% (7.61 MiB) and the assistant joined the VC, but 1s
+    # later pytgcalls 2.1.0 crashed in its own bridge:
+    #   GroupCallWrapper(update.call.id, update.call.params)
+    #   AttributeError: 'GroupCall' object has no attribute 'params'
+    # and no audio ever started; the assistant left ~10s later. Verified:
+    # Pyrogram 2.0.106 (layer 158) raw GroupCall has NO params slot, and
+    # the RTC join payload now arrives as UpdateGroupCallConnection.
+    # The patch mirrors pytgcalls' own Telethon handler (placeholder ids
+    # fed to the same group_call_update_callback).
+    import types as _modtypes
+    from pyrogram import ContinuePropagation as _ContinuePropagation
+    from pyrogram.raw import types as _RT
+
+    class _FakeGCWrapper:
+        def __init__(self, call_id, params):
+            self.id = call_id
+            self.params = params
+
+    class _FakeGCDiscardedWrapper:
+        pass
+
+    class _FakeUpdateGCWrapper:
+        def __init__(self, chat_id, call):
+            self.chat_id = chat_id
+            self.call = call
+
+    class _FakePyrogramBridge:
+        """The REAL pytgcalls 2.1.0 _process_update, verbatim from the
+        wheel — including the update.call.params crash on layer 158."""
+        def __init__(self):
+            self.group_call = None
+            self.callbacks = []
+            self._update_to_handler = {
+                _RT.UpdateGroupCallParticipants: self._process_group_call_participants_update,
+                _RT.UpdateGroupCall: self._process_group_call_update,
+            }
+
+        async def _cb(self, wrapped):
+            self.callbacks.append(wrapped)
+
+        group_call_update_callback = _cb
+
+        async def _process_group_call_participants_update(self, update):
+            return None
+
+        async def _process_group_call_update(self, update):
+            if isinstance(update.call, _RT.GroupCallDiscarded):
+                call = _FakeGCDiscardedWrapper()
+            else:
+                call = _FakeGCWrapper(update.call.id, update.call.params)
+            wrapped = _FakeUpdateGCWrapper(update.chat_id, call)
+            await self.group_call_update_callback(wrapped)
+
+        async def _process_update(self, _, update, users, chats):
+            if type(update) not in self._update_to_handler.keys():
+                raise _ContinuePropagation
+            if not self.group_call or not update.call or update.call.id != self.group_call.id:
+                raise _ContinuePropagation
+            self.group_call = update.call
+            await self._update_to_handler[type(update)](update)
+
+    _stub_pytg = _modtypes.ModuleType("pytgcalls")
+    _stub_mtproto = _modtypes.ModuleType("pytgcalls.mtproto")
+    _stub_bridge_mod = _modtypes.ModuleType("pytgcalls.mtproto.pyrogram_bridge")
+    _stub_bridge_mod.PyrogramBridge = _FakePyrogramBridge
+    _stub_data = _modtypes.ModuleType("pytgcalls.mtproto.data")
+    _stub_data.GroupCallWrapper = _FakeGCWrapper
+    _stub_data.GroupCallDiscardedWrapper = _FakeGCDiscardedWrapper
+    _stub_data_update = _modtypes.ModuleType("pytgcalls.mtproto.data.update")
+    _stub_data_update.UpdateGroupCallWrapper = _FakeUpdateGCWrapper
+    _stub_names = ("pytgcalls", "pytgcalls.mtproto",
+                   "pytgcalls.mtproto.pyrogram_bridge",
+                   "pytgcalls.mtproto.data", "pytgcalls.mtproto.data.update")
+    _saved_sysmods = {k: sys.modules.get(k) for k in _stub_names}
+    sys.modules["pytgcalls"] = _stub_pytg
+    sys.modules["pytgcalls.mtproto"] = _stub_mtproto
+    sys.modules["pytgcalls.mtproto.pyrogram_bridge"] = _stub_bridge_mod
+    sys.modules["pytgcalls.mtproto.data"] = _stub_data
+    sys.modules["pytgcalls.mtproto.data.update"] = _stub_data_update
+    B._BRIDGE_LAYER158_PATCHED = False
+    _bridge = _FakePyrogramBridge()
+    _bridge.group_call = type("G", (), {"id": 123})()
+    _raw_call = _RT.GroupCall(id=123, access_hash=456, participants_count=2,
+                              unmuted_video_limit=2, version=1)
+    _upd = _RT.UpdateGroupCall(chat_id=-100501, call=_raw_call)
+    # (a) the live crash, reproduced on the REAL raw types
+    try:
+        await _bridge._process_update(None, _upd, [], [])
+        check("bridge patch repro crash", False)
+    except AttributeError as _e:
+        check("bridge patch repro crash", "params" in str(_e), str(_e))
+    # (b) the patch applies and the same update now flows through
+    check("bridge patch applies", B._music_apply_group_call_bridge_patch() is True)
+    check("bridge patch flag set", B._BRIDGE_LAYER158_PATCHED is True)
+    _bridge.callbacks.clear()
+    await _bridge._process_update(None, _upd, [], [])
+    check("bridge patch updategroupcall no crash",
+          len(_bridge.callbacks) == 1
+          and _bridge.callbacks[0].call.id == 123
+          and _bridge.callbacks[0].call.params is None, str(_bridge.callbacks))
+    check("bridge patch updates group_call", _bridge.group_call is _raw_call)
+    # (c) the join payload arrives as UpdateGroupCallConnection
+    _bridge.callbacks.clear()
+    _conn = _RT.UpdateGroupCallConnection(
+        params=_RT.DataJSON(data='{"ufrag":"abc","pwd":"xyz"}'))
+    await _bridge._process_update(None, _conn, [], [])
+    check("bridge patch connection payload",
+          len(_bridge.callbacks) == 1
+          and _bridge.callbacks[0].call.params.data == '{"ufrag":"abc","pwd":"xyz"}',
+          str(_bridge.callbacks))
+    # (d) connection update with no active call is ignored, not a crash
+    _bridge2 = _FakePyrogramBridge()
+    _bridge2.group_call = None
+    try:
+        await _bridge2._process_update(None, _conn, [], [])
+        check("bridge patch connection no call ignored", False)
+    except _ContinuePropagation:
+        check("bridge patch connection no call ignored", True)
+    # (e) discarded call maps to the discarded wrapper
+    _bridge.callbacks.clear()
+    _disc = _RT.GroupCallDiscarded(id=123, access_hash=456, duration=60)
+    await _bridge._process_update(
+        None, _RT.UpdateGroupCall(chat_id=-100501, call=_disc), [], [])
+    check("bridge patch discarded",
+          len(_bridge.callbacks) == 1
+          and isinstance(_bridge.callbacks[0].call, _FakeGCDiscardedWrapper))
+    # (f) update for another call id is ignored
+    _other = _RT.GroupCall(id=999, access_hash=1, participants_count=1,
+                           unmuted_video_limit=1, version=1)
+    try:
+        await _bridge._process_update(
+            None, _RT.UpdateGroupCall(chat_id=-100501, call=_other), [], [])
+        check("bridge patch wrong call ignored", False)
+    except _ContinuePropagation:
+        check("bridge patch wrong call ignored", True)
+    # (g) unrelated updates still delegate to the original handler
+    try:
+        await _bridge._process_update(None, object(), [], [])
+        check("bridge patch delegates unknown", False)
+    except _ContinuePropagation:
+        check("bridge patch delegates unknown", True)
+    # (h) applying twice does not double-wrap the handler
+    _first_patched = _FakePyrogramBridge._process_update
+    check("bridge patch idempotent",
+          B._music_apply_group_call_bridge_patch() is True
+          and _FakePyrogramBridge._process_update is _first_patched)
+    # (i) the assistant startup actually applies the patch
+    _src253 = open(os.path.join(os.path.dirname(B.__file__), "bot.py")).read()
+    check("bridge patch wired into ensure_assistant",
+          _src253.count("_music_apply_group_call_bridge_patch()") >= 2)
+    # restore: stub modules out, flag off (real pytgcalls is not installed
+    # in this venv, so nothing else in the suite depends on the stub)
+    for _k in _stub_names:
+        if _saved_sysmods[_k] is None:
+            sys.modules.pop(_k, None)
+        else:
+            sys.modules[_k] = _saved_sysmods[_k]
+    B._BRIDGE_LAYER158_PATCHED = False
+
+    # ---- v2.5.4: transcode downloads to raw PCM for tgcalls ----
+    # Root cause (Railway logs 2026-11-13 12:31 IST + local repro with
+    # the bot's exact yt-dlp options): with the web_embedded/tv_samsung/web player
+    # clients, "bestaudio/best" has NO audio-only format (YouTube's SABR
+    # experiment hides them), so yt-dlp falls back to "best" = format 18,
+    # an MP4 VIDEO file (h264 + AAC, 4.40 MiB for Mortals, 7.61 MiB for
+    # Pal Pal). tgcalls 2.0.0 cannot play that container — it emits a
+    # high-pitched screech and signals playout-ended after ~10s, so the
+    # queue empties and the assistant leaves ("queue khatam" — confirmed
+    # by Sanji 12:37 IST). The v2.5.3 patch is proven live (its log line
+    # appears 12:31:26, no traceback since), so the remaining failure is
+    # purely the file format. Fix: transcode to raw PCM s16le 48 kHz
+    # stereo with the bundled ffmpeg before handing the file to
+    # GroupCallFile. Tests use the REAL imageio-ffmpeg binary.
+    _ffmpeg_exe = B.music_ffmpeg_setup()
+    check("v254 ffmpeg present", bool(_ffmpeg_exe), str(_ffmpeg_exe))
+    _tone_dir = tempfile.mkdtemp(prefix="chulbuli-tone-")
+    _tone_path = os.path.join(_tone_dir, "tone.wav")
+    # WAV at 48 kHz on purpose: sample-exact, so the transcoded .raw is
+    # exactly 1s x 48000 x 2ch x s16 (AAC would add priming samples).
+    subprocess.run([_ffmpeg_exe, "-y", "-v", "error", "-f", "lavfi",
+                    "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+                    "-c:a", "pcm_s16le", _tone_path], check=True, timeout=60)
+    check("v254 tone generated", os.path.isfile(_tone_path)
+          and os.path.getsize(_tone_path) > 0)
+    # (a) a real 1s tone transcodes to exactly 1s of raw PCM
+    _raw = B._music_transcode_to_raw(_tone_path)
+    check("v254 transcode raw path",
+          _raw is not None and _raw.endswith(".raw"), str(_raw))
+    check("v254 transcode raw size",
+          _raw is not None and os.path.isfile(_raw)
+          and os.path.getsize(_raw) == 48000 * 2 * 2,  # 1s x 48k x 2ch x s16
+          str(os.path.getsize(_raw)) if _raw and os.path.isfile(_raw) else "no file")
+    if _raw:
+        B._music_delete_file(_raw)
+    # (b) garbage bytes fail the transcode cleanly (None, no .raw left)
+    _junk_path = os.path.join(_tone_dir, "junk.m4a")
+    with open(_junk_path, "wb") as _jf:
+        _jf.write(b"fake-audio")
+    check("v254 transcode junk returns none",
+          B._music_transcode_to_raw(_junk_path) is None)
+    check("v254 transcode junk no raw left",
+          not os.path.exists(os.path.splitext(_junk_path)[0] + ".raw"))
+    # (c) no ffmpeg at all -> None (caller keeps the original file)
+    _real_ffmpeg_setup = B.music_ffmpeg_setup
+    B.music_ffmpeg_setup = lambda: None
+    check("v254 transcode no ffmpeg returns none",
+          B._music_transcode_to_raw(_tone_path) is None)
+    B.music_ffmpeg_setup = _real_ffmpeg_setup
+    # (d) download of a real audio file returns the .raw, container gone
+    class _ToneYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            _p = self.opts["outtmpl"].replace("%(ext)s", "m4a")
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
+            shutil.copyfile(_tone_path, _p)
+            return {"title": "Tone Gaana",
+                    "webpage_url": "https://youtube.com/watch?v=tone",
+                    "url": "https://audio.example/tone.m4a", "duration": 1,
+                    "requested_downloads": [{"filepath": _p}]}
+
+    _saved_ydl254 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _ToneYDL})
+    _dl_raw = B._music_download_sync({"title": "Tone Gaana",
+                                      "url": "https://youtube.com/watch?v=tone",
+                                      "audio": "https://audio.example/tone.m4a",
+                                      "duration": 1})
+    check("v254 download returns raw",
+          _dl_raw.endswith(".raw") and os.path.isfile(_dl_raw)
+          and os.path.getsize(_dl_raw) == 48000 * 2 * 2, str(_dl_raw))
+    _raw_stem = os.path.splitext(os.path.basename(_dl_raw))[0]
+    check("v254 download container deleted",
+          not os.path.exists(os.path.join(B._MUSIC_TMPDIR, _raw_stem + ".m4a")),
+          str(os.listdir(B._MUSIC_TMPDIR)))
+    B._music_delete_file(_dl_raw)
+    # (e) download of undecodable bytes falls back to the original file
+    B._yt_dlp = _FakeYtDlp
+    _dl_orig = B._music_download_sync({"title": "Test Gaana",
+                                       "url": "https://youtube.com/watch?v=test",
+                                       "audio": "https://audio.example/test.m4a",
+                                       "duration": 200})
+    check("v254 download fallback keeps original",
+          not _dl_orig.endswith(".raw") and os.path.isfile(_dl_orig), str(_dl_orig))
+    B._music_delete_file(_dl_orig)
+    B._yt_dlp = _saved_ydl254
+    shutil.rmtree(_tone_dir, ignore_errors=True)
+    # (f) the download path is wired to the transcode helper
+    check("v254 download wired to transcode",
+          "_music_transcode_to_raw(path)" in _src253
+          and "def _music_transcode_to_raw" in _src253)
+
+    # ---- v2.5.5: per-user playlists + autoplay ----
+    # Sanji's order 2026-11-13 12:46 IST (right after /play started
+    # working): a ➕ button on the player card adds the song to the
+    # tapper's own playlist, /playlist lists it with play buttons, and
+    # autoplay keeps playing from the requester's playlist when the
+    # queue ends. No fake recommendations — autoplay only ever plays
+    # from a real playlist the user built.
+    def _pl_track(n):
+        return {"title": f"PL Gaana {n}",
+                "url": f"https://youtube.com/watch?v=pl{n}",
+                "audio": f"https://audio.example/pl{n}.m4a",
+                "duration": 200 + n, "source": "youtube"}
+
+    # (a) add / dup / per-user isolation (no shared-list trap)
+    check("playlist add", B.playlist_add(777001, _pl_track(1)) == "added")
+    check("playlist dup", B.playlist_add(777001, _pl_track(1)) == "dup")
+    check("playlist isolation",
+          len(B.user_playlist(777001)) == 1 and B.user_playlist(777002) == [])
+    check("playlist persisted in user",
+          B.get_user(777001).get("playlist") == B.user_playlist(777001))
+    # (b) cap at 50
+    for _n in range(2, 52):
+        B.playlist_add(777009, _pl_track(_n))
+    check("playlist cap 50", len(B.user_playlist(777009)) == 50)
+    check("playlist full", B.playlist_add(777009, _pl_track(99)) == "full")
+    # (c) /playlist list: titles + play/remove/clear buttons
+    B.playlist_add(777002, _pl_track(1))
+    B.playlist_add(777002, _pl_track(2))
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    await B.cmd_music(client, FakeMessage("/playlist", uid=777002, name="Tester", chat_id=-100505))
+    _pl_text = FakeMessage.outbox[-1][1] if FakeMessage.outbox else ""
+    check("playlist list shows songs",
+          "PL Gaana 1" in _pl_text and "PL Gaana 2" in _pl_text, _pl_text)
+    _pl_markup = FakeMessage.outbox_full[-1][2].get("reply_markup") if FakeMessage.outbox_full else None
+    _pl_datas = [b.callback_data for _row in (_pl_markup.inline_keyboard if _pl_markup else [])
+                 for b in _row]
+    # v2.6.17 — one ▶️ button per song (no per-song ❌: 50 songs x 2 + clear
+    # would exceed Telegram's 100-button limit); delete is clear-all only.
+    check("playlist list buttons",
+          "mus:plplay:0" in _pl_datas and "mus:plplay:1" in _pl_datas
+          and "mus:plclear" in _pl_datas
+          and not any(d.startswith("mus:pldel") for d in _pl_datas),
+          str(_pl_datas))
+    # (d) /playlist empty -> khaali
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/playlist", uid=777005, name="Tester", chat_id=-100505))
+    check("playlist empty", any("khaali" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    # (e) mocked assistant for the play paths (same fakes as the music test)
+    _real_factory255 = B._GroupCallFactory
+    _real_mkc255 = B._music_make_client
+    _real_session255 = B.ASSISTANT_SESSION
+    _real_ydl255 = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    FakeMessage.outbox.clear()
+    # (f) /playlist 2 plays the 2nd song
+    await B.cmd_music(client, FakeMessage("/playlist 2", uid=777002, name="Tester", chat_id=-100505))
+    check("playlist play by number",
+          B.music_state(-100505).get("playing") is True
+          and B.music_state(-100505)["current"]["title"] == "PL Gaana 2",
+          str(B.music_state(-100505).get("current")))
+    check("playlist play sets by", B.music_state(-100505)["current"]["by_id"] == 777002)
+    # (g) /playlist 99 -> honest reply, nothing changes
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/playlist 99", uid=777002, name="Tester", chat_id=-100505))
+    check("playlist bad number",
+          any("itna gaana nahi" in t for _, t in FakeMessage.outbox))
+    # (h) ➕ button adds the playing song to the TAPPER's playlist (not the requester's)
+    _st506 = B.music_state(-100506)
+    _st506["current"] = dict(_pl_track(3), by="Tester", by_id=777002)
+    _st506["playing"] = True
+    FakeMessage.outbox.clear()
+    await B.music_callbacks(client, FakeCallbackQuery(
+        "mus:addpl", uid=777003, name="Tapper",
+        message=FakeMessage("player", uid=111, name="Tester", chat_id=-100506)))
+    check("playlist addpl adds to tapper",
+          any(t["url"].endswith("pl3") for t in B.user_playlist(777003))
+          and any("playlist me add" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    FakeMessage.outbox.clear()
+    await B.music_callbacks(client, FakeCallbackQuery(
+        "mus:addpl", uid=777003, name="Tapper",
+        message=FakeMessage("player", uid=111, name="Tester", chat_id=-100506)))
+    check("playlist addpl dup",
+          any("pehle se" in t for _, t in FakeMessage.outbox))
+    # (i) ▶️ button on a /playlist row plays that song
+    FakeMessage.outbox.clear()
+    await B.music_callbacks(client, FakeCallbackQuery(
+        "mus:plplay:0", uid=777002, name="Tester",
+        message=FakeMessage("/playlist", uid=777002, name="Tester", chat_id=-100505)))
+    check("playlist button plays",
+          B.music_state(-100505)["current"]["title"] == "PL Gaana 1"
+          or any("queue me add" in t for _, t in FakeMessage.outbox),
+          str(B.music_state(-100505).get("current")))
+    # (j) v2.6.17 — per-song ❌ REMOVED (see (c) above): /playlist now
+    # shows one ▶️ button per song, and delete is clear-all only, so
+    # there is no mus:pldel callback left to test.
+    # (k) autoplay: queue empty -> next song from the requester's playlist
+    B.playlist_add(777004, _pl_track(1))
+    B.playlist_add(777004, _pl_track(2))
+    _st507 = B.music_state(-100507)
+    _st507["current"] = dict(_pl_track(1), by="Tester", by_id=777004)
+    _st507["playing"] = True
+    _st507["queue"] = []
+    await B._music_play_next(-100507)
+    check("autoplay picks next from playlist",
+          B.music_state(-100507).get("current", {}).get("title") == "PL Gaana 2"
+          and B.music_state(-100507).get("playing") is True,
+          str(B.music_state(-100507).get("current")))
+    check("autoplay marks track",
+          B.music_state(-100507).get("current", {}).get("autoplay") is True
+          and "autoplay" in B.music_player_text(-100507),
+          B.music_player_text(-100507))
+    check("queue text shows autoplay on", "autoplay ON" in B.music_queue_text(-100507))
+    # (l) autoplay OFF -> queue empty leaves like before
+    _st507["autoplay"] = False
+    _st507["current"] = dict(_pl_track(2), by="Tester", by_id=777004)
+    _st507["playing"] = True
+    _st507["queue"] = []
+    await B._music_play_next(-100507)
+    check("autoplay off leaves",
+          B.music_state(-100507).get("playing") is False
+          and B.music_state(-100507).get("current") is None)
+    # (m) autoplay with an empty playlist also leaves
+    _st507["autoplay"] = True
+    _st507["current"] = dict(_pl_track(1), by="Tester", by_id=777005)
+    _st507["playing"] = True
+    _st507["queue"] = []
+    await B._music_play_next(-100507)
+    check("autoplay empty playlist leaves",
+          B.music_state(-100507).get("playing") is False)
+    # (n) /autoplay toggles the per-chat flag
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/autoplay", uid=111, name="Tester", chat_id=-100507))
+    check("autoplay toggle off",
+          B.music_state(-100507).get("autoplay") is False
+          and any("OFF" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/autoplay", uid=111, name="Tester", chat_id=-100507))
+    check("autoplay toggle on",
+          B.music_state(-100507).get("autoplay") is True
+          and any("ON" in t for _, t in FakeMessage.outbox))
+    # (o) /playlist clear empties it
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/playlist clear", uid=777002, name="Tester", chat_id=-100505))
+    check("playlist clear command",
+          B.user_playlist(777002) == []
+          and any("saaf" in t for _, t in FakeMessage.outbox))
+    # (p) stop the test playback + restore the music fakes
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100505))
+    B._yt_dlp = _real_ydl255
+    B._GroupCallFactory = _real_factory255
+    B._music_make_client = _real_mkc255
+    B.ASSISTANT_SESSION = _real_session255
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+    check("playlist enqueue shared helper",
+          _src253.count("_music_enqueue_track(message.chat.id, track, message)") >= 2)
+    # tidy up the test users so data.json does not keep them
+    for _tuid in ("777001", "777002", "777003", "777004", "777005", "777009"):
+        B.DATA["users"].pop(_tuid, None)
+    B.save_data()
+
+    # ---- v2.5.6: bigger AI models + reply filter + SC download fallback ----
+    # Sanji 2026-11-13 ~14:00 IST showed Chulbuli rambling and losing
+    # track mid-sentence, and the YouTube block error coming back on
+    # /play. Two root causes: (1) the AI list tried a 1.7B model FIRST
+    # and accepted its first non-empty reply; (2) resolve_track falls
+    # back to SoundCloud only when the SEARCH is blocked — a download
+    # blocked after a successful search just died with the error.
+    _live_free_256 = {
+        "apodex/apodex-1.1-mini:free", "baidu/ernie-5.5-flash-preview:free",
+        "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free",
+        "google/gemma-4-26b-a4b-it:free", "google/gemma-4-31b-it:free",
+        "google/lyria-3-clip-preview", "google/lyria-3-pro-preview",
+        "liquid/lfm-2.5-2.6b:free", "liquid/lfm-3-1.7b:free",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "nvidia/nemotron-3.5-super-vl:free", "openrouter/free",
+        "particle-ai/particle-1:free", "recursive/flint-v1.0:free",
+        "thinkingmachines/inkling-2-small:free"}
+    check("ai big model first", B.AI_MODELS[0] == "google/gemma-4-31b-it:free"
+          and B.AI_MODELS[1] == "google/gemma-4-26b-a4b-it:free",
+          str(B.AI_MODELS[:3]))
+    check("ai tiny models last",
+          B.AI_MODELS.index("liquid/lfm-3-1.7b:free") > B.AI_MODELS.index("google/gemma-4-31b-it:free"))
+    check("ai models all live-free",
+          all(m in _live_free_256 for m in B.AI_MODELS), str(B.AI_MODELS))
+    check("ai no lyria music models",
+          not any("lyria" in m for m in B.AI_MODELS))
+    check("ai models unique", len(B.AI_MODELS) == len(set(B.AI_MODELS)))
+    check("ai system bans echo/confusion",
+          "NEVER repeat back" in B.AI_SYSTEM and "do NOT say you are" in B.AI_SYSTEM)
+    # (b) the reply filter rejects exactly the failures Sanji saw
+    check("ai filter ok normal",
+          B._ai_reply_ok("hiee yaar, kya kar rahe ho", "kya kar rahe ho"))
+    check("ai filter ok hinglish",
+          B._ai_reply_ok("hehe acha, aur batao na", "aur batao"))
+    check("ai filter rejects empty", not B._ai_reply_ok("", "hello"))
+    check("ai filter rejects short", not B._ai_reply_ok("hi", "hello"))
+    check("ai filter rejects ai admission",
+          not B._ai_reply_ok("As an AI language model, I cannot do that", "tum ai ho?"))
+    check("ai filter rejects confusion",
+          not B._ai_reply_ok("Mmm, okay, wait no — I'm getting confused now. What were we talking about?", "kya baat hai"))
+    check("ai filter rejects echo",
+          not B._ai_reply_ok("Sanjiji: Ik to ye samajh me nahi aata", "Ik to ye samajh me nahi aata"))
+    check("ai filter rejects verbatim",
+          not B._ai_reply_ok("Ik to ye samajh me nahi aata", "Ik to ye samajh me nahi aata"))
+    check("ai filter rejects repeat",
+          not B._ai_reply_ok("hehe\nhehe\nhehe", "kya hua"))
+    check("ai filter rejects mmm start",
+          not B._ai_reply_ok("Mmm, okay, so like...", "batao"))
+    # (c) history + final message carry NO "Name: " prefix any more
+    _real_ai_post = B._ai_post
+    _captured_msgs = []
+    B._ai_post = lambda provider, model, messages: (_captured_msgs.append(messages), None)[1]
+    _saved_key = os.environ.get("OPENROUTER_API_KEY")
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey256"
+    B.DATA.setdefault("history", {})["-100123"] = [
+        {"u": "Sanjiji", "t": "Ik to ye samajh me nahi aata", "c": 0},
+        {"u": "", "t": "hehe acha", "c": 1}]
+    _ai_out = await B.ai_chat_reply("Ik to ye samajh me nahi aata", "Sanjiji", -100123, 111)
+    check("ai no key needed path returns none", _ai_out is None)
+    _sent = _captured_msgs[0] if _captured_msgs else []
+    _non_system = [m for m in _sent if m.get("role") != "system"]
+    check("ai history has no name prefix",
+          all("Sanjiji:" not in (m.get("content") or "") for m in _non_system),
+          str(_non_system))
+    check("ai final message is plain text",
+          _non_system and _non_system[-1].get("content") == "Ik to ye samajh me nahi aata",
+          str(_non_system[-1] if _non_system else None))
+    B._ai_post = _real_ai_post
+    if _saved_key is None:
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    else:
+        os.environ["OPENROUTER_API_KEY"] = _saved_key
+    B.DATA.get("history", {}).pop("-100123", None)
+    # (d) SoundCloud download fallback: unit + live play_next integration
+    _real_extract256 = B._yt_extract
+    _sc_info = {"title": "SC Gaana", "webpage_url": "https://soundcloud.com/x/sc-gaana",
+                "url": "https://audio.example/sc.mp3", "duration": 180}
+    B._yt_extract = lambda src, **kw: dict(_sc_info)
+    _yt_track = {"title": "YT Gaana", "url": "https://youtube.com/watch?v=yt1",
+                 "audio": "https://audio.example/yt1.m4a", "duration": 200,
+                 "source": "youtube", "by": "Tester", "by_id": 111}
+    _sc_track = B._music_sc_fallback(_yt_track)
+    check("sc fallback returns soundcloud",
+          _sc_track is not None and _sc_track.get("source") == "soundcloud"
+          and _sc_track.get("title") == "SC Gaana", str(_sc_track))
+    B._yt_extract = lambda src, **kw: (_ for _ in ()).throw(B.MusicError("youtube_blocked"))
+    check("sc fallback none on failure", B._music_sc_fallback(_yt_track) is None)
+    B._yt_extract = lambda src, **kw: dict(_sc_info)
+    # integration: youtube download blocked -> same song plays from SC
+    _real_factory256 = B._GroupCallFactory
+    _real_mkc256 = B._music_make_client
+    _real_session256 = B.ASSISTANT_SESSION
+    _real_ydl256 = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _real_dl_audio = B._music_download_audio
+    _dl_calls = {"n": 0}
+
+    async def _dl_once(track):
+        _dl_calls["n"] += 1
+        if _dl_calls["n"] == 1:
+            raise B.MusicError("youtube_blocked")
+        return await _real_dl_audio(track)
+
+    B._music_download_audio = _dl_once
+    await B._music_ensure_assistant()
+    B.music_queue_add(-100508, dict(_yt_track))
+    await B._music_play_next(-100508)
+    _st508 = B.music_state(-100508)
+    check("sc fallback plays on download block",
+          _st508.get("playing") is True
+          and _st508.get("current", {}).get("source") == "soundcloud"
+          and _st508.get("current", {}).get("title") == "SC Gaana",
+          str(_st508.get("current")))
+    check("sc fallback player says soundcloud",
+          "SoundCloud se" in B.music_player_text(-100508),
+          B.music_player_text(-100508))
+    FakeMessage.outbox.clear()
+    await B.cmd_music(client, FakeMessage("/stop", uid=111, name="Tester", chat_id=-100508))
+    B._music_download_audio = _real_dl_audio
+    B._yt_extract = _real_extract256
+    B._yt_dlp = _real_ydl256
+    B._GroupCallFactory = _real_factory256
+    B._music_make_client = _real_mkc256
+    B.ASSISTANT_SESSION = _real_session256
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+
+    # ---- v2.5.6 (owner panel): AI model + system prompt + more, /panel removed ----
+    # Sanji 2026-11-13 14:03 IST: system prompt + model change buttons in
+    # the owner panel, "or bhi bahut kuchh", /panel command HATAO — uski
+    # jagah menu me Owner Panel button jo sirf owner ko dikhe.
+    def _own_datas(kb):
+        return [b.callback_data for row in (kb.inline_keyboard if kb else [])
+                for b in row]
+
+    _mk_owner = B.main_menu_keyboard(B.OWNER_ID)
+    _mk_other = B.main_menu_keyboard(111)
+    check("panel menu button owner only",
+          "menu:owner" in _own_datas(_mk_owner)
+          and "menu:owner" not in _own_datas(_mk_other)
+          and "menu:owner" not in _own_datas(B.main_menu_keyboard()))
+    check("panel text shows ai settings",
+          "AI Model:" in B.owner_panel_text()
+          and "System Prompt:" in B.owner_panel_text())
+    check("panel keyboard has new rows",
+          "own:model" in _own_datas(B.owner_keyboard())
+          and "own:prompt" in _own_datas(B.owner_keyboard())
+          and "own:give" in _own_datas(B.owner_keyboard())
+          and "own:music" in _own_datas(B.owner_keyboard()))
+    # model order helper
+    _saved_model = B.DATA.get("ai_model", "auto")
+    B.DATA["ai_model"] = "auto"
+    check("panel model order auto", B.ai_model_order() == B.AI_MODELS)
+    B.DATA["ai_model"] = B.AI_MODELS[1]
+    check("panel model order picked first",
+          B.ai_model_order()[0] == B.AI_MODELS[1]
+          and len(B.ai_model_order()) == len(B.AI_MODELS))
+    B.DATA["ai_model"] = "bogus/model:free"
+    check("panel model order bogus falls back", B.ai_model_order() == B.AI_MODELS)
+    B.DATA["ai_model"] = _saved_model
+    # system prompt helper
+    _saved_sys = B.DATA.get("ai_system", "")
+    B.DATA["ai_system"] = ""
+    check("panel system default", B.ai_system_prompt() == B.AI_SYSTEM)
+    B.DATA["ai_system"] = "You are a test prompt, be nice."
+    check("panel system custom", B.ai_system_prompt() == "You are a test prompt, be nice.")
+    B.DATA["ai_system"] = _saved_sys
+    # model screen + pick via callbacks
+    _own_msg = FakeMessage("/owner", uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID)
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:model", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel model screen lists models",
+          FakeMessage.edits and "gemma-4-31b" in FakeMessage.edits[-1][1],
+          str([e[1][:80] for e in FakeMessage.edits]))
+    await B.owner_callbacks(client, FakeCallbackQuery("own:pick:1", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel model pick sets",
+          B.DATA.get("ai_model") == B.AI_MODELS[1], str(B.DATA.get("ai_model")))
+    await B.owner_callbacks(client, FakeCallbackQuery("own:pick:auto", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel model pick auto", B.DATA.get("ai_model") == "auto")
+    # system prompt screen + edit + reset
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:prompt", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel prompt screen",
+          FakeMessage.edits and "System Prompt" in FakeMessage.edits[-1][1])
+    await B.owner_callbacks(client, FakeCallbackQuery("own:prompt_edit", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel prompt edit waits", B.OWNER_PENDING.get(B.OWNER_ID) == "prompt")
+    FakeMessage.outbox.clear()
+    await B.handle_owner_pending(FakeMessage("short", uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID))
+    check("panel prompt too short rejected",
+          B.DATA.get("ai_system", "") == _saved_sys
+          and B.OWNER_PENDING.get(B.OWNER_ID) == "prompt")
+    await B.handle_owner_pending(FakeMessage(
+        "You are Chulbuli, a sweet girl who loves cricket and music.",
+        uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID))
+    check("panel prompt saved",
+          B.DATA.get("ai_system") == "You are Chulbuli, a sweet girl who loves cricket and music."
+          and B.OWNER_ID not in B.OWNER_PENDING)
+    await B.owner_callbacks(client, FakeCallbackQuery("own:prompt_reset", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel prompt reset", B.DATA.get("ai_system") == "")
+    B.DATA["ai_system"] = _saved_sys
+    # ---- v2.6.4: AI providers (Sanji: "provider change karo, provider ke
+    # hisab se model aa jaye"; "scripted msg" = OpenRouter free limit hit,
+    # so the chain now falls through to Groq/Gemini when they have a key) ----
+    _saved_prov = B.DATA.get("ai_provider", "openrouter")
+    _saved_keys = dict(B.DATA.get("ai_keys") or {})
+    _saved_env_or = os.environ.get("OPENROUTER_API_KEY")
+    _saved_env_gr = os.environ.get("GROQ_API_KEY")
+    _saved_env_ge = os.environ.get("GEMINI_API_KEY")
+    B.DATA["ai_keys"] = {}
+    B.DATA["ai_provider"] = "openrouter"
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    os.environ.pop("GROQ_API_KEY", None)
+    os.environ.pop("GEMINI_API_KEY", None)
+    check("v264 provider order default", B.ai_provider_order() == ["openrouter"])
+    os.environ["GROQ_API_KEY"] = "gsk_testenv123"
+    check("v264 provider order with groq key", B.ai_provider_order() == ["openrouter", "groq"])
+    B.DATA["ai_provider"] = "groq"
+    check("v264 provider order groq first", B.ai_provider_order() == ["groq"])
+    B.DATA["ai_provider"] = "openrouter"
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-envkeyor123"
+    check("v264 key env fallback", B._ai_key_for("openrouter") == "sk-or-v1-envkeyor123")
+    B.DATA["ai_keys"] = {"openrouter": "sk-or-v1-panelkeyor123"}
+    check("v264 key panel beats env", B._ai_key_for("openrouter") == "sk-or-v1-panelkeyor123")
+    check("v264 key masked", "sk-or-v1-panelkeyor123" not in B._ai_key_masked("openrouter")
+          and "****" in B._ai_key_masked("openrouter"))
+    B.DATA["ai_model"] = "openai/gpt-oss-120b"
+    check("v264 groq pick first", B.ai_model_order("groq")[0] == "openai/gpt-oss-120b")
+    check("v264 other provider pick ignored",
+          B.ai_model_order("openrouter")[0] == "google/gemma-4-31b-it:free")
+    B.DATA["ai_model"] = "auto"
+    _real_post264 = B._ai_post
+    def _fail_or_then(provider, model, messages):
+        if provider == "openrouter":
+            return None
+        return "groq se jawab 🙂"
+    B._ai_post = _fail_or_then
+    B.DATA["toggles"]["ai"] = True
+    _r264 = await B.ai_chat_reply("aur batao", "Tester", chat_id=-100301, user_id=111)
+    B._ai_post = _real_post264
+    check("v264 fallback to groq", _r264 == "groq se jawab 🙂", str(_r264))
+    _seen_urls264 = []
+    def _cap_urlopen264(req, timeout=None):
+        _seen_urls264.append(req.full_url)
+        return _FakeResp({"choices": [{"message": {"content": "ok 🙂"}}]})
+    _real_urlopen264 = urllib.request.urlopen
+    urllib.request.urlopen = _cap_urlopen264
+    try:
+        _o264 = B._ai_post("groq", "openai/gpt-oss-20b", [{"role": "user", "content": "hi"}])
+        _p264 = B._ai_post("openrouter", "google/gemma-4-31b-it:free", [{"role": "user", "content": "hi"}])
+    finally:
+        urllib.request.urlopen = _real_urlopen264
+    check("v264 post hits provider urls", _o264 == "ok 🙂" and _p264 == "ok 🙂"
+          and _seen_urls264[0].startswith("https://api.groq.com/openai/v1/chat/completions")
+          and _seen_urls264[1].startswith("https://openrouter.ai/api/v1/chat/completions"),
+          str(_seen_urls264))
+    check("v264 panel shows provider",
+          "Provider:" in B.owner_panel_text() and "API Key:" in B.owner_panel_text())
+    check("v264 panel keyboard provider+key",
+          "own:provider" in _own_datas(B.owner_keyboard())
+          and "own:key" in _own_datas(B.owner_keyboard()))
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:provider", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 provider screen lists all",
+          FakeMessage.edits and all(p in FakeMessage.edits[-1][1] for p in ("OpenRouter", "Groq", "Gemini")))
+    await B.owner_callbacks(client, FakeCallbackQuery("own:pickprov:groq", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 pick provider groq", B.DATA.get("ai_provider") == "groq"
+          and B.DATA.get("ai_model") == "auto")
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:model", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 model screen follows provider",
+          FakeMessage.edits and "gpt-oss-120b" in FakeMessage.edits[-1][1]
+          and "gemma-4-31b" not in FakeMessage.edits[-1][1])
+    await B.owner_callbacks(client, FakeCallbackQuery("own:pick:0", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 model pick groq", B.DATA.get("ai_model") == "openai/gpt-oss-120b")
+    await B.owner_callbacks(client, FakeCallbackQuery("own:key", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 key screen", FakeMessage.edits and "API Key" in FakeMessage.edits[-1][1])
+    await B.owner_callbacks(client, FakeCallbackQuery("own:key_edit", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 key edit waits", B.OWNER_PENDING.get(B.OWNER_ID) == "key")
+    FakeMessage.outbox.clear()
+    await B.handle_owner_pending(FakeMessage("gsk_testkey1234567890abcd", uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID))
+    check("v264 key saved masked", B.DATA.get("ai_keys", {}).get("groq") == "gsk_testkey1234567890abcd"
+          and B.OWNER_ID not in B.OWNER_PENDING
+          and any("****abcd" in t and "gsk_testkey1234567890abcd" not in t for _, t in FakeMessage.outbox))
+    await B.owner_callbacks(client, FakeCallbackQuery("own:key_clear", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v264 key clear", B.DATA.get("ai_keys", {}).get("groq") is None)
+    B.DATA["ai_provider"] = _saved_prov
+    B.DATA["ai_keys"] = _saved_keys
+    B.DATA["ai_model"] = _saved_model
+    for _k264, _v264 in (("OPENROUTER_API_KEY", _saved_env_or),
+                         ("GROQ_API_KEY", _saved_env_gr),
+                         ("GEMINI_API_KEY", _saved_env_ge)):
+        if _v264 is None:
+            os.environ.pop(_k264, None)
+        else:
+            os.environ[_k264] = _v264
+    # ---- v2.6.5: ALL free models per provider (Sanji: "provider groq set
+    # kiya to models sirf groq ka dikhaye ... sabhi models dikhaye har
+    # provider ka ... Free wale") ----
+    check("v265 groq all free models", B.AI_PROVIDERS["groq"]["models"]
+          == ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"])
+    _gem265 = B.AI_PROVIDERS["gemini"]["models"]
+    check("v265 gemini all free models", _gem265[0] == "gemini-3.8-flash"
+          and "gemini-4-hydrogen" in _gem265
+          and "gemini-3.6-flash" in _gem265 and "gemini-3-flash-preview" in _gem265
+          and "gemini-3.5-flash-lite" in _gem265 and "gemini-3.1-flash-lite" in _gem265
+          and len(_gem265) == 7)
+    check("v265 gemini dead models removed", "gemini-2.0-flash" not in _gem265
+          and "gemini-2.5-flash" not in _gem265
+          and "gemini-2.5-pro" not in _gem265)
+    check("v265 groq no enterprise llama",
+          all("llama" not in m for m in B.AI_PROVIDERS["groq"]["models"]))
+    B.DATA["ai_provider"] = "gemini"
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:model", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("v265 gemini screen only gemini",
+          FakeMessage.edits and "gemini-3.8-flash" in FakeMessage.edits[-1][1]
+          and "gpt-oss" not in FakeMessage.edits[-1][1]
+          and "gemma-4-31b" not in FakeMessage.edits[-1][1])
+    B.DATA["ai_provider"] = _saved_prov
+    B.DATA["ai_model"] = _saved_model
+    # ---- v2.6.6: thoda roast + thoda attitude + friendly (Sanji 22:21 IST) ----
+    check("v266 system roast+attitude", "roast" in B.AI_SYSTEM.lower()
+          and "attitude" in B.AI_SYSTEM.lower()
+          and "friendly" in B.AI_SYSTEM.lower()
+          and "queen" in B.AI_SYSTEM.lower())
+    # ---- v2.6.7: roast ki koi limit nahi (Sanji 22:29 IST: "ye limit achhi
+    # nahi hai gali chalegi bezati bhi bura lagne wala bhi chalega") ----
+    check("v267 system roast no limits", "koi limit nahi" in B.AI_SYSTEM.lower()
+          and "gaali bhi chalegi" in B.AI_SYSTEM.lower()
+          and "beizzati bhi" in B.AI_SYSTEM.lower())
+    check("v267 old bans gone", "kabhi gaali nahi" not in B.AI_SYSTEM.lower()
+          and "kabhi beizzati nahi" not in B.AI_SYSTEM.lower()
+          and "bura lagane wala nahi" not in B.AI_SYSTEM.lower())
+    check("v267 attitude still halka", "halka" in B.AI_SYSTEM.lower())
+    check("v267 fallback spicy lines", any("bakwas" in s for s in B.CHAT_DEFAULT))
+    check("v266 system still ladki bhasha", "LADKI BHASHA" in B.AI_SYSTEM
+          and "btati hun" in B.AI_SYSTEM and "1-2 lines" in B.AI_SYSTEM)
+    check("v266 fallback roast lines", any("smart lag raha hai" in s for s in B.CHAT_DEFAULT)
+          and any("queen hun" in s for s in B.CHAT_DEFAULT))
+    check("v266 roast lines pass gate",
+          B._ai_reply_ok("arre waah, aaj to tu bhi smart lag raha hai 😏")
+          and B._ai_reply_ok("main to queen hun, pehle bata kya chahiye 👑")
+          and B._ai_reply_ok("itni der soch raha tha, abhi tak samajh nahi aaya? hehe"))
+    _greet_seen266 = {B._greet("Test") for _ in range(50)}
+    check("v266 greet has roast variant",
+          any("😏" in g or "queen" in g for g in _greet_seen266))
+    _cont_seen266 = {B._continue("Test") for _ in range(50)}
+    check("v266 continue has attitude variant",
+          any("busy hun" in c for c in _cont_seen266))
+    # ---- v2.6.8: owner ko asli error, users ko scripted (Sanji 22:35 IST:
+    # "owner ko real reply de yani error de or users ko scripted de jab bhi
+    # koi error ho") ----
+    _saved_keys268 = dict(B.DATA.get("ai_keys") or {})
+    _saved_env_or268 = os.environ.get("OPENROUTER_API_KEY")
+    _saved_env_gr268 = os.environ.get("GROQ_API_KEY")
+    _saved_env_ge268 = os.environ.get("GEMINI_API_KEY")
+    _saved_429_268 = dict(B._AI_LAST_429)
+    _saved_ai268 = B.DATA["toggles"]["ai"]
+    B._AI_LAST_429.clear()
+    B.DATA["ai_keys"] = {}
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    os.environ.pop("GROQ_API_KEY", None)
+    os.environ.pop("GEMINI_API_KEY", None)
+    B.DATA["toggles"]["ai"] = True
+    _r268 = await B.ai_chat_reply("hello", "Tester", chat_id=-100301, user_id=111)
+    check("v268 no key error", _r268 is None
+          and "key" in B._AI_LAST_ERROR.lower())
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
+    _real_post268 = B._ai_post
+    def _fail_post268(provider, model, messages):
+        B._AI_LAST_POST_ERROR = "429 (free limit)"
+        return None
+    B._ai_post = _fail_post268
+    _r268b = await B.ai_chat_reply("hello", "Tester", chat_id=-100301, user_id=111)
+    check("v268 chain fail error", _r268b is None
+          and "OpenRouter" in B._AI_LAST_ERROR and "429" in B._AI_LAST_ERROR)
+    _owner_r268 = await B.chat_reply_ai("hello", "Tester", chat_id=-100301, user_id=B.OWNER_ID)
+    check("v268 owner gets real error", _owner_r268.startswith("⚠️ AI error:")
+          and "429" in _owner_r268)
+    _user_r268 = await B.chat_reply_ai("hello", "Tester", chat_id=-100301, user_id=111)
+    check("v268 user gets scripted", _user_r268 and "AI error" not in _user_r268)
+    check("v268 panel shows last error", "Last AI error" in B.owner_panel_text()
+          and "429" in B.owner_panel_text())
+    B._ai_post = lambda provider, model, messages: "haan bolo, kya hua 🙂"
+    _r268c = await B.ai_chat_reply("hello", "Tester", chat_id=-100301, user_id=111)
+    check("v268 success clears error", _r268c is not None and B._AI_LAST_ERROR == "")
+    check("v268 panel hides error when clear", "Last AI error" not in B.owner_panel_text())
+    B._ai_post = _real_post268
+    B._AI_LAST_429.clear()
+    B._AI_LAST_429.update(_saved_429_268)
+    B.DATA["ai_keys"] = _saved_keys268
+    B.DATA["toggles"]["ai"] = _saved_ai268
+    for _k268, _v268 in (("OPENROUTER_API_KEY", _saved_env_or268),
+                         ("GROQ_API_KEY", _saved_env_gr268),
+                         ("GEMINI_API_KEY", _saved_env_ge268)):
+        if _v268 is None:
+            os.environ.pop(_k268, None)
+        else:
+            os.environ[_k268] = _v268
+    # ---- v2.6.9: key format guard (a Groq key pasted under the wrong
+    # provider 401'd OpenRouter; a wrong-format key must be ignored so the
+    # right key is used, and reported instead of silently skipped) ----
+    _saved_keys269 = dict(B.DATA.get("ai_keys") or {})
+    _saved_env_or269 = os.environ.get("OPENROUTER_API_KEY")
+    _saved_env_gr269 = os.environ.get("GROQ_API_KEY")
+    _saved_ai269 = B.DATA["toggles"]["ai"]
+    B.DATA["ai_keys"] = {}
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    os.environ.pop("GROQ_API_KEY", None)
+    B.DATA["ai_keys"] = {"openrouter": "gsk_wrongproviderkey123"}
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-goodenvkey123"
+    check("v269 wrong panel key ignored", B._ai_key_for("openrouter") == "sk-or-v1-goodenvkey123")
+    B.DATA["ai_keys"] = {"groq": "gsk_goodpanelkey123"}
+    os.environ.pop("GROQ_API_KEY", None)
+    check("v269 right panel key used", B._ai_key_for("groq") == "gsk_goodpanelkey123")
+    B.DATA["ai_keys"] = {"groq": "  gsk_spacedkey123  \n"}
+    check("v269 key stripped", B._ai_key_for("groq") == "gsk_spacedkey123")
+    B.DATA["ai_keys"] = {"groq": "sk-or-v1-wrongformat123"}
+    os.environ.pop("GROQ_API_KEY", None)
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-goodenvkey123"
+    B.DATA["toggles"]["ai"] = True
+    B._AI_LAST_429.clear()
+    _real_post269 = B._ai_post
+    B._ai_post = lambda provider, model, messages: None
+    B._AI_LAST_POST_ERROR = "429 (free limit)"
+    _r269 = await B.ai_chat_reply("hello", "Tester", chat_id=-100301, user_id=111)
+    check("v269 wrong format reported", _r269 is None
+          and "format galat" in B._AI_LAST_ERROR
+          and "Groq" in B._AI_LAST_ERROR)
+    B._ai_post = _real_post269
+    B.DATA["ai_keys"] = _saved_keys269
+    B.DATA["toggles"]["ai"] = _saved_ai269
+    for _k269, _v269 in (("OPENROUTER_API_KEY", _saved_env_or269),
+                         ("GROQ_API_KEY", _saved_env_gr269)):
+        if _v269 is None:
+            os.environ.pop(_k269, None)
+        else:
+            os.environ[_k269] = _v269
+    # ---- v2.6.10: 403 body tells Cloudflare-1010 (network block, key
+    # never checked — a fake key gets the same 1010) apart from a real
+    # key rejection. Proven live 2026-11-13 23:24 IST: my VM got 403/1010
+    # for a fake key AND Sanji's real key alike. ----
+    import urllib.error as _urlerr2610
+    _real_urlopen2610 = urllib.request.urlopen
+    def _raise_1010(req, timeout=None):
+        raise _urlerr2610.HTTPError(
+            req.full_url if hasattr(req, "full_url") else str(req),
+            403, "Forbidden", None, io.BytesIO(b"error code: 1010"))
+    def _raise_401body(req, timeout=None):
+        raise _urlerr2610.HTTPError(
+            req.full_url if hasattr(req, "full_url") else str(req),
+            401, "Unauthorized", None,
+            io.BytesIO(b'{"error":{"message":"Invalid API Key","type":"invalid_request_error"}}'))
+    def _raise_403plain(req, timeout=None):
+        raise _urlerr2610.HTTPError(
+            req.full_url if hasattr(req, "full_url") else str(req),
+            403, "Forbidden", None, io.BytesIO(b'{"error":{"message":"Forbidden"}}'))
+    os.environ["GROQ_API_KEY"] = "gsk_testkey123"
+    urllib.request.urlopen = _raise_1010
+    try:
+        _r2610a = B._ai_post("groq", "openai/gpt-oss-120b", [{"role": "user", "content": "hi"}])
+    finally:
+        urllib.request.urlopen = _real_urlopen2610
+    check("v2610 1010 classified", _r2610a is None
+          and "1010" in B._AI_LAST_POST_ERROR
+          and "key check nahi hui" in B._AI_LAST_POST_ERROR,
+          B._AI_LAST_POST_ERROR)
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkey123"
+    urllib.request.urlopen = _raise_401body
+    try:
+        _r2610b = B._ai_post("openrouter", "google/gemma-4-31b-it:free", [{"role": "user", "content": "hi"}])
+    finally:
+        urllib.request.urlopen = _real_urlopen2610
+    check("v2610 401 still 401", _r2610b is None
+          and "401" in B._AI_LAST_POST_ERROR
+          and "1010" not in B._AI_LAST_POST_ERROR,
+          B._AI_LAST_POST_ERROR)
+    urllib.request.urlopen = _raise_403plain
+    try:
+        _r2610c = B._ai_post("groq", "openai/gpt-oss-120b", [{"role": "user", "content": "hi"}])
+    finally:
+        urllib.request.urlopen = _real_urlopen2610
+        os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY", None)
+    check("v2610 plain 403 stays 403", _r2610c is None
+          and B._AI_LAST_POST_ERROR == "403",
+          B._AI_LAST_POST_ERROR)
+    # ---- v2.6.11: explicit honest User-Agent on AI calls (Cloudflare
+    # bans urllib's default "Python-urllib/3.x" signature with 1010
+    # before the key is read; any other UA reaches Groq's real auth) ----
+    _captured_ua2611 = []
+    def _capture_ua(req, timeout=None):
+        _captured_ua2611.append(
+            [v for v in req.headers.values() if str(v).startswith("Chulbuli/")])
+        return _FakeResp({"choices": [{"message": {"content": "ua test ok 🙂"}}]})
+    os.environ["GROQ_API_KEY"] = "gsk_testkey123"
+    urllib.request.urlopen = _capture_ua
+    try:
+        _r2611 = B._ai_post("groq", "openai/gpt-oss-120b", [{"role": "user", "content": "hi"}])
+    finally:
+        urllib.request.urlopen = _real_urlopen2610
+        os.environ.pop("GROQ_API_KEY", None)
+    check("v2611 ua header sent", _r2611 == "ua test ok 🙂"
+          and _captured_ua2611 and _captured_ua2611[0]
+          and _captured_ua2611[0][0] == f"Chulbuli/{B.VERSION}",
+          str(_captured_ua2611))
+    check("v2611 no urllib ua", not any(
+        "Python-urllib" in str(v) for v in _captured_ua2611[0]) if _captured_ua2611 else False)
+    # ---- v2.6.12: new mod commands (Sanji: "/del lao ... or bhi bahut
+    # sari commands add kro") — /del /tmute /tban /lock /unlock /slowmode
+    # /zombies /link /ginfo. /unwarn /unmute /unban /warns /promote /
+    # demote /title /report already existed — verified, not re-added. ----
+    check("v2612 dur parse", B._parse_duration("10m") == 600
+          and B._parse_duration("1h") == 3600
+          and B._parse_duration("2d") == 172800
+          and B._parse_duration("30s") == 30
+          and B._parse_duration("5") == 300
+          and B._parse_duration("abc") is None
+          and B._parse_duration("") is None)
+    _app2612 = FakeApp()
+    _owner2612 = B.OWNER_ID
+    _bad2612 = FakeMessage("bad msg", uid=222, name="BadGuy", chat_id=-100600)
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    _cmd2612 = FakeMessage("/del", uid=_owner2612, name="Sanji", chat_id=-100600, reply_to=_bad2612)
+    await B.cmd_del(_app2612, _cmd2612)
+    check("v2612 del", ("delete_messages", -100600, [_bad2612.id, _cmd2612.id]) in FakeApp.calls)
+    FakeMessage.outbox.clear()
+    await B.cmd_del(_app2612, FakeMessage("/del", uid=_owner2612, name="Sanji", chat_id=-100600))
+    check("v2612 del needs reply", any("reply karke /del" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_tmute(_app2612, FakeMessage("/tmute 10m", uid=_owner2612, name="Sanji", chat_id=-100600, reply_to=_bad2612))
+    check("v2612 tmute", any(c[0] == "restrict" for c in FakeApp.calls)
+          and "until_date" in FakeApp.last_restrict_kwargs
+          and any("mute ho gaya" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_tban(_app2612, FakeMessage("/tban 1h", uid=_owner2612, name="Sanji", chat_id=-100600, reply_to=_bad2612))
+    check("v2612 tban", any(c[0] == "ban" for c in FakeApp.calls)
+          and "until_date" in FakeApp.last_ban_kwargs
+          and any("ban ho gaya" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_tmute(_app2612, FakeMessage("/tmute", uid=_owner2612, name="Sanji", chat_id=-100600, reply_to=_bad2612))
+    check("v2612 tmute needs time", any("Time batao" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_lock(_app2612, FakeMessage("/lock", uid=_owner2612, name="Sanji", chat_id=-100600))
+    _perm2612 = [c[2] for c in FakeApp.calls if c[0] == "set_permissions"]
+    check("v2612 lock", _perm2612 and not _perm2612[0].can_send_messages
+          and any("lock ho gaya" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_unlock(_app2612, FakeMessage("/unlock", uid=_owner2612, name="Sanji", chat_id=-100600))
+    _perm2612b = [c[2] for c in FakeApp.calls if c[0] == "set_permissions"]
+    check("v2612 unlock", _perm2612b and _perm2612b[0].can_send_messages is True
+          and any("unlock ho gaya" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_slowmode(_app2612, FakeMessage("/slowmode 10", uid=_owner2612, name="Sanji", chat_id=-100600))
+    check("v2612 slowmode", ("slowmode", -100600, 10) in FakeApp.calls
+          and any("Slow mode ON" in t for _, t in FakeMessage.outbox))
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_slowmode(_app2612, FakeMessage("/slowmode off", uid=_owner2612, name="Sanji", chat_id=-100600))
+    check("v2612 slowmode off", ("slowmode", -100600, 0) in FakeApp.calls)
+    async def _members2612(self, chat_id, filter=None):
+        _ghost = FakeUser(333, "Ghost")
+        _ghost.is_deleted = True
+        yield FakeChatMember(_ghost, "member")
+        yield FakeChatMember(FakeUser(444, "Alive"), "member")
+    _real_members2612 = FakeApp.get_chat_members
+    FakeApp.get_chat_members = _members2612
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    try:
+        await B.cmd_zombies(_app2612, FakeMessage("/zombies", uid=_owner2612, name="Sanji", chat_id=-100600))
+    finally:
+        FakeApp.get_chat_members = _real_members2612
+    check("v2612 zombies", ("ban", -100600, 333) in FakeApp.calls
+          and ("unban", -100600, 333) in FakeApp.calls
+          and ("ban", -100600, 444) not in FakeApp.calls
+          and any("1 deleted" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_link(_app2612, FakeMessage("/link", uid=_owner2612, name="Sanji", chat_id=-100600))
+    check("v2612 link", any("https://t.me/+fakeinvite" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_ginfo(_app2612, FakeMessage("/ginfo", uid=_owner2612, name="Sanji", chat_id=-100600))
+    check("v2612 ginfo", any("Test Group" in t and "42" in t for _, t in FakeMessage.outbox))
+    check("v2612 help lists new", "/del" in B.HELP_TEXT and "/tmute" in B.HELP_TEXT
+          and "/lock" in B.HELP_TEXT and "/slowmode" in B.HELP_TEXT)
+    # ---- v2.6.13: /play sends the MP3 too (Sanji: "play bhi ho or mp3
+    # bhi aaye jse users can download") — _music_to_mp3 converts the
+    # playing file (raw PCM or native container) with ffmpeg+libmp3lame,
+    # _music_send_mp3 uploads it via app.send_audio and deletes the temp
+    # file. Any failure skips the mp3, never breaks playback. ----
+    import shutil as _shutil2613
+    _raw2613 = os.path.join(tempfile.gettempdir(), "chulbuli-test-2613.raw")
+    with open(_raw2613, "wb") as _f2613:
+        _f2613.write(b"\x00" * (48000 * 2 * 2))  # 1s silence, s16le 48k stereo
+    _mp32613 = B._music_to_mp3(_raw2613)
+    check("v2613 raw to mp3", _mp32613 is not None and _mp32613.endswith(".mp3")
+          and os.path.isfile(_mp32613) and os.path.getsize(_mp32613) > 0)
+    _native2613 = os.path.join(tempfile.gettempdir(), "chulbuli-test-2613.m4a")
+    _shutil2613.copy(_mp32613, _native2613)
+    _mp32613b = B._music_to_mp3(_native2613)
+    check("v2613 native to mp3", _mp32613b is not None
+          and os.path.isfile(_mp32613b) and os.path.getsize(_mp32613b) > 0)
+    check("v2613 to mp3 missing", B._music_to_mp3("/tmp/no-such-chulbuli-file.raw") is None)
+    _already2613 = os.path.join(tempfile.gettempdir(), "chulbuli-test-2613-already.mp3")
+    with open(_already2613, "wb") as _f2613:
+        _f2613.write(b"fake-audio")
+    check("v2613 mp3 passthrough", B._music_to_mp3(_already2613) == _already2613
+          and os.path.isfile(_already2613))
+    FakeApp.calls.clear()
+    _app2613 = FakeApp()
+    B.app = _app2613
+    _track2613 = {"title": "Test Gaana", "duration": 200, "source": "youtube"}
+    await B._music_send_mp3(-100600, _track2613, _raw2613)
+    _sent2613 = [c for c in FakeApp.calls if c[0] == "send_audio"]
+    check("v2613 send mp3", len(_sent2613) == 1 and _sent2613[0][1] == -100600
+          and str(_sent2613[0][2]).endswith(".mp3")
+          and _sent2613[0][3].get("title") == "Test Gaana"
+          and "download kar lo" in str(_sent2613[0][3].get("caption") or ""))
+    check("v2613 mp3 temp deleted", not os.path.isfile(_mp32613))
+    FakeApp.calls.clear()
+    await B._music_send_mp3(-100600, _track2613, "/tmp/no-such-chulbuli-file.raw")
+    check("v2613 send mp3 missing file", not any(c[0] == "send_audio" for c in FakeApp.calls))
+    _oldmax2613 = B._MUSIC_MP3_MAX_BYTES
+    B._MUSIC_MP3_MAX_BYTES = 0
+    FakeApp.calls.clear()
+    try:
+        await B._music_send_mp3(-100600, _track2613, _raw2613)
+    finally:
+        B._MUSIC_MP3_MAX_BYTES = _oldmax2613
+    check("v2613 mp3 too big skipped", not any(c[0] == "send_audio" for c in FakeApp.calls))
+    check("v2613 help mentions mp3", "MP3" in B.HELP_TEXT)
+    for _p2613 in (_raw2613, _mp32613, _native2613, _mp32613b, _already2613):
+        try:
+            os.remove(_p2613)
+        except Exception:  # noqa: BLE001
+            pass
+    # ---- v2.6.14: /secretmsg (Sanji: "msg sirf usi user ko dikhe or
+    # users ko na dikhe ... send kare to bhi dusro ko na dikhe") —
+    # command deleted, placeholder + button only, secret reveals ONLY to
+    # the target via alert popup; anyone else is refused. ----
+    _app2614 = FakeApp()
+    B.app = _app2614
+    B.SECRETS.clear()
+    _tgt2614 = FakeMessage("hi", uid=222, name="Ravi", chat_id=-100600)
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    _cmd2614 = FakeMessage("/secretmsg ye mera secret hai", uid=111, name="Sanji",
+                           chat_id=-100600, reply_to=_tgt2614)
+    await B.cmd_secretmsg(_app2614, _cmd2614)
+    check("v2614 del command", ("delete_messages", -100600, [_cmd2614.id]) in FakeApp.calls)
+    check("v2614 placeholder", any("secret message" in t and "Ravi" in t for _, t in FakeMessage.outbox))
+    _kb2614 = FakeMessage.outbox_full[-1][2].get("reply_markup")
+    _cbs2614 = _cbs_of(_kb2614)
+    check("v2614 button", len(_cbs2614) == 1 and _cbs2614[0].startswith("sec:"))
+    _sid2614 = _cbs2614[0][4:]
+    check("v2614 stored", B.SECRETS.get(_sid2614, {}).get("to") == 222
+          and B.SECRETS.get(_sid2614, {}).get("text") == "ye mera secret hai")
+    _ph2614 = FakeMessage("placeholder", uid=999, name="Chulbuli", chat_id=-100600)
+    FakeMessage.edits.clear()
+    _q2614 = FakeCallbackQuery(f"sec:{_sid2614}", uid=222, name="Ravi", message=_ph2614)
+    await B.secret_callbacks(_app2614, _q2614)
+    check("v2614 target sees secret", _q2614.answers == [("ye mera secret hai", True)])
+    check("v2614 placeholder edited", any("dekh liya" in t for _, t, _ in FakeMessage.edits))
+    _q2614b = FakeCallbackQuery(f"sec:{_sid2614}", uid=333, name="Chunnu", message=_ph2614)
+    await B.secret_callbacks(_app2614, _q2614b)
+    check("v2614 other refused", len(_q2614b.answers) == 1
+          and "sirf Ravi ke liye hai" in (_q2614b.answers[0][0] or "")
+          and "ye mera secret hai" not in str(_q2614b.answers))
+    _q2614c = FakeCallbackQuery(f"sec:{_sid2614}", uid=222, name="Ravi", message=_ph2614)
+    await B.secret_callbacks(_app2614, _q2614c)
+    check("v2614 target second tap", any("pehle hi dekh chuke" in (a[0] or "") for a in _q2614c.answers))
+    FakeApp.users_by_name = {"ravi": FakeUser(777, "Ravi")}
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg @ravi hello ravi",
+                                                 uid=111, name="Sanji", chat_id=-100600))
+    _cbs2614b = _cbs_of(FakeMessage.outbox_full[-1][2].get("reply_markup"))
+    _sid2614b = _cbs2614b[0][4:]
+    check("v2614 username mode", B.SECRETS.get(_sid2614b, {}).get("to") == 777)
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg 888 hi wahan",
+                                                 uid=111, name="Sanji", chat_id=-100600))
+    _cbs2614c = _cbs_of(FakeMessage.outbox_full[-1][2].get("reply_markup"))
+    check("v2614 numeric id mode", B.SECRETS.get(_cbs2614c[0][4:], {}).get("to") == 888)
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg @nobody hi",
+                                                 uid=111, name="Sanji", chat_id=-100600))
+    check("v2614 unknown user", any("nahi mila" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg", uid=111, name="Sanji",
+                                                 chat_id=-100600, reply_to=_tgt2614))
+    check("v2614 no text hint", any("/secretmsg @username" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg " + "x" * 200, uid=111, name="Sanji",
+                                                 chat_id=-100600, reply_to=_tgt2614))
+    check("v2614 too long", any("190 characters" in t for _, t in FakeMessage.outbox))
+    _self2614 = FakeMessage("mera msg", uid=111, name="Sanji", chat_id=-100600)
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg khud ko", uid=111, name="Sanji",
+                                                 chat_id=-100600, reply_to=_self2614))
+    check("v2614 self blocked", any("khud ko secret" in t for _, t in FakeMessage.outbox))
+    _bot2614 = FakeMessage("bot msg", uid=8405203833, name="Chulbuli", chat_id=-100600)
+    _bot2614.from_user.is_bot = True
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg hi bot", uid=111, name="Sanji",
+                                                 chat_id=-100600, reply_to=_bot2614))
+    check("v2614 bot target blocked", any("sab jaanti hun" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg @ravi hi", uid=111, name="Sanji",
+                                                 chat_id=111, ctype="private"))
+    check("v2614 dm hint", any("sirf tum aur main" in t for _, t in FakeMessage.outbox))
+    B.SECRETS[_sid2614b]["ts"] = time.time() - 25 * 3600
+    _q2614d = FakeCallbackQuery(f"sec:{_sid2614b}", uid=777, name="Ravi", message=_ph2614)
+    await B.secret_callbacks(_app2614, _q2614d)
+    check("v2614 expired", any("expire ho gaya" in (a[0] or "") for a in _q2614d.answers))
+    _q2614e = FakeCallbackQuery("sec:deadbeef", uid=777, name="Ravi", message=_ph2614)
+    await B.secret_callbacks(_app2614, _q2614e)
+    check("v2614 unknown sid", any("nahi raha" in (a[0] or "") for a in _q2614e.answers))
+    _orig_del2614 = FakeApp.delete_messages
+
+    async def _fail_del2614(self, chat_id, message_ids, **kwargs):
+        raise Exception("no delete rights")
+
+    FakeApp.delete_messages = _fail_del2614
+    FakeMessage.outbox.clear()
+    try:
+        await B.cmd_secretmsg(_app2614, FakeMessage("/secretmsg chhupa hua", uid=111, name="Sanji",
+                                                     chat_id=-100600, reply_to=_tgt2614))
+    finally:
+        FakeApp.delete_messages = _orig_del2614
+    check("v2614 delete fail warns", any("delete nahi kar payi" in t for _, t in FakeMessage.outbox))
+    check("v2614 help lists", "/secretmsg" in B.HELP_TEXT)
+    B.SECRETS.clear()
+    FakeApp.users_by_name = {}
+    _coins_before = B.get_user(111).get("coins", 0)
+    B.OWNER_PENDING[B.OWNER_ID] = "give"
+    await B.handle_owner_pending(FakeMessage("111 500", uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID))
+    check("panel give coins", B.get_user(111).get("coins", 0) == _coins_before + 500)
+    B.get_user(111)["coins"] = _coins_before
+    B.save_data()
+    # music screen + stop all
+    _st509 = B.music_state(-100509)
+    _st509["current"] = {"title": "PL Gaana 1", "url": "https://youtube.com/watch?v=pl1", "duration": 200}
+    _st509["playing"] = True
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(client, FakeCallbackQuery("own:music", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel music screen",
+          FakeMessage.edits and "Music" in FakeMessage.edits[-1][1]
+          and "PL Gaana 1" in FakeMessage.edits[-1][1])
+    await B.owner_callbacks(client, FakeCallbackQuery("own:music_stopall", uid=B.OWNER_ID, name="Sanji", message=_own_msg))
+    check("panel music stop all", B.music_state(-100509).get("playing") is False)
+    B.MUSIC.clear()
+    # /panel command is gone (source check) — and so is /owner (v2.5.7):
+    # the panel opens only from the menu button now.
+    check("panel command removed",
+          'filters.command(["owner", "panel"])' not in _src253
+          and 'filters.command(["owner"])' not in _src253)
+    # menu:owner opens the panel for the owner, alerts everyone else
+    FakeMessage.edits.clear()
+    _menu_msg = FakeMessage("/start", uid=B.OWNER_ID, name="Sanji", chat_id=B.OWNER_ID)
+    await B.menu_callbacks(client, FakeCallbackQuery("menu:owner", uid=B.OWNER_ID, name="Sanji", message=_menu_msg))
+    check("panel menu owner opens",
+          FakeMessage.edits and "OWNER PANEL" in FakeMessage.edits[-1][1])
+    _q_other = FakeCallbackQuery("menu:owner", uid=111, name="Tester",
+                                 message=FakeMessage("/start", uid=111, name="Tester", chat_id=-100123))
+    await B.menu_callbacks(client, _q_other)
+    check("panel menu non-owner alert",
+          any("Sirf owner" in (a[0] or "") for a in _q_other.answers))
+    B.OWNER_PENDING.pop(B.OWNER_ID, None)
+
+    # ---- v2.5.8: ladki bhasha + chhote jawab + slow reply (Sanji's live
+    # report, 2026-11-13 14:30 IST: "reply bahut fast aa raha hai or thoda
+    # jyada long hai or 'batata' ye word ladka use karta hai") ----
+    # (1) Masculine self-forms are REJECTED by the quality filter — the
+    # next model (or the feminine rule-based fallback) answers instead.
+    check("filter rejects batata", not B._ai_reply_ok("main batata hun kal khelte hain"))
+    check("filter rejects ja raha hun", not B._ai_reply_ok("main ja raha hun abhi"))
+    check("filter rejects karunga", not B._ai_reply_ok("kal main karunga ye kaam"))
+    check("filter rejects raha hoon", not B._ai_reply_ok("main soch raha hoon"))
+    check("filter accepts btati", B._ai_reply_ok("main btati hun kal khelte hain"))
+    check("filter accepts ja rahi hun", B._ai_reply_ok("main ja rahi hun abhi"))
+    check("filter accepts karungi", B._ai_reply_ok("kal main karungi ye kaam"))
+    # (2) Long replies are rejected (>400 chars) — Sanji wants short.
+    check("filter rejects long reply", not B._ai_reply_ok("x" * 450))
+    check("filter accepts short reply", B._ai_reply_ok("haan yaar, kya kar rahe ho"))
+    # (3) The system prompt itself teaches the feminine + short rules.
+    check("system prompt ladki bhasha",
+          "btati hun" in B.AI_SYSTEM and "karungi" in B.AI_SYSTEM
+          and "batata" in B.AI_SYSTEM and "25-30 words" in B.AI_SYSTEM)
+    # (4) max_tokens is small now (250, was 800) — short replies by design.
+    check("ai max_tokens 250", '"max_tokens": 250' in _src253)
+    # (5) Typing is slower + human: 2-6 s, scales with length.
+    check("typing delay 2-6s range", B.typing_delay("hi") == 2.0
+          and B.typing_delay("x" * 200) == 6.0
+          and 2.0 < B.typing_delay("x" * 50) < 6.0)
+    # (6) The two masculine canned lines found in the sweep are fixed.
+    check("canned lines feminine", "role nahi btati" in _src253
+          and "bhej rahi hun" in _src253
+          and "role nahi batata" not in _src253
+          and "bhej raha hun" not in _src253)
 
     # ---- v2.3.1: /promote uses ChatPrivileges (real Pyrogram API) ----
     _fake_app2 = FakeApp()
@@ -3220,6 +4639,20 @@ async def main():
     await B.web_app_data_handler(client, _FakeWadMessage('not json at all'))
     check("v240 webapp bad json ignored", B.get_user(780)["coins"] == 1500,
           f"coins={B.get_user(780)['coins']}")
+    # ---- v2.6.0 (merged from Sanji's audit zip): Mini App reward claims
+    # cannot mint unlimited coins — at most MINIAPP_WIN_MAX per user per day.
+    _u782 = B.get_user(782, "RewardCapTester")
+    _u782["coins"] = 1000
+    _u782["miniapp_reward_day"] = ""
+    _u782["miniapp_rewarded_today"] = 0
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        '{"game":"wordguess","result":"win","coins":9999}', uid=782))
+    check("v260 miniapp daily reward capped", B.get_user(782)["coins"] == 1500)
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        '{"game":"wordguess","result":"win","coins":500}', uid=782))
+    check("v260 miniapp repeat claim blocked", B.get_user(782)["coins"] == 1500)
+    await B.web_app_data_handler(client, _FakeWadMessage("[]", uid=782))
+    check("v260 non-object webapp payload ignored", B.get_user(782)["coins"] == 1500)
 
     # ================= v2.4.1: web_app buttons via Bot API =================
     # Live v2.4.0 bug: Pyrogram MTProto rejects any send/edit whose inline
@@ -3420,10 +4853,14 @@ async def main():
     # posts Mini App buttons (one per color, current FEN in the URL)
     FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); _botapi_calls.clear()
     await B.cmd_chess(client, FakeMessage("/chess", uid=411, name="ChessA", chat_id=-100301))
-    _lob = FakeMessage.outbox_full[-1]
     _mid_a = B._chess_matches_in_chat(-100301)[0]["match_id"]
-    check("v250 lobby join button", _lob[1].startswith("♟️ **CHESS**")
-          and f"chess:join:{_mid_a}" in _kb_cbs(_lob[2].get("reply_markup")), str(_lob[2]))
+    _lob_calls_a = [p for _m, p in _botapi_calls if (p.get("text") or "").startswith("♟️ **CHESS**")]
+    _kb_a = _lob_calls_a[0].get("reply_markup", {}).get("inline_keyboard", []) if _lob_calls_a else []
+    _cbs_a = [b.get("callback_data") for row in _kb_a for b in row]
+    _urls_a = [b.get("web_app", {}).get("url") for row in _kb_a for b in row if b.get("web_app")]
+    check("v250 lobby join button", len(_lob_calls_a) == 1
+          and f"chess:join:{_mid_a}" in _cbs_a
+          and any(u == B.MINIAPP_URL + "?join=" + _mid_a for u in _urls_a), str(_kb_a))
     check("v250 lobby waiting", len(B._chess_matches_in_chat(-100301)) == 1
           and not B._chess_matches_in_chat(-100301)[0].get("started"))
     _cbq = FakeCallbackQuery(f"chess:join:{_mid_a}", uid=422, name="ChessB",
@@ -3600,7 +5037,1732 @@ async def main():
         json.dumps({"game": "chess", "match_id": _mid2, "move": "e2e4"}), uid=1033, chat_id=-100999))  # wrong chat
     check("v250 bad chess webapp payloads ignored", B.get_user(999)["coins"] == _before
           and not FakeMessage.outbox)
+    # ---- v2.6.2: board lives in the Mini App, not the group (Sanji:
+    # "ye aa raha hai group me na ki mini app me"); matches survive a
+    # restart (Sanji: "dono play kar sake or /end work nahi karta") ----
+    # (a) start message: short, no ASCII board, Mini App buttons present.
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); _botapi_calls.clear()
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1211, name="PersistW", chat_id=-100311))
+    await B.cmd_joinchess(client, FakeMessage("/joinchess", uid=1222, name="PersistB", chat_id=-100311))
+    _start_calls = [p for _m, p in _botapi_calls if "CHESS SHURU" in (p.get("text") or "")]
+    check("v262 start short no board", len(_start_calls) == 1
+          and "```" not in _start_calls[0].get("text", "")
+          and "r n b q" not in _start_calls[0].get("text", ""), str(_start_calls))
+    check("v262 start has miniapp buttons",
+          len([u for u in _botapi_weburls(_botapi_calls) if "match=" in u]) == 2)
+    # (b) post-move message: short too, no ASCII board; /board still shows it.
+    _botapi_calls.clear(); FakeMessage.outbox.clear()
+    await B.cmd_chess_move(client, FakeMessage("/move e2e4", uid=1211, name="PersistW", chat_id=-100311))
+    _move_calls = [p for _m, p in _botapi_calls if "e4" in (p.get("text") or "")]
+    check("v262 move msg short no board", len(_move_calls) >= 1
+          and all("```" not in p.get("text", "") for p in _move_calls), str(_move_calls))
+    FakeMessage.outbox.clear()
+    await B.cmd_chess_board(client, FakeMessage("/board", uid=1211, name="PersistW", chat_id=-100311))
+    check("v262 /board still shows ascii", any("```" in t and "r n b q" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    # (c) persistence round-trip: move saved to DATA, RAM wiped (restart),
+    # restore brings the match back with the same FEN; Black can move after it.
+    _fen_after_e4 = B._chess_matches_in_chat(-100311)[0]["board"].fen()
+    check("v262 match persisted", _fen_after_e4.startswith("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b")
+          and B.DATA.get("chess_matches", {}).get(B._chess_matches_in_chat(-100311)[0]["match_id"], {}).get("fen") == _fen_after_e4)
+    B._CHESS_MATCHES.clear()
+    B._CHESS_RESTORED = False
+    B._chess_restore()
+    _restored = B._chess_matches_in_chat(-100311)
+    check("v262 restore brings match back", len(_restored) == 1
+          and _restored[0]["board"].fen() == _fen_after_e4
+          and _restored[0]["players"] == [1211, 1222])
+    await B.cmd_chess_move(client, FakeMessage("/move e7e5", uid=1222, name="PersistB", chat_id=-100311))
+    check("v262 black moves after restore",
+          B._chess_matches_in_chat(-100311)[0]["board"].fen().startswith(
+              "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w"))
+    # (d) /end after a restore clears the match from RAM *and* DATA
+    # (other chats' matches stay untouched).
+    await B.cmd_end_game(client, FakeMessage("/end", uid=1211, name="PersistW", chat_id=-100311))
+    check("v262 /end after restore clears all", not B._chess_matches_in_chat(-100311)
+          and all(s.get("chat_id") != -100311 for s in (B.DATA.get("chess_matches") or {}).values()))
+    # (e) an expired waiting lobby is dropped on restore, not resurrected.
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1311, name="StaleW", chat_id=-100312))
+    _stale = B._chess_matches_in_chat(-100312)[0]
+    _stale["created"] = time.time() - 200
+    B._chess_save()
+    B._CHESS_MATCHES.clear()
+    B._CHESS_RESTORED = False
+    B._chess_restore()
+    check("v262 stale lobby dropped on restore", not B._chess_matches_in_chat(-100312))
+    # ---- v2.6.3: Join dabate hi Mini App khule (Sanji: "join par click
+    # karte hi mini app khule ... real person ke sath") ----
+    # (a) lobby carries a web_app Join button (opens the Mini App at once)
+    # plus the callback Join button as fallback.
+    FakeMessage.outbox.clear(); FakeMessage.outbox_full.clear(); _botapi_calls.clear()
+    await B.cmd_chess(client, FakeMessage("/chess", uid=1411, name="JoinAppW", chat_id=-100313))
+    _mid_j = B._chess_matches_in_chat(-100313)[0]["match_id"]
+    _lob_j = [p for _m, p in _botapi_calls if (p.get("text") or "").startswith("♟️ **CHESS**")]
+    _kb_j = _lob_j[0].get("reply_markup", {}).get("inline_keyboard", []) if _lob_j else []
+    _urls_j = [b.get("web_app", {}).get("url") for row in _kb_j for b in row if b.get("web_app")]
+    _cbs_j = [b.get("callback_data") for row in _kb_j for b in row]
+    check("v263 lobby webapp join button", len(_lob_j) == 1
+          and any(u == B.MINIAPP_URL + "?join=" + _mid_j for u in _urls_j)
+          and f"chess:join:{_mid_j}" in _cbs_j, str(_kb_j))
+    # (b) joining from inside the Mini App pairs White/Black and posts the
+    # start message (short, Mini App buttons).
+    _botapi_calls.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "action": "join", "match_id": _mid_j}), uid=1422, chat_id=-100313))
+    _m_j = B._chess_matches_in_chat(-100313)[0]
+    check("v263 webapp join pairs", _m_j.get("started") and _m_j["players"] == [1411, 1422])
+    check("v263 webapp join posts start", any("CHESS SHURU" in (p.get("text") or "") for _m, p in _botapi_calls))
+    # (c) a webapp join with an unknown match is ignored silently.
+    FakeMessage.outbox.clear()
+    await B.web_app_data_handler(client, _FakeWadMessage(
+        json.dumps({"game": "chess", "action": "join", "match_id": "chess-nope-2"}), uid=1433, chat_id=-100313))
+    check("v263 bad webapp join ignored", not FakeMessage.outbox)
+    # (d) the Mini App join screen exists: index.html reads ?join= and sends
+    # the join back with sendData.
+    _idx263 = open(os.path.join(os.path.dirname(B.__file__), "webapp", "index.html")).read()
+    check("v263 webapp join screen", '_qp.get("join")' in _idx263
+          and "joinMatchId" in _idx263, "no ?join= handling")
+    check("v263 webapp join sendData", 'action: "join"' in _idx263
+          and "Join as Black" in _idx263, "no in-app join button")
     B._botapi_call_sync = _orig_botapi
+
+    # ---- v2.6.18: /playlist + /autoplay actually wired + autoplay button + /play status ----
+    # Sanji 2026-11-14 08:09 IST: "/playlist wali command nahi add ki" —
+    # he was RIGHT. The v2.5.5 handler branches existed, but the decorator's
+    # filters.command list never included "playlist"/"autoplay", so Pyrogram
+    # never routed them (the tests called cmd_music directly, which is why
+    # 797 tests never caught it). Also new: autoplay toggle button on the
+    # player card, ALL playlist songs tappable, and a "searching…
+    # downloading" reply right after /play.
+    _src2618 = open(os.path.join(os.path.dirname(B.__file__), "bot.py")).read()
+    _dec2618 = _src2618.split("async def cmd_music")[0].rsplit("@app.on_message", 1)[1]
+    check("v2618 playlist routed", '"playlist"' in _dec2618, _dec2618[:200])
+    check("v2618 autoplay routed", '"autoplay"' in _dec2618, _dec2618[:200])
+    check("v2618 help lists playlist+autoplay",
+          "/playlist" in B.HELP_TEXT and "/autoplay" in B.HELP_TEXT)
+
+    def _t2618(n):
+        return {"title": f"Song {n}", "url": f"https://youtube.com/watch?v=s{n}",
+                "audio": f"https://audio.example/s{n}.m4a", "duration": 180 + n,
+                "source": "youtube"}
+
+    # (a) all 12 songs get a ▶️ button, no per-song delete, clear present
+    for _n in range(1, 13):
+        B.playlist_add(777101, _t2618(_n))
+    _mk2618 = B.playlist_markup(777101)
+    _datas2618 = _cbs_of(_mk2618)
+    check("v2618 all 12 songs tappable",
+          all(f"mus:plplay:{i}" in _datas2618 for i in range(12))
+          and "mus:plclear" in _datas2618
+          and not any(d.startswith("mus:pldel") for d in _datas2618),
+          str(_datas2618))
+    # (b) a full 50-song playlist: all 50 tappable, still under the
+    # 100-button limit (50 play + 1 clear)
+    for _n in range(13, 51):
+        B.playlist_add(777101, _t2618(_n))
+    _datas2618b = _cbs_of(B.playlist_markup(777101))
+    check("v2618 all 50 songs tappable",
+          len([d for d in _datas2618b if d.startswith("mus:plplay:")]) == 50
+          and len(_datas2618b) <= 100, str(len(_datas2618b)))
+    # (c) autoplay button on the player card shows the real state
+    B.MUSIC.clear()
+    _st2618 = B.music_state(-100601)
+    _st2618["autoplay"] = True
+    _cbs2618 = _cbs_of(B.music_player_markup(-100601))
+    _lbl2618 = [b.text for _row in B.music_player_markup(-100601).inline_keyboard for b in _row]
+    check("v2618 player autoplay button on",
+          "mus:autoplay" in _cbs2618 and any("Autoplay: ON" in t for t in _lbl2618),
+          str(_lbl2618))
+    _st2618["autoplay"] = False
+    _lbl2618b = [b.text for _row in B.music_player_markup(-100601).inline_keyboard for b in _row]
+    check("v2618 player autoplay button off",
+          any("Autoplay: OFF" in t for t in _lbl2618b), str(_lbl2618b))
+    # (d) player text names the autoplay state
+    _st2618["current"] = {"title": "Song 1", "duration": 200, "source": "youtube", "by": "Tester"}
+    _st2618["playing"] = True
+    check("v2618 player text autoplay off",
+          "autoplay OFF" in B.music_player_text(-100601), B.music_player_text(-100601))
+    # (e) tapping the autoplay button toggles it + refreshes the card
+    _st2618["player_msg"] = (-100601, 4242)
+    FakeMessage.edits.clear()
+    await B.music_callbacks(client, FakeCallbackQuery(
+        "mus:autoplay", uid=111, name="Tester",
+        message=FakeMessage("player", uid=111, name="Tester", chat_id=-100601)))
+    check("v2618 autoplay button toggles",
+          B.music_state(-100601).get("autoplay") is True
+          and FakeMessage.edits
+          and "autoplay ON" in FakeMessage.edits[-1][1],
+          str([e[1] for e in FakeMessage.edits]))
+    # (f) /play: searching status first, deleted when the player card lands
+    _real_factory2618 = B._GroupCallFactory
+    _real_mkc2618 = B._music_make_client
+    _real_session2618 = B.ASSISTANT_SESSION
+    _real_ydl2618 = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": True})
+    B.MUSIC.clear()
+    FakeMessage.outbox.clear()
+    FakeMessage.outbox_full.clear()
+    FakeApp.calls.clear()
+    await B.cmd_music(client, FakeMessage("/play test gaana", uid=111, name="Tester", chat_id=-100602))
+    check("v2618 play status sent",
+          any("search" in t and "test gaana" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    check("v2618 play card follows status",
+          any("Test Gaana" in t and "baj raha hai" in t for _, t in FakeMessage.outbox),
+          str([t for _, t in FakeMessage.outbox]))
+    check("v2618 play status deleted",
+          any(c[0] == "delete_messages" and c[1] == -100602 for c in FakeApp.calls),
+          str(FakeApp.calls))
+    check("v2618 play status cleared from state",
+          B.music_state(-100602).get("search_msg") is None)
+    # restore music fakes + tidy the test user
+    B._yt_dlp = _real_ydl2618
+    B._GroupCallFactory = _real_factory2618
+    B._music_make_client = _real_mkc2618
+    B.ASSISTANT_SESSION = _real_session2618
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False, "me": None, "init_started": False})
+    B.MUSIC.clear()
+    B.DATA["users"].pop("777101", None)
+    B.save_data()
+
+    # ---- v2.6.19: group/DM context + recent group messages + no-beg prompt
+    # + tag fix (string filter was the live bug) + guarded command errors ----
+    # (a) dispatch map — the REAL Pyrogram routing, not direct handler calls
+    check("v2619 dispatch atag -> cmd_atag", DISPATCH_MAP.get("atag") == "cmd_atag", str(DISPATCH_MAP.get("atag")))
+    check("v2619 dispatch utag -> cmd_utag", DISPATCH_MAP.get("utag") == "cmd_utag", str(DISPATCH_MAP.get("utag")))
+    check("v2619 dispatch staff -> cmd_staff", DISPATCH_MAP.get("staff") == "cmd_staff", str(DISPATCH_MAP.get("staff")))
+    check("v2619 dispatch report -> cmd_report", DISPATCH_MAP.get("report") == "cmd_report", str(DISPATCH_MAP.get("report")))
+    check("v2619 dispatch zombies -> cmd_zombies", DISPATCH_MAP.get("zombies") == "cmd_zombies", str(DISPATCH_MAP.get("zombies")))
+    check("v2619 dispatch playlist -> cmd_music", DISPATCH_MAP.get("playlist") == "cmd_music", str(DISPATCH_MAP.get("playlist")))
+    check("v2619 dispatch autoplay -> cmd_music", DISPATCH_MAP.get("autoplay") == "cmd_music", str(DISPATCH_MAP.get("autoplay")))
+    check("v2619 dispatch start -> cmd_start_help", DISPATCH_MAP.get("start") == "cmd_start_help", str(DISPATCH_MAP.get("start")))
+    check("v2619 dispatch secretmsg -> cmd_secretmsg", DISPATCH_MAP.get("secretmsg") == "cmd_secretmsg", str(DISPATCH_MAP.get("secretmsg")))
+    check("v2619 dispatch map big", len(DISPATCH_MAP) > 200, f"size={len(DISPATCH_MAP)}")
+    # (b) AI_SYSTEM keeps every old rule + gains the new ones
+    check("v2619 system group vs dm", "GROUP" in B.AI_SYSTEM and "PRIVATE DM" in B.AI_SYSTEM)
+    check("v2619 system no-beg rule", "MAANGO MAT" in B.AI_SYSTEM)
+    check("v2619 system owner sanji", "Sanji" in B.AI_SYSTEM)
+    check("v2619 system knows commands", "/wordguess" in B.AI_SYSTEM and "/play" in B.AI_SYSTEM)
+    check("v2619 system old rules kept", "NOT an AI" in B.AI_SYSTEM and "unless asked" not in B.AI_SYSTEM
+          and "sweet desi girl" in B.AI_SYSTEM and "Chulbuli hun" in B.AI_SYSTEM)
+    # (c) context helpers
+    check("v2619 ctx group", "GROUP" in B._ai_chat_context("group", "moonlight", "Ravi")
+          and "moonlight" in B._ai_chat_context("group", "moonlight", "Ravi"))
+    check("v2619 ctx dm", "PRIVATE DM" in B._ai_chat_context("private", None, "Ravi"))
+    check("v2619 ctx unknown empty", B._ai_chat_context(None, None, "Ravi") == "")
+    # (d) recent group context — humans only, bot turns skipped
+    B.DATA.setdefault("recent", {})["-100999"] = [
+        {"u": 1, "n": "Ravi", "t": "cricket khelte hain?", "ts": 1, "m": 1, "bot": False},
+        {"u": 2, "n": "Priya", "t": "haan chalo", "ts": 2, "m": 2, "bot": False},
+        {"u": 0, "n": "Chulbuli", "t": "main bhi", "ts": 3, "m": 3, "bot": True},
+    ]
+    _rc2619 = B._recent_group_context(-100999)
+    check("v2619 recent has humans", "Ravi" in _rc2619 and "Priya" in _rc2619, _rc2619)
+    check("v2619 recent skips bot", "main bhi" not in _rc2619)
+    check("v2619 recent empty", B._recent_group_context(-100998) == "")
+    # (e) ai_chat_reply carries context + recent into the AI payload
+    _real_key2619 = B._ai_key_for
+    _real_post2619 = B._ai_post
+    _cap2619 = {}
+    def _fake_post2619(provider, model, messages):
+        _cap2619["messages"] = messages
+        return "hehe acha yaar"
+    B._ai_key_for = lambda p: "sk-or-v1-fakekey1234567890"
+    B._ai_post = _fake_post2619
+    await B.ai_chat_reply("cricket?", "Ravi", chat_id=-100999, user_id=111,
+                          chat_type="group", chat_title="moonlight")
+    _sys2619 = _cap2619["messages"][0]["content"]
+    check("v2619 ai sees group", "GROUP" in _sys2619 and "moonlight" in _sys2619, _sys2619[:200])
+    check("v2619 ai sees recent", "Ravi" in _sys2619 and "cricket khelte hain?" in _sys2619)
+    await B.ai_chat_reply("hi", "Ravi", chat_id=-100123, user_id=111, chat_type="private")
+    _sys2619b = _cap2619["messages"][0]["content"]
+    check("v2619 ai sees dm", "PRIVATE DM" in _sys2619b)
+    check("v2619 ai dm no recent", "isi ke hisab se jawab do" not in _sys2619b)
+    await B.chat_reply_ai("cricket?", "Ravi", chat_id=-100999, user_id=111,
+                          chat_type="group", chat_title="moonlight")
+    _sys2619c = _cap2619["messages"][0]["content"]
+    check("v2619 chat_reply_ai passes ctx", "GROUP" in _sys2619c and "moonlight" in _sys2619c)
+    B._ai_key_for = _real_key2619
+    B._ai_post = _real_post2619
+    # (f) /atag — the string-filter bug: real Pyrogram raises AttributeError
+    # on filter.value; the strict fake reproduces it, the enum fix survives it
+    FakeApp.members_override = [
+        FakeChatMember(FakeUser(7966027018, "Sanji"), "owner"),
+        FakeChatMember(FakeUser(222, "Admin2"), "administrator"),
+        FakeChatMember(FakeUser(333, "Ravi"), "member"),
+    ]
+    FakeMessage.outbox.clear()
+    await B.cmd_atag(FakeApp(), FakeMessage("/atag hello", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("v2619 atag tags admins", any("Sanji" in t and "Admin2" in t for _, t in FakeMessage.outbox),
+          str([t[:80] for _, t in FakeMessage.outbox]))
+    check("v2619 atag skips members", not any("Ravi" in t for _, t in FakeMessage.outbox))
+    check("v2619 atag no failure line", not any("Tag nahi kar payi" in t for _, t in FakeMessage.outbox))
+    _real_isadmin2619 = B.is_chat_admin
+    async def _not_admin2619(client, chat_id, user_id):
+        return False
+    B.is_chat_admin = _not_admin2619
+    FakeMessage.outbox.clear()
+    await B.cmd_atag(FakeApp(), FakeMessage("/atag hello", uid=333, name="Ravi", chat_id=-100123))
+    check("v2619 atag non-admin blocked", any("Sirf admins" in t for _, t in FakeMessage.outbox))
+    B.is_chat_admin = _real_isadmin2619
+    # (g) /utag — RECENT enumeration, batches of 7, bots skipped, count honest
+    _users2619 = [FakeChatMember(FakeUser(1000 + i, f"User{i}"), "member") for i in range(9)]
+    _bot2619 = FakeUser(9999, "SomeBot")
+    _bot2619.is_bot = True
+    FakeApp.members_override = _users2619 + [FakeChatMember(_bot2619, "member")]
+    FakeMessage.outbox.clear()
+    await B.cmd_utag(FakeApp(), FakeMessage("/utag attention", uid=7966027018, name="Sanji", chat_id=-100123))
+    _tagmsgs2619 = [t for _, t in FakeMessage.outbox if t.startswith("📣 attention")]
+    check("v2619 utag batches 7+2", len(_tagmsgs2619) == 2, f"got {len(_tagmsgs2619)}")
+    check("v2619 utag counts 9", any("9 members ko tag kar diya" in t for _, t in FakeMessage.outbox))
+    check("v2619 utag skips bots", not any("SomeBot" in t for _, t in FakeMessage.outbox))
+    # (h) /utag with nobody to tag says so honestly (old code went silent)
+    FakeApp.members_override = []
+    FakeMessage.outbox.clear()
+    await B.cmd_utag(FakeApp(), FakeMessage("/utag hi", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("v2619 utag zero honest", any("koi member nahi mila" in t for _, t in FakeMessage.outbox))
+    FakeApp.members_override = None
+    # (i) /staff + /report — same string-filter bug, same enum fix
+    FakeApp.members_override = [
+        FakeChatMember(FakeUser(7966027018, "Sanji"), "owner"),
+        FakeChatMember(FakeUser(222, "Admin2"), "administrator"),
+        FakeChatMember(FakeUser(333, "Ravi"), "member"),
+    ]
+    FakeMessage.outbox.clear()
+    await B.cmd_staff(FakeApp(), FakeMessage("/staff", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("v2619 staff lists admins", any("Group Staff" in t and "Sanji" in t for _, t in FakeMessage.outbox))
+    check("v2619 staff no failure", not any("nahi nikaal payi" in t for _, t in FakeMessage.outbox))
+    FakeMessage.outbox.clear()
+    await B.cmd_report(FakeApp(), FakeMessage("/report spam hai", uid=111, name="Tester", chat_id=-100123,
+                                              reply_to=FakeMessage("bad msg", uid=333, name="Ravi")))
+    check("v2619 report tags admins", any("Report" in t and "Sanji" in t for _, t in FakeMessage.outbox))
+    FakeApp.members_override = None
+    # (j) @guarded — a crashing command is recorded, the owner is DM'd
+    # (throttled), the user gets one friendly line, nothing propagates
+    async def _boom2619(client, message):
+        raise RuntimeError("boom-test-2619")
+    _wrapped2619 = B.guarded(_boom2619)
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    await _wrapped2619(FakeApp(), FakeMessage("/boom", uid=111, chat_id=-100123))
+    check("v2619 guarded records", len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "boom"
+          and "RuntimeError" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    check("v2619 guarded tells user", any("gadbad" in t for _, t in FakeMessage.outbox))
+    check("v2619 guarded dms owner", any(cid == B.OWNER_ID for cid, _ in FakeMessage.outbox))
+    await _wrapped2619(FakeApp(), FakeMessage("/boom", uid=111, chat_id=-100123))
+    check("v2619 guarded throttles dm", sum(1 for cid, _ in FakeMessage.outbox if cid == B.OWNER_ID) == 1
+          and len(B._CMD_ERRORS) == 2)
+    async def _flood2619(client, message):
+        raise FloodWait(5)
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    await B.guarded(_flood2619)(FakeApp(), FakeMessage("/flood", uid=111, chat_id=-100123))
+    check("v2619 guarded floodwait recorded", len(B._CMD_ERRORS) == 1 and "FloodWait" in B._CMD_ERRORS[0]["err"])
+    check("v2619 guarded floodwait no dm", not any(cid == B.OWNER_ID for cid, _ in FakeMessage.outbox))
+    # (k) owner panel shows the error + the errors screen lists it
+    B._CMD_ERRORS.clear()
+    B.record_command_error("utag", RuntimeError("boom-test-2619"), None)
+    check("v2619 panel shows last error", "Last command error" in B.owner_panel_text()
+          and "utag" in B.owner_panel_text())
+    _q2619 = FakeCallbackQuery("own:cmderrors", uid=B.OWNER_ID,
+                               message=FakeMessage("/start", uid=B.OWNER_ID))
+    FakeMessage.edits.clear()
+    await B.owner_callbacks(FakeApp(), _q2619)
+    check("v2619 cmderrors screen", any("Command errors" in t and "utag" in t for _, t, _ in FakeMessage.edits),
+          str([t[:60] for _, t, _ in FakeMessage.edits]))
+    # (l) live bug (Sanji, 2026-11-15): group me "hello guys" -> "arre guys? yahan sirf
+    # main hun, chulbuli 😏 kisse baat kar raha hai?" — group me akeli hone ka
+    # daava + har reply me apna naam, dono bot jaise lage. Prompt + gate fix.
+    check("v2619 system no alone in group", "kabhi akeli nahi" in B.AI_SYSTEM
+          and "yahan sirf main hun" in B.AI_SYSTEM)
+    check("v2619 system no name every msg", "HAR MESSAGE ME MAT BOLO" in B.AI_SYSTEM)
+    _bad2619 = "arre guys? yahan sirf main hun, chulbuli 😏 kisse baat kar raha hai?"
+    check("v2619 gate rejects live bug", B._ai_reply_ok(_bad2619, "hello guys", "group") is False)
+    check("v2619 gate dm untouched", B._ai_reply_ok(_bad2619, "hello guys", "private") is True)
+    check("v2619 gate identity ok", B._ai_reply_ok("main Chulbuli hun, tumhe kya lagta hai?",
+          "tum kaun ho?", "group") is True)
+    check("v2619 gate normal group ok", B._ai_reply_ok("hiee guys, kya chal raha hai?",
+          "hello guys", "group") is True)
+    # end-to-end: the buggy reply is rejected, the next model answers
+    _replies2619 = [_bad2619, "hiee guys, kya chal raha hai?"]
+    def _fake_post2619b(provider, model, messages):
+        return _replies2619.pop(0) if _replies2619 else None
+    B._ai_key_for = lambda p: "sk-or-v1-fakekey1234567890"
+    B._ai_post = _fake_post2619b
+    _got2619 = await B.ai_chat_reply("hello guys", "Ravi", chat_id=-100999, user_id=111,
+                                     chat_type="group", chat_title="moonlight")
+    check("v2619 ai skips bad reply", _got2619 == "hiee guys, kya chal raha hai?", str(_got2619))
+    B._ai_key_for = _real_key2619
+    B._ai_post = _real_post2619
+    B._CMD_ERRORS.clear()
+    B.DATA.get("recent", {}).pop("-100999", None)
+
+    # (m) v2.6.20 — data must SURVIVE redeploys (Sanji, 2026-11-15: "har bar
+    # data save rahe, har update ke bad data delete ho jati hai"). The
+    # container filesystem is wiped on every Railway deploy, so DATA_FILE
+    # must be honoured from CHULBULI_DATA_FILE (the Railway volume path).
+    _seed2620 = "/tmp/chulbuli-persist-test.json"
+    with open(_seed2620, "w", encoding="utf-8") as _fh2620:
+        json.dump({"users": {"123": {"name": "Test", "coins": 1000}},
+                   "chats": {}}, _fh2620)
+    _env2620 = dict(os.environ)
+    _env2620["CHULBULI_DATA_FILE"] = _seed2620
+    _proc2620 = subprocess.run(
+        [sys.executable, "-c", "import bot as B; print('DATA_FILE=' + B.DATA_FILE)"],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), "chulbuli-bot"),
+        env=_env2620)
+    check("v2620 env var honored", f"DATA_FILE={_seed2620}" in _proc2620.stdout,
+          _proc2620.stdout[-300:] + _proc2620.stderr[-300:])
+    check("v2620 seeded user loads", "1 users" in _proc2620.stdout
+          and _seed2620 in _proc2620.stdout, _proc2620.stdout[-300:])
+    check("v2620 default is data.json", "data.json" in B.DATA_FILE)
+    try:
+        os.remove(_seed2620)
+    except OSError:
+        pass
+
+    # (n) v2.6.21 — YouTube first, ANY YouTube failure -> SoundCloud
+    # (Sanji, 2026-11-15: "pahle youtube par search kre, waha na mile ya
+    # error ho to us ko use kare"). Before: the fallback only fired on the
+    # exact "youtube_blocked" error; "not found" / "search failed" gave up
+    # without trying SoundCloud at all.
+    class _ScYDL2621:
+        calls = []
+        mode = "yt_notfound_sc_ok"
+
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            type(self).calls.append(src)
+            if src.startswith("scsearch1:"):
+                if type(self).mode.endswith("_sc_notfound"):
+                    return {"entries": []}
+                return {"title": "SC Gaana",
+                        "webpage_url": "https://soundcloud.com/test/sc-gaana",
+                        "url": "https://audio.example/sc.m4a", "duration": 210}
+            if type(self).mode == "yt_ok":
+                return {"title": "YT Gaana", "webpage_url": "https://youtube.com/watch?v=ytok",
+                        "url": "https://audio.example/yt.m4a", "duration": 200}
+            if type(self).mode == "yt_error_sc_ok":
+                raise Exception("ERROR: [youtube] x: HTTP Error 500")
+            if type(self).mode == "yt_direct_fail":
+                raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+            return {"entries": []}  # yt_notfound_* modes
+
+    _saved_ydl2621 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _ScYDL2621})
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_notfound_sc_ok"
+    _t2621 = await B.resolve_track("koi gaana")
+    check("v2621 notfound falls back to sc", _t2621.get("source") == "soundcloud", str(_t2621))
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_error_sc_ok"
+    _t2621b = await B.resolve_track("koi gaana")
+    check("v2621 generic error falls back to sc", _t2621b.get("source") == "soundcloud", str(_t2621b))
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_notfound_sc_notfound"
+    try:
+        await B.resolve_track("koi gaana")
+        check("v2621 both fail raises original", False)
+    except B.MusicError as _e2621:
+        check("v2621 both fail raises original", str(_e2621) == "not found", str(_e2621))
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_direct_fail"
+    try:
+        await B.resolve_track("https://youtube.com/watch?v=abc123")
+        check("v2621 direct link no sc search", False)
+    except B.MusicError as _e2621:
+        check("v2621 direct link no sc search",
+              str(_e2621) == "youtube_blocked"
+              and not any(c.startswith("scsearch1:") for c in _ScYDL2621.calls),
+              str(_e2621))
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_ok"
+    _t2621c = await B.resolve_track("koi gaana")
+    check("v2621 youtube wins no sc call",
+          _t2621c.get("source") == "youtube"
+          and not any(c.startswith("scsearch1:") for c in _ScYDL2621.calls), str(_t2621c))
+    B._yt_dlp = _saved_ydl2621
+    # download phase: a generic YouTube download error also falls back
+    _real_extract2621 = B._yt_extract
+    _sc_info2621 = {"title": "SC Gaana", "webpage_url": "https://soundcloud.com/x/sc-gaana",
+                    "url": "https://audio.example/sc.mp3", "duration": 180}
+    B._yt_extract = lambda src, **kw: dict(_sc_info2621)
+    _yt_track2621 = {"title": "YT Gaana", "url": "https://youtube.com/watch?v=yt1",
+                     "audio": "https://audio.example/yt1.m4a", "duration": 200,
+                     "source": "youtube", "by": "Tester", "by_id": 111}
+    _real_factory2621 = B._GroupCallFactory
+    _real_mkc2621 = B._music_make_client
+    _real_session2621 = B.ASSISTANT_SESSION
+    _real_ydl2621b = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False,
+                         "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _real_dl_audio2621 = B._music_download_audio
+    _dl_calls2621 = {"n": 0}
+
+    async def _dl_once2621(track):
+        _dl_calls2621["n"] += 1
+        if _dl_calls2621["n"] == 1:
+            raise B.MusicError("download failed: HTTP Error 403")
+        return await _real_dl_audio2621(track)
+
+    B._music_download_audio = _dl_once2621
+    await B._music_ensure_assistant()
+    B.music_queue_add(-100508, dict(_yt_track2621))
+    await B._music_play_next(-100508)
+    _st508n = B.music_state(-100508)
+    check("v2621 download error falls back to sc",
+          _st508n.get("playing") is True
+          and _st508n.get("current", {}).get("source") == "soundcloud"
+          and _st508n.get("current", {}).get("title") == "SC Gaana",
+          str(_st508n.get("current")))
+    # queue note is neutral now (no "block kar raha hai" claim)
+    FakeMessage.outbox.clear()
+    await B._music_enqueue_track(-100508, dict(_sc_info2621, source="soundcloud",
+                                               by="Tester", by_id=111),
+                                 FakeMessage("/play sc gaana", uid=111, name="Tester",
+                                             chat_id=-100508))
+    check("v2621 queue note neutral",
+          any("SoundCloud se" in t for _, t in FakeMessage.outbox)
+          and not any("block kar raha hai" in t for _, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    # a voice-call error is NOT a download error: no SoundCloud retry
+    _real_stream2621 = B._music_stream_track
+    _real_scfb2621 = B._music_sc_fallback
+    _sc_calls2621 = {"n": 0}
+
+    def _sc_count2621(track):
+        _sc_calls2621["n"] += 1
+        return _real_scfb2621(track)
+
+    async def _stream_vc_fail2621(chat_id, track):
+        raise B.MusicError("group me koi voice chat nahi hai — pehle VC start karo 🙂")
+
+    B._music_sc_fallback = _sc_count2621
+    B._music_stream_track = _stream_vc_fail2621
+    B.MUSIC.clear()
+    B.music_queue_add(-100509, dict(_yt_track2621))
+    await B._music_play_next(-100509)
+    check("v2621 vc error no sc retry",
+          _sc_calls2621["n"] == 0
+          and B.music_state(-100509).get("playing") is False
+          and B.music_state(-100509).get("current") is None,
+          str(_sc_calls2621))
+    B._music_stream_track = _real_stream2621
+    B._music_sc_fallback = _real_scfb2621
+    B._music_download_audio = _real_dl_audio2621
+    B._yt_extract = _real_extract2621
+    B._yt_dlp = _real_ydl2621b
+    B._GroupCallFactory = _real_factory2621
+    B._music_make_client = _real_mkc2621
+    B.ASSISTANT_SESSION = _real_session2621
+
+    # (o) v2.6.22 — the SoundCloud fallback must LOG the YouTube reason
+    # (Sanji's live "Motu Patlu" play fell back silently — the Railway
+    # logs couldn't say why YouTube failed).
+    _saved_ydl2622 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _ScYDL2621})
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_notfound_sc_ok"
+    _buf2622 = io.StringIO()
+    with contextlib.redirect_stdout(_buf2622):
+        _t2622 = await B.resolve_track("koi gaana")
+    check("v2622 fallback logs youtube reason",
+          "youtube search failed (not found), trying SoundCloud" in _buf2622.getvalue()
+          and _t2622.get("source") == "soundcloud", _buf2622.getvalue())
+    _ScYDL2621.calls.clear()
+    _ScYDL2621.mode = "yt_notfound_sc_notfound"
+    _buf2622b = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf2622b):
+            await B.resolve_track("koi gaana")
+        check("v2622 both fail logs reason", False)
+    except B.MusicError as _e2622:
+        check("v2622 both fail logs reason",
+              "soundcloud also failed, keeping youtube error (not found)" in _buf2622b.getvalue()
+              and str(_e2622) == "not found", _buf2622b.getvalue())
+    B._yt_dlp = _saved_ydl2622
+
+    # (p) v2.6.23 — similar-song autoplay + owner DM for music errors
+    # (Sanji, 2026-11-15: autoplay ON ho to jo song chal raha ho us jese
+    # songs automatically chale; aur jab bhi koi error aaye to owner ke
+    # DM me bataye.)
+    _cur2623 = {"title": "Motu Patlu | Title Track",
+                "url": "https://youtube.com/watch?v=cur1",
+                "audio": "https://audio.example/cur.m4a", "duration": 159,
+                "source": "youtube", "by": "Tester", "by_id": 999223}
+    _sim_entries2623 = [
+        {"title": "Motu Patlu | Title Track | Kids Songs",
+         "webpage_url": "https://youtube.com/watch?v=cur1",
+         "url": "https://audio.example/cur.m4a", "duration": 159},
+        {"title": "Motu Patlu - Chhota Bheem Song",
+         "webpage_url": "https://youtube.com/watch?v=sim1",
+         "url": "https://audio.example/sim1.m4a", "duration": 180},
+        {"title": "Motu Patlu - Cartoon Song",
+         "webpage_url": "https://youtube.com/watch?v=sim2",
+         "url": "https://audio.example/sim2.m4a", "duration": 200},
+    ]
+    _extract_calls2623 = []
+    _real_extract2623 = B._yt_extract
+
+    def _extract_sim2623(src, **kw):
+        _extract_calls2623.append(src)
+        if src.startswith("scsearch5:"):
+            return {"entries": [_sim_entries2623[1]]}
+        return {"entries": list(_sim_entries2623)}
+
+    B._yt_extract = _extract_sim2623
+    _st510 = B.music_state(-100510)
+    _st510["current"] = dict(_cur2623)
+    _st510.pop("autoplay_seen", None)
+    _sim2623 = B._music_similar_pick(-100510)
+    check("v2623 similar skips current",
+          _sim2623 is not None and _sim2623.get("title") == "Motu Patlu - Chhota Bheem Song"
+          and _sim2623.get("source") == "youtube" and _sim2623.get("autoplay") is True
+          and _sim2623.get("by_id") == 999223
+          and _extract_calls2623 and _extract_calls2623[0].startswith("ytsearch5:"),
+          str(_sim2623))
+    check("v2623 similar remembers seen",
+          "https://youtube.com/watch?v=sim1" in _st510.get("autoplay_seen", [])
+          and "https://youtube.com/watch?v=cur1" in _st510.get("autoplay_seen", []),
+          str(_st510.get("autoplay_seen")))
+    # YouTube fails -> same SoundCloud search (v2.6.21 rule)
+    def _extract_yt_fail2623(src, **kw):
+        _extract_calls2623.append(src)
+        if src.startswith("ytsearch5:"):
+            raise B.MusicError("search failed: x")
+        return {"entries": [_sim_entries2623[2]]}
+
+    B._yt_extract = _extract_yt_fail2623
+    _st510["current"] = dict(_cur2623)
+    _st510.pop("autoplay_seen", None)
+    _sim2623b = B._music_similar_pick(-100510)
+    check("v2623 similar yt fail falls back to sc",
+          _sim2623b is not None and _sim2623b.get("source") == "soundcloud"
+          and _sim2623b.get("title") == "Motu Patlu - Cartoon Song", str(_sim2623b))
+    # everything found already played -> history forgotten, first other
+    # result taken instead of ending playback
+    B._yt_extract = _extract_sim2623
+    _st510["current"] = dict(_cur2623)
+    _st510["autoplay_seen"] = ["https://youtube.com/watch?v=sim1",
+                               "https://youtube.com/watch?v=sim2"]
+    _sim2623c = B._music_similar_pick(-100510)
+    check("v2623 similar all seen forgets history",
+          _sim2623c is not None and _sim2623c.get("title") == "Motu Patlu - Chhota Bheem Song"
+          and _st510.get("autoplay_seen") == ["https://youtube.com/watch?v=cur1",
+                                               "https://youtube.com/watch?v=sim1"],
+          str(_sim2623c))
+    # both fail -> None; no current track -> None
+    def _extract_always_fail2623(src, **kw):
+        raise B.MusicError("search failed")
+
+    B._yt_extract = _extract_always_fail2623
+    _st510["current"] = dict(_cur2623)
+    check("v2623 similar both fail none", B._music_similar_pick(-100510) is None)
+    _st510["current"] = None
+    check("v2623 similar no current none", B._music_similar_pick(-100510) is None)
+    B._yt_extract = _real_extract2623
+    # play_next: empty playlist -> similar song actually plays
+    _real_factory2623 = B._GroupCallFactory
+    _real_mkc2623 = B._music_make_client
+    _real_session2623 = B.ASSISTANT_SESSION
+    _real_ydl2623 = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False,
+                         "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _extract_calls2623.clear()
+    B._yt_extract = _extract_sim2623
+    await B._music_ensure_assistant()
+    _st510b = B.music_state(-100510)
+    _st510b["current"] = dict(_cur2623)
+    _st510b["playing"] = True
+    await B._music_play_next(-100510)
+    _st510c = B.music_state(-100510)
+    check("v2623 play_next similar plays",
+          _st510c.get("playing") is True
+          and _st510c.get("current", {}).get("title") == "Motu Patlu - Chhota Bheem Song"
+          and _st510c.get("current", {}).get("source") == "youtube", str(_st510c.get("current")))
+    # playlist still wins when it has a next song (no search at all)
+    _extract_calls2623.clear()
+    B.playlist_add(999224, {"title": "Playlist Gaana 1",
+                            "url": "https://youtube.com/watch?v=pl1",
+                            "audio": "https://audio.example/pl1.m4a", "duration": 100, "source": "youtube"})
+    B.playlist_add(999224, {"title": "Playlist Gaana 2",
+                            "url": "https://youtube.com/watch?v=pl2",
+                            "audio": "https://audio.example/pl2.m4a", "duration": 110, "source": "youtube"})
+    _st511 = B.music_state(-100511)
+    _st511["current"] = {"title": "Playlist Gaana 1",
+                         "url": "https://youtube.com/watch?v=pl1",
+                         "audio": "https://audio.example/pl1.m4a", "duration": 100,
+                         "source": "youtube", "by": "Tester2", "by_id": 999224}
+    _st511["playing"] = True
+    await B._music_play_next(-100511)
+    _st511b = B.music_state(-100511)
+    check("v2623 playlist still wins over similar",
+          _st511b.get("playing") is True
+          and _st511b.get("current", {}).get("title") == "Playlist Gaana 2"
+          and not _extract_calls2623, str(_st511b.get("current")))
+    # owner DM: /play YouTube resolve fails -> owner DM'd with the query
+    _real_resolve2623 = B.resolve_track
+
+    async def _resolve_blocked2623(q):
+        raise B.MusicError("youtube_blocked")
+
+    B.resolve_track = _resolve_blocked2623
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_music(FakeApp(), FakeMessage("/play motu patlu", uid=111, name="Tester", chat_id=-100123))
+    check("v2623 play resolve fail records",
+          len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "play"
+          and "youtube_blocked" in B._CMD_ERRORS[0]["err"]
+          and "query: motu patlu" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    check("v2623 play resolve fail dms owner",
+          any(cid == B.OWNER_ID and "youtube_blocked" in t and "motu patlu" in t
+              for cid, t in FakeMessage.outbox), str(FakeMessage.outbox))
+    check("v2623 play resolve fail tells user",
+          any("block kar diya" in t for _, t in FakeMessage.outbox))
+    B.resolve_track = _real_resolve2623
+    # owner DM: download fails AND SoundCloud retry fails -> owner DM'd
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+
+    def _extract_dl_fail2623(src, **kw):
+        raise B.MusicError("youtube_blocked")
+
+    B._yt_extract = _extract_dl_fail2623
+    _real_dl2623 = B._music_download_audio
+
+    async def _dl_always_fail2623(track):
+        raise B.MusicError("download failed: HTTP Error 403")
+
+    B._music_download_audio = _dl_always_fail2623
+    _st512 = B.music_state(-100512)
+    B.music_queue_add(-100512, dict(_cur2623, by="Tester", by_id=999225))
+    await B._music_play_next(-100512)
+    check("v2623 download fail records",
+          len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "play"
+          and "download failed" in B._CMD_ERRORS[0]["err"]
+          and "track: Motu Patlu" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    check("v2623 download fail dms owner",
+          any(cid == B.OWNER_ID and "download failed" in t for cid, t in FakeMessage.outbox),
+          str(FakeMessage.outbox))
+    check("v2623 download fail stops",
+          B.music_state(-100512).get("playing") is False
+          and B.music_state(-100512).get("current") is None)
+    B._music_download_audio = _real_dl2623
+    B._yt_extract = _real_extract2623
+    B._yt_dlp = _real_ydl2623
+    B._GroupCallFactory = _real_factory2623
+    B._music_make_client = _real_mkc2623
+    B.ASSISTANT_SESSION = _real_session2623
+
+    # (q) v2.6.24 — YouTube search fix + owner DM on fallback
+    # (Sanji, 2026-11-15: Motu Patlu STILL came from SoundCloud — the
+    # Railway log showed the search died with "Requested format is not
+    # available" even though the search page found the video.)
+    class _NoFmtYDL2624:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            return {"entries": [{"title": "Koi Gaana",
+                                 "webpage_url": "https://youtube.com/watch?v=abc",
+                                 "url": "https://audio.example/x.m4a", "duration": 100}]}
+
+    _saved_ydl2624 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _NoFmtYDL2624})
+    _NoFmtYDL2624.calls.clear()
+    _info2624 = B._yt_extract("ytsearch1:koi gaana")
+    check("v2624 search opts have no format",
+          bool(_NoFmtYDL2624.calls) and "format" not in _NoFmtYDL2624.calls[0]
+          and (_info2624.get("entries") or [{}])[0].get("title") == "Koi Gaana",
+          str(_NoFmtYDL2624.calls[0] if _NoFmtYDL2624.calls else "no call"))
+
+    class _FmtErrYDL2624:
+        calls = []
+        mode = "retry_ok"
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            if type(self).mode == "retry_ok" and len(type(self).calls) == 1:
+                raise Exception("ERROR: [youtube] abc: Requested format is not available. "
+                                "Use --list-formats for a list of available formats")
+            if type(self).mode == "always_fail":
+                raise Exception("ERROR: [youtube] abc: Requested format is not available. "
+                                "Use --list-formats for a list of available formats")
+            return {"entries": [{"title": "Retry Gaana",
+                                 "webpage_url": "https://youtube.com/watch?v=retry",
+                                 "url": "https://audio.example/retry.m4a", "duration": 180}]}
+
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FmtErrYDL2624})
+    _FmtErrYDL2624.calls.clear()
+    _FmtErrYDL2624.mode = "retry_ok"
+    _info2624b = B._yt_extract("ytsearch1:retry gaana")
+    check("v2624 format error retries mweb tv web",
+          len(_FmtErrYDL2624.calls) == 2
+          and _FmtErrYDL2624.calls[1].get("extractor_args", {}).get("youtube", {}).get("player_client") == ["mweb", "tv", "web"]
+          and (_info2624b.get("entries") or [{}])[0].get("title") == "Retry Gaana",
+          str(len(_FmtErrYDL2624.calls)))
+    _FmtErrYDL2624.calls.clear()
+    _FmtErrYDL2624.mode = "always_fail"
+    try:
+        B._yt_extract("ytsearch1:retry gaana")
+        check("v2624 format error both fail blocked", False)
+    except B.MusicError as _e2624:
+        check("v2624 format error both fail blocked", str(_e2624) == "youtube_blocked", str(_e2624))
+    B._yt_dlp = _saved_ydl2624
+    _real_extract2624 = B._yt_extract
+
+    def _extract_fb2624(src, **kw):
+        if src.startswith("ytsearch1:"):
+            raise B.MusicError("search failed: ERROR: [youtube] abc: Requested format is not available")
+        return {"entries": [{"title": "SC Gaana",
+                             "webpage_url": "https://soundcloud.com/x/sc-gaana",
+                             "url": "https://audio.example/sc.m4a", "duration": 210}]}
+
+    B._yt_extract = _extract_fb2624
+    _t2624 = await B.resolve_track("motu patlu")
+    check("v2624 fallback carries reason",
+          _t2624.get("source") == "soundcloud"
+          and _t2624.get("fallback_from") == "youtube"
+          and "Requested format is not available" in (_t2624.get("fallback_reason") or ""),
+          str(_t2624))
+    B._yt_extract = _real_extract2624
+    _real_factory2624 = B._GroupCallFactory
+    _real_mkc2624 = B._music_make_client
+    _real_session2624 = B.ASSISTANT_SESSION
+    _real_ydl2624b = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False,
+                         "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _real_resolve2624 = B.resolve_track
+
+    async def _resolve_fb2624(q):
+        return {"title": "SC Gaana", "url": "https://soundcloud.com/x/sc-gaana",
+                "audio": "https://audio.example/sc.m4a", "duration": 210,
+                "source": "soundcloud", "by": "", "by_id": 0,
+                "fallback_from": "youtube",
+                "fallback_reason": "search failed: Requested format is not available"}
+
+    B.resolve_track = _resolve_fb2624
+    await B._music_ensure_assistant()
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_music(FakeApp(), FakeMessage("/play motu patlu", uid=111, name="Tester", chat_id=-100123))
+    check("v2624 fallback dms owner",
+          any(cid == B.OWNER_ID and "youtube failed" in t and "motu patlu" in t
+              for cid, t in FakeMessage.outbox), str(FakeMessage.outbox))
+    check("v2624 fallback records",
+          len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "play"
+          and "youtube failed" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    check("v2624 fallback still plays",
+          B.music_state(-100123).get("playing") is True
+          and B.music_state(-100123).get("current", {}).get("source") == "soundcloud")
+    B.resolve_track = _real_resolve2624
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    _real_dl2624 = B._music_download_audio
+    _dl_calls2624 = {"n": 0}
+
+    async def _dl_once2624(track):
+        _dl_calls2624["n"] += 1
+        if _dl_calls2624["n"] == 1:
+            raise B.MusicError("download failed: HTTP Error 403")
+        return await _real_dl2624(track)
+
+    B._music_download_audio = _dl_once2624
+    _real_scfb2624 = B._music_sc_fallback
+
+    def _scfb2624(track):
+        return {"title": "SC Gaana", "url": "https://soundcloud.com/x/sc-gaana",
+                "audio": "https://audio.example/sc.m4a", "duration": 210,
+                "source": "soundcloud", "by": "Tester", "by_id": 999226}
+
+    B._music_sc_fallback = _scfb2624
+    B.MUSIC.clear()
+    await B._music_ensure_assistant()
+    B.music_queue_add(-100513, dict(_cur2623, by="Tester", by_id=999226))
+    await B._music_play_next(-100513)
+    _st513b = B.music_state(-100513)
+    check("v2624 download fallback plays sc",
+          _st513b.get("playing") is True
+          and _st513b.get("current", {}).get("source") == "soundcloud"
+          and _st513b.get("current", {}).get("title") == "SC Gaana", str(_st513b.get("current")))
+    check("v2624 download fallback dms owner",
+          any(cid == B.OWNER_ID and "youtube download failed" in t and "Motu Patlu" in t
+              for cid, t in FakeMessage.outbox), str(FakeMessage.outbox))
+    check("v2624 download fallback records",
+          len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "play"
+          and "youtube download failed" in B._CMD_ERRORS[0]["err"]
+          and "track: Motu Patlu" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    B._music_download_audio = _real_dl2624
+    B._music_sc_fallback = _real_scfb2624
+    B._yt_dlp = _real_ydl2624b
+    B._GroupCallFactory = _real_factory2624
+    B._music_make_client = _real_mkc2624
+    B.ASSISTANT_SESSION = _real_session2624
+
+    # (r) v2.6.26 — flat YouTube search (extract_flat) + cookie clients
+    # (Sanji, 2026-11-15: v2.6.25's py-yt-search never loaded on Railway —
+    # 0.8.2 needs Python >=3.10 and 0.6.2 does not import on 3.9 at all.
+    # extract_flat does the same job with yt-dlp alone: search entries
+    # come back shallow, never re-extracted as full videos.)
+    _real_extract2626 = B._yt_extract
+
+    class _FlatYDL2626:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            return {"entries": [{"id": "WrxYRXH2ceg",
+                                 "title": "Motu Patlu Ka Twins Carnival",
+                                 "duration": 1334,
+                                 "url": "https://www.youtube.com/watch?v=WrxYRXH2ceg",
+                                 "webpage_url": None}]}
+
+    _saved_ydl2626 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FlatYDL2626})
+    _FlatYDL2626.calls.clear()
+    _info2626 = B._yt_extract("ytsearch1:motu patlu", flat=True)
+    check("v2626 flat search opts",
+          bool(_FlatYDL2626.calls) and _FlatYDL2626.calls[0].get("extract_flat") is True
+          and (_info2626.get("entries") or [{}])[0].get("title") == "Motu Patlu Ka Twins Carnival",
+          str(_FlatYDL2626.calls[0] if _FlatYDL2626.calls else "no call"))
+    B._yt_dlp = _saved_ydl2626
+
+    def _extract_flat2626(src, **kw):
+        if src.startswith("ytsearch1:"):
+            return {"entries": [{"id": "WrxYRXH2ceg",
+                                 "title": "Motu Patlu Ka Twins Carnival",
+                                 "duration": 1334,
+                                 "url": "https://www.youtube.com/watch?v=WrxYRXH2ceg",
+                                 "webpage_url": None}]}
+        return {"entries": [{"title": "SC Gaana",
+                             "webpage_url": "https://soundcloud.com/x/sc-gaana",
+                             "url": "https://audio.example/sc.m4a", "duration": 210}]}
+
+    B._yt_extract = _extract_flat2626
+    _t2626 = await B.resolve_track("motu patlu")
+    check("v2626 flat search resolves youtube",
+          _t2626.get("source") == "youtube"
+          and _t2626.get("title") == "Motu Patlu Ka Twins Carnival"
+          and _t2626.get("duration") == 1334
+          and _t2626.get("url") == "https://www.youtube.com/watch?v=WrxYRXH2ceg"
+          and _t2626.get("audio") == "https://www.youtube.com/watch?v=WrxYRXH2ceg"
+          and "fallback_from" not in _t2626, str(_t2626))
+
+    def _extract_flat_fail2626(src, **kw):
+        if src.startswith("ytsearch1:"):
+            raise B.MusicError("search failed: ERROR: [youtube] x: Sign in to confirm you're not a bot")
+        return {"entries": [{"title": "SC Gaana",
+                             "webpage_url": "https://soundcloud.com/x/sc-gaana",
+                             "url": "https://audio.example/sc.m4a", "duration": 210}]}
+
+    B._yt_extract = _extract_flat_fail2626
+    _t2626b = await B.resolve_track("motu patlu")
+    check("v2626 flat search fail falls back to sc",
+          _t2626b.get("source") == "soundcloud"
+          and _t2626b.get("fallback_from") == "youtube"
+          and "not a bot" in (_t2626b.get("fallback_reason") or ""), str(_t2626b))
+    B._yt_extract = _real_extract2626
+
+    # similar pick with flat YouTube entries (webpage_url None, url = watch URL)
+    def _extract_sim_flat2626(src, **kw):
+        if src.startswith("scsearch5:"):
+            return {"entries": [{"title": "SC Song",
+                                 "webpage_url": "https://soundcloud.com/x/sc-song",
+                                 "url": "https://audio.example/scs.m4a", "duration": 180}]}
+        return {"entries": [{"id": "cur1", "title": "Cur Gaana", "duration": 100,
+                             "url": "https://youtube.com/watch?v=cur1", "webpage_url": None},
+                            {"id": "sim1", "title": "Sim Gaana", "duration": 200,
+                             "url": "https://youtube.com/watch?v=sim1", "webpage_url": None}]}
+
+    B._yt_extract = _extract_sim_flat2626
+    _st2626 = B.music_state(-100526)
+    _st2626["current"] = {"title": "Cur Gaana", "url": "https://youtube.com/watch?v=cur1",
+                          "by": "Tester", "by_id": 999}
+    _st2626.pop("autoplay_seen", None)
+    _sim2626 = B._music_similar_pick(-100526)
+    check("v2626 similar flat skips current",
+          _sim2626 is not None and _sim2626.get("title") == "Sim Gaana"
+          and _sim2626.get("source") == "youtube"
+          and _sim2626.get("url") == "https://youtube.com/watch?v=sim1", str(_sim2626))
+    B._yt_extract = _real_extract2626
+
+    class _CapDlYDL2626:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"requested_downloads": [{"filepath": _dl_tmp2626}]}
+
+    _dl_tmp2626 = os.path.join(tempfile.gettempdir(), "v2626-dl.webm")
+    with open(_dl_tmp2626, "wb") as _fh:
+        _fh.write(b"fake-audio")
+    _saved_dl_ydl2626 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _CapDlYDL2626})
+    _CapDlYDL2626.calls.clear()
+    _dl_out2626 = B._music_download_sync({"url": "https://www.youtube.com/watch?v=W2P1jPZAZtU",
+                                          "title": "Motu Patlu", "duration": 159})
+    check("v2626 download opts format + cookie clients",
+          bool(_CapDlYDL2626.calls)
+          and _CapDlYDL2626.calls[0].get("format") == "bestaudio[ext=webm]/bestaudio/best"
+          and _CapDlYDL2626.calls[0].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["web_embedded", "tv_samsung", "web"]
+          and _dl_out2626 == _dl_tmp2626,
+          str(_CapDlYDL2626.calls[0] if _CapDlYDL2626.calls else "no call"))
+    B._yt_dlp = _saved_dl_ydl2626
+    if os.path.isfile(_dl_tmp2626):
+        os.remove(_dl_tmp2626)
+
+
+    # (s) v2.6.27 — EJS challenge solver + Deno + SC-retry silence log
+    # (Sanji, 2026-11-15 08:35 IST: /play Motu Patlu LIVE FAILED at the
+    # DOWNLOAD — "This video is unavailable" — while the flat search
+    # found the video. Verified from this VM: the same download FAILS
+    # without EJS and SUCCEEDS with remote_components ejs:github + Deno,
+    # no cookies. The SC retry was also silent in the log.)
+    _real_extract2627 = B._yt_extract
+
+    class _CapYDL2627:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            return {"entries": [{"id": "W2P1jPZAZtU", "title": "Motu Patlu",
+                                 "duration": 159,
+                                 "url": "https://www.youtube.com/watch?v=W2P1jPZAZtU",
+                                 "webpage_url": None}]}
+
+    _saved_ydl2627 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _CapYDL2627})
+    _CapYDL2627.calls.clear()
+    _info2627 = B._yt_extract("ytsearch1:motu patlu", flat=True)
+    check("v2627 extract opts ejs",
+          bool(_CapYDL2627.calls)
+          and _CapYDL2627.calls[0].get("remote_components") == ["ejs:github"]
+          and _CapYDL2627.calls[0].get("extract_flat") is True,
+          str(_CapYDL2627.calls[0] if _CapYDL2627.calls else "no call"))
+    B._yt_dlp = _saved_ydl2627
+
+    class _CapDlYDL2627:
+        calls = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            type(self).calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"requested_downloads": [{"filepath": _dl_tmp2627}]}
+
+    _dl_tmp2627 = os.path.join(tempfile.gettempdir(), "v2627-dl.webm")
+    with open(_dl_tmp2627, "wb") as _fh:
+        _fh.write(b"fake-audio")
+    _saved_dl_ydl2627 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _CapDlYDL2627})
+    _CapDlYDL2627.calls.clear()
+    _dl_out2627 = B._music_download_sync({"url": "https://www.youtube.com/watch?v=W2P1jPZAZtU",
+                                          "title": "Motu Patlu", "duration": 159})
+    check("v2627 download opts ejs",
+          bool(_CapDlYDL2627.calls)
+          and _CapDlYDL2627.calls[0].get("remote_components") == ["ejs:github"]
+          and _dl_out2627 == _dl_tmp2627,
+          str(_CapDlYDL2627.calls[0] if _CapDlYDL2627.calls else "no call"))
+    B._yt_dlp = _saved_dl_ydl2627
+    if os.path.isfile(_dl_tmp2627):
+        os.remove(_dl_tmp2627)
+
+    # SC retry finds nothing -> the "soundcloud retry found nothing" line
+    _real_factory2627 = B._GroupCallFactory
+    _real_mkc2627 = B._music_make_client
+    _real_session2627 = B.ASSISTANT_SESSION
+    _real_ydl2627b = B._yt_dlp
+    B._GroupCallFactory = _FakeGroupCallFactory
+    B._music_make_client = lambda: _FakeAssistantClient()
+    B.ASSISTANT_SESSION = "fake-session-for-test"
+    B._yt_dlp = _FakeYtDlp
+    B._ASSISTANT.update({"client": None, "factory": None, "started": False,
+                         "me": None, "init_started": True})
+    B.MUSIC.clear()
+    _real_dl2627 = B._music_download_audio
+
+    async def _dl_fail2627(track):
+        raise B.MusicError("download failed: ERROR: [youtube] x: This video is unavailable")
+
+    B._music_download_audio = _dl_fail2627
+    _real_scfb2627 = B._music_sc_fallback
+    B._music_sc_fallback = lambda track: None
+    B._CMD_ERRORS.clear()
+    B._CMD_ERR_DM_AT.clear()
+    FakeMessage.outbox.clear()
+    await B._music_ensure_assistant()
+    B.music_queue_add(-100527, dict(_cur2623, by="Tester", by_id=999227))
+    _buf2627 = io.StringIO()
+    with contextlib.redirect_stdout(_buf2627):
+        await B._music_play_next(-100527)
+    check("v2627 sc retry nothing logs",
+          "soundcloud retry found nothing" in _buf2627.getvalue(),
+          _buf2627.getvalue()[-400:])
+    check("v2627 sc retry nothing errors",
+          len(B._CMD_ERRORS) == 1 and B._CMD_ERRORS[0]["cmd"] == "play"
+          and "This video is unavailable" in B._CMD_ERRORS[0]["err"], str(B._CMD_ERRORS))
+    B._music_download_audio = _real_dl2627
+    B._music_sc_fallback = _real_scfb2627
+    B._yt_dlp = _real_ydl2627b
+    B._GroupCallFactory = _real_factory2627
+    B._music_make_client = _real_mkc2627
+    B.ASSISTANT_SESSION = _real_session2627
+
+
+    # (t) v2.6.28 — kustmusic download method: 3 attempts, backoff,
+    # alternating clients, looser format (no opus filter)
+    _dl_tmp2628 = os.path.join(tempfile.gettempdir(), "v2628-dl.webm")
+    with open(_dl_tmp2628, "wb") as _fh:
+        _fh.write(b"fake-audio")
+
+    class _FlakyDlYDL2628:
+        calls = []
+        fail_times = 2
+        fail_msg = "ERROR: [youtube] x: This video is unavailable"
+
+        def __init__(self, opts):
+            # copy: the bot mutates the SAME opts dict between attempts
+            # (extractor_args is replaced), so storing the live dict would
+            # make every recorded call show the LAST client set.
+            self.opts = dict(opts)
+            type(self).calls.append(self.opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            if len(type(self).calls) <= type(self).fail_times:
+                raise Exception(type(self).fail_msg)
+            return {"requested_downloads": [{"filepath": _dl_tmp2628}]}
+
+    _saved_ydl2628 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FlakyDlYDL2628})
+    _FlakyDlYDL2628.calls.clear()
+    _FlakyDlYDL2628.fail_times = 2
+    _FlakyDlYDL2628.fail_msg = "ERROR: [youtube] x: This video is unavailable"
+    _dl_out2628 = B._music_download_sync({"url": "https://www.youtube.com/watch?v=x",
+                                          "title": "Flaky Gaana", "duration": 100})
+    check("v2628 download retries unavailable then succeeds",
+          _dl_out2628 == _dl_tmp2628 and len(_FlakyDlYDL2628.calls) == 3
+          and _FlakyDlYDL2628.calls[0].get("format") == "bestaudio[ext=webm]/bestaudio/best"
+          and _FlakyDlYDL2628.calls[1].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["mweb", "tv", "web"],
+          str(len(_FlakyDlYDL2628.calls)))
+    # permanent error -> no retry at all
+    _FlakyDlYDL2628.calls.clear()
+    _FlakyDlYDL2628.fail_times = 99
+    _FlakyDlYDL2628.fail_msg = "ERROR: [youtube] x: This is a private video"
+    try:
+        B._music_download_sync({"url": "https://www.youtube.com/watch?v=x",
+                                "title": "Private Gaana", "duration": 100})
+        _perm2628 = False
+    except B.MusicError:
+        _perm2628 = True
+    check("v2628 download permanent no retry",
+          _perm2628 and len(_FlakyDlYDL2628.calls) == 1,
+          str(len(_FlakyDlYDL2628.calls)))
+    # three failures -> MusicError after 3 attempts
+    _FlakyDlYDL2628.calls.clear()
+    _FlakyDlYDL2628.fail_times = 99
+    _FlakyDlYDL2628.fail_msg = "ERROR: [youtube] x: Internal Server Error"
+    try:
+        B._music_download_sync({"url": "https://www.youtube.com/watch?v=x",
+                                "title": "Dead Gaana", "duration": 100})
+        _dead2628 = False
+    except B.MusicError as _e2628:
+        _dead2628 = "download failed" in str(_e2628)
+    check("v2628 download gives up after 3",
+          _dead2628 and len(_FlakyDlYDL2628.calls) == 3,
+          str(len(_FlakyDlYDL2628.calls)))
+    B._yt_dlp = _saved_ydl2628
+    if os.path.isfile(_dl_tmp2628):
+        os.remove(_dl_tmp2628)
+
+
+    # (u) v2.6.29 — android cookie-less video fallback (Sanji's idea)
+    # block (t) deleted the temp file at its end — recreate it here.
+    with open(_dl_tmp2628, "wb") as _fh:
+        _fh.write(b"fake-audio")
+    _saved_cookie_file2629 = B._yt_cookie_file
+    B._yt_cookie_file = lambda: "/tmp/fake-yt-cookies-2629.txt"
+
+    class _FlakyDlYDL2629(_FlakyDlYDL2628):
+        pass
+
+    _saved_ydl2629 = B._yt_dlp
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FlakyDlYDL2629})
+    _FlakyDlYDL2629.calls.clear()
+    _FlakyDlYDL2629.fail_times = 2
+    _FlakyDlYDL2629.fail_msg = "ERROR: [youtube] x: This video is unavailable"
+    _dl_out2629 = B._music_download_sync({"url": "https://www.youtube.com/watch?v=x",
+                                          "title": "Android Gaana", "duration": 100})
+    _c2629 = _FlakyDlYDL2629.calls
+    check("v2629 download android attempt no cookies",
+          _dl_out2629 == _dl_tmp2628
+          and len(_c2629) == 3
+          and _c2629[0].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["web_embedded", "tv_samsung", "web"]
+          and _c2629[0].get("cookiefile") == "/tmp/fake-yt-cookies-2629.txt"
+          and _c2629[1].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["mweb", "tv", "web"]
+          and _c2629[1].get("cookiefile") == "/tmp/fake-yt-cookies-2629.txt"
+          and _c2629[2].get("extractor_args", {}).get("youtube", {}).get("player_client")
+          == ["android"]
+          and "cookiefile" not in _c2629[2],
+          str([_c2629[i].get("extractor_args", {}).get("youtube", {}).get("player_client")
+               for i in range(len(_c2629))]))
+    B._yt_dlp = _saved_ydl2629
+    B._yt_cookie_file = _saved_cookie_file2629
+    if os.path.isfile(_dl_tmp2628):
+        os.remove(_dl_tmp2628)
+
+
+    # (v) v2.6.30 — CLI shim: opts -> yt-dlp binary args, JSON parse,
+    # download stem scan, error lines, missing binary
+    import subprocess as _sp2630
+    _saved_ytdlp_bin2630 = os.environ.get("YTDLP_BIN")
+    if "YTDLP_BIN" in os.environ:
+        del os.environ["YTDLP_BIN"]
+
+    class _FakeProc2630:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    _run_calls2630 = []
+
+    def _fake_run2630(cmd, capture_output=True, text=True, timeout=None):
+        _run_calls2630.append((cmd, timeout))
+        if any("ytsearch1:" in str(a) for a in cmd):
+            return _FakeProc2630(0, json.dumps({
+                "entries": [{"id": "WrxYRXH2ceg", "title": "Motu Patlu Test",
+                             "duration": 95, "url": "https://www.youtube.com/watch?v=WrxYRXH2ceg",
+                             "webpage_url": None}]}), "")
+        if "--dump-single-json" in cmd:
+            return _FakeProc2630(0, json.dumps({"id": "x", "title": "T", "duration": 5}), "")
+        return _FakeProc2630(0, "", "")
+
+    _real_run2630 = _sp2630.run
+    _sp2630.run = _fake_run2630
+    _run_calls2630.clear()
+    _info2630 = B._yt_dlp.YoutubeDL({
+        "quiet": True, "noplaylist": True, "no_warnings": True,
+        "skip_download": True, "remote_components": ["ejs:github"],
+        "extract_flat": True, "cookiefile": "/tmp/fake-ck.txt",
+        "extractor_args": {"youtube": {"player_client": ["web_embedded", "tv_samsung", "web"]}},
+    }).extract_info("ytsearch1:motu patlu", download=False)
+    _cmd2630 = _run_calls2630[0][0]
+    check("v2630 shim search args + json",
+          _info2630.get("entries", [{}])[0].get("title") == "Motu Patlu Test"
+          and _cmd2630[0].endswith("yt-dlp")
+          and "--dump-single-json" in _cmd2630
+          and "--flat-playlist" in _cmd2630
+          and "--remote-components" in _cmd2630 and "ejs:github" in _cmd2630
+          and "--extractor-args" in _cmd2630
+          and "youtube:player_client=web_embedded,tv_samsung,web" in _cmd2630
+          and "--cookies" in _cmd2630 and "/tmp/fake-ck.txt" in _cmd2630
+          and _cmd2630[-2:] == ["--", "ytsearch1:motu patlu"]
+          and _run_calls2630[0][1] == 30,
+          str(_cmd2630))
+    # download: -f/-o flags, timeout 300, stem scan finds the file
+    _dl_stem2630 = "1700000000-1234"
+    _dl_file2630 = os.path.join(tempfile.gettempdir(), _dl_stem2630 + ".mp4")
+    with open(_dl_file2630, "wb") as _fh:
+        _fh.write(b"fake-video")
+    _run_calls2630.clear()
+    _dl2630 = B._yt_dlp.YoutubeDL({
+        "quiet": True, "noplaylist": True,
+        "format": "bestaudio[ext=webm]/bestaudio/best", "no_warnings": True,
+        "outtmpl": os.path.join(tempfile.gettempdir(), _dl_stem2630 + ".%(ext)s"),
+        "remote_components": ["ejs:github"],
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
+    }).extract_info("https://www.youtube.com/watch?v=x", download=True)
+    _dcmd2630 = _run_calls2630[0][0]
+    check("v2630 shim download args + stem scan",
+          _dl2630.get("requested_downloads", [{}])[0].get("filepath") == _dl_file2630
+          and "-f" in _dcmd2630 and "bestaudio[ext=webm]/bestaudio/best" in _dcmd2630
+          and "-o" in _dcmd2630 and "--dump-single-json" not in _dcmd2630
+          and "youtube:player_client=android" in _dcmd2630
+          and "--cookies" not in _dcmd2630
+          and _run_calls2630[0][1] == 300,
+          str(_dcmd2630))
+    if os.path.isfile(_dl_file2630):
+        os.remove(_dl_file2630)
+    # error: last ERROR line surfaces as the exception
+    def _fake_err2630(cmd, capture_output=True, text=True, timeout=None):
+        _run_calls2630.append((cmd, timeout))
+        return _FakeProc2630(1, "", "WARNING: something\nERROR: [youtube] x: This video is unavailable\n")
+    _sp2630.run = _fake_err2630
+    try:
+        B._yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}).extract_info(
+            "https://www.youtube.com/watch?v=x", download=False)
+        _err2630 = ""
+    except Exception as _e2630:
+        _err2630 = str(_e2630)
+    check("v2630 shim error line", "This video is unavailable" in _err2630, _err2630)
+    _sp2630.run = _real_run2630
+    # binary missing -> MusicError("search unavailable")
+    os.environ["YTDLP_BIN"] = "/nonexistent/yt-dlp-2630"
+    try:
+        B._yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}).extract_info(
+            "ytsearch1:x", download=False)
+        _miss2630 = ""
+    except B.MusicError as _e2630:
+        _miss2630 = str(_e2630)
+    except Exception as _e2630:  # noqa: BLE001
+        _miss2630 = "WRONG: " + type(_e2630).__name__
+    check("v2630 shim missing binary", _miss2630 == "search unavailable", _miss2630)
+    if _saved_ytdlp_bin2630 is None:
+        os.environ.pop("YTDLP_BIN", None)
+    else:
+        os.environ["YTDLP_BIN"] = _saved_ytdlp_bin2630
+
+
+    # (w) v2.6.31 — SC fallback tries title -> cleaned title -> user's
+    # query; resolve_track stores the query; final download error logged
+    check("w2631 clean title pipe", B._sc_clean_title(
+        "Motu Patlu Ka Twins Carnival Mein Dhamaka | Motu Patlu Compilation | Cartoons For Kids")
+        == "Motu Patlu Ka Twins Carnival Mein Dhamaka")
+    check("w2631 clean title official", B._sc_clean_title(
+        "Tum Se Hi (Official Video) | Jab We Met") == "Tum Se Hi")
+    check("w2631 clean title keeps year", B._sc_clean_title(
+        "Banake Kyun Bigada Re With Lyrics Zanjeer (1973) - Official")
+        == "Banake Kyun Bigada Re With Lyrics Zanjeer (1973)")
+    check("w2631 clean title plain", B._sc_clean_title("motu patlu") == "motu patlu")
+    _real_extract2631 = B._yt_extract
+    _sc_calls2631 = []
+    _sc_info2631 = {"title": "Motu Patlu - Title Song",
+                    "webpage_url": "https://soundcloud.com/x/motu",
+                    "url": "https://audio.example/motu.mp3", "duration": 95}
+
+    def _fake_extract2631(src, **kw):
+        _sc_calls2631.append(src)
+        if src == "scsearch1:motu patlu":
+            return dict(_sc_info2631)
+        raise B.MusicError("not found")
+
+    B._yt_extract = _fake_extract2631
+    _w_track2631 = {"title": "Motu Patlu Ka Twins Carnival Mein Dhamaka | Motu Patlu Compilation | Cartoons For Kids",
+                    "url": "https://youtube.com/watch?v=WrxYRXH2ceg", "audio": "", "duration": 95,
+                    "source": "youtube", "by": "", "by_id": 0, "query": "motu patlu"}
+    _w_found2631 = B._music_sc_fallback(_w_track2631)
+    check("w2631 sc fallback tries query after title",
+          _w_found2631 is not None and _w_found2631.get("title") == "Motu Patlu - Title Song"
+          and _sc_calls2631 == ["scsearch1:Motu Patlu Ka Twins Carnival Mein Dhamaka | Motu Patlu Compilation | Cartoons For Kids",
+                                "scsearch1:Motu Patlu Ka Twins Carnival Mein Dhamaka",
+                                "scsearch1:motu patlu"],
+          str(_sc_calls2631))
+    _sc_calls2631.clear()
+    _w_found2631b = B._music_sc_fallback({"title": "motu patlu", "query": "motu patlu"})
+    check("w2631 sc fallback dedups", _w_found2631b is not None and len(_sc_calls2631) == 1
+          and _sc_calls2631[0] == "scsearch1:motu patlu", str(_sc_calls2631))
+    B._yt_extract = lambda src, **kw: (_ for _ in ()).throw(B.MusicError("not found"))
+    check("w2631 sc fallback none when all fail", B._music_sc_fallback(_w_track2631) is None)
+    B._yt_extract = _real_extract2631
+
+    def _fake_resolve_extract2631(src, **kw):
+        if src.startswith("ytsearch1:"):
+            return {"entries": [{"id": "WrxYRXH2ceg", "title": "Motu Patlu Test",
+                                 "duration": 95, "url": "https://www.youtube.com/watch?v=WrxYRXH2ceg",
+                                 "webpage_url": None}]}
+        raise B.MusicError("not found")
+
+    _real_extract2631b = B._yt_extract
+    B._yt_extract = _fake_resolve_extract2631
+    _w_res2631 = await B.resolve_track("motu patlu")
+    check("w2631 resolve stores query", _w_res2631.get("query") == "motu patlu"
+          and _w_res2631.get("title") == "Motu Patlu Test", str(_w_res2631))
+    B._yt_extract = _real_extract2631b
+    # download: all 3 attempts fail -> the final (android) error is logged
+    _real_ytdlp2631 = B._yt_dlp
+
+    class _FailAll2631:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, src, download=False):
+            raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+
+    B._yt_dlp = type("Y", (), {"YoutubeDL": _FailAll2631})
+    _buf2631 = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf2631):
+            B._music_download_sync({"url": "https://www.youtube.com/watch?v=x", "title": "T",
+                                    "audio": "", "duration": 0, "source": "youtube"})
+        _dl_err2631 = ""
+    except B.MusicError as _e2631:
+        _dl_err2631 = str(_e2631)
+    check("w2631 download final error logged",
+          "download failed after 3/3 attempts (android), last error: ERROR: [youtube] x: Sign in to confirm" in _buf2631.getvalue()
+          and _dl_err2631 == "youtube_blocked", _buf2631.getvalue()[-400:])
+    B._yt_dlp = _real_ytdlp2631
+
+    # (x) v2.6.32 — force-join gate: /joining wired, non-joined messages
+    # deleted + warned, joined/admins untouched, check button, panel add/delete
+    check("v2632 dispatch joining -> cmd_joining", DISPATCH_MAP.get("joining") == "cmd_joining",
+          str(DISPATCH_MAP.get("joining")))
+    check("v2632 gate handler registered in group -1",
+          "force_join_gate" in HANDLER_GROUPS.get(-1, []), str(HANDLER_GROUPS.get(-1)))
+
+    class _FakeGateClient2632:
+        def __init__(self):
+            self.statuses = {}
+            self.sent = []
+            self.deleted_msgs = []
+
+        async def get_chat_member(self, chat_id, user_id):
+            st = self.statuses.get((chat_id, user_id), B.ChatMemberStatus.LEFT)
+            return FakeChatMember(FakeUser(user_id, "T"), st)
+
+        async def send_message(self, chat_id, text, **kwargs):
+            FakeMessage._id += 1
+            m = FakeMessage.__new__(FakeMessage)
+            m.id = FakeMessage._id
+            m.text = text
+            m.deleted = False
+
+            async def _del():
+                m.deleted = True
+                return True
+            m.delete = _del
+            self.sent.append((chat_id, text, kwargs))
+            return m
+
+        async def delete_messages(self, chat_id, message_ids, **kwargs):
+            self.deleted_msgs.append((chat_id, list(message_ids)))
+            return True
+
+    _real_isadmin2632 = B.is_chat_admin
+    _admins2632 = set()
+
+    async def _fake_isadmin2632(cl, cid, uid):
+        return (cid, uid) in _admins2632 or uid == B.OWNER_ID
+    B.is_chat_admin = _fake_isadmin2632
+    _gclient2632 = _FakeGateClient2632()
+    B.DATA["force_join"] = {"channel": -100999, "username": "testchan",
+                            "title": "Test Channel", "invite": ""}
+    B._chat_data(-100123)["force_join"] = True
+
+    def _gate_msg2632(text="hello", uid=111):
+        m = FakeMessage(text, uid=uid, name="Tester", chat_id=-100123, ctype="group")
+        m.deleted = []
+
+        async def _del():
+            m.deleted.append(m.id)
+            return True
+        m.delete = _del
+        return m
+
+    async def _gate2632(msg):
+        try:
+            await B.force_join_gate(_gclient2632, msg)
+            return False
+        except B.StopPropagation:
+            return True
+
+    B._FJ_CACHE.clear()
+    B._FJ_ADMIN_CACHE.clear()
+    B._FJ_WARNS.clear()
+    # gate OFF -> nothing happens
+    B._chat_data(-100123)["force_join"] = False
+    _m2632 = _gate_msg2632()
+    check("x2632 gate off passes through", await _gate2632(_m2632) is False and not _m2632.deleted,
+          str(_m2632.deleted))
+    B._chat_data(-100123)["force_join"] = True
+    # no channel -> nothing happens
+    B.DATA["force_join"]["channel"] = 0
+    _m2632 = _gate_msg2632()
+    check("x2632 no channel passes through", await _gate2632(_m2632) is False and not _m2632.deleted,
+          str(_m2632.deleted))
+    B.DATA["force_join"]["channel"] = -100999
+    # admin -> passes through
+    _admins2632.add((-100123, 111))
+    B._FJ_ADMIN_CACHE.clear()
+    _m2632 = _gate_msg2632()
+    check("x2632 admin passes through", await _gate2632(_m2632) is False and not _m2632.deleted,
+          str(_m2632.deleted))
+    _admins2632.discard((-100123, 111))
+    B._FJ_ADMIN_CACHE.clear()
+    # joined user -> passes through, no delete, no warn
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    B._FJ_CACHE.clear()
+    _sent_before2632 = len(_gclient2632.sent)
+    _m2632 = _gate_msg2632()
+    check("x2632 joined passes through", await _gate2632(_m2632) is False and not _m2632.deleted
+          and len(_gclient2632.sent) == _sent_before2632, str(_m2632.deleted))
+    # not joined -> delete + warn + StopPropagation
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    B._FJ_CACHE.clear()
+    _m2632 = _gate_msg2632()
+    _stopped2632 = await _gate2632(_m2632)
+    _warn2632 = _gclient2632.sent[-1] if _gclient2632.sent else None
+    _warn_btns2632 = _warn2632[2].get("reply_markup").inline_keyboard if _warn2632 else []
+    check("x2632 not joined deletes + warns + stops",
+          _stopped2632 is True and bool(_m2632.deleted) and _warn2632 is not None
+          and "Test Channel" in _warn2632[1] and "join karo" in _warn2632[1]
+          and _warn_btns2632[0][0].url == "https://t.me/testchan"
+          and _warn_btns2632[1][0].callback_data == "fjcheck:111",
+          str(_warn2632[1] if _warn2632 else None))
+    # same user again within 5 min -> delete again, but NO second warn
+    _sent_before2632 = len(_gclient2632.sent)
+    _m2632 = _gate_msg2632()
+    _stopped2632 = await _gate2632(_m2632)
+    check("x2632 warn throttled", _stopped2632 is True and bool(_m2632.deleted)
+          and len(_gclient2632.sent) == _sent_before2632, f"sent={len(_gclient2632.sent)}")
+    # cached joined -> still passes even if the status flips (cache proves)
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    # reuse the joined cache entry from the earlier case by re-seeding it
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time())
+    _m2632 = _gate_msg2632()
+    check("x2632 joined cache hit passes", await _gate2632(_m2632) is False and not _m2632.deleted,
+          str(_m2632.deleted))
+    B._FJ_CACHE.clear()
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    _m2632 = _gate_msg2632()
+    check("x2632 cache cleared blocks again", await _gate2632(_m2632) is True and bool(_m2632.deleted),
+          str(_m2632.deleted))
+    # service message (join event) -> passes through, no delete
+    _m2632 = _gate_msg2632()
+    _m2632.new_chat_members = [FakeUser(222, "New")]
+    check("x2632 service message passes", await _gate2632(_m2632) is False and not _m2632.deleted,
+          str(_m2632.deleted))
+    # membership check fails -> fail-open (no delete), owner DM throttled
+    B._FJ_CACHE.clear()
+    B._FJ_NOTIFY_AT.clear()
+    _out_before2632 = len(FakeMessage.outbox)
+    _old_gcm2632 = _gclient2632.get_chat_member
+
+    async def _boom2632(chat_id, user_id):
+        raise RuntimeError("boom")
+    _gclient2632.get_chat_member = _boom2632
+    _m2632 = _gate_msg2632()
+    check("x2632 check failure fail-open",
+          await _gate2632(_m2632) is False and not _m2632.deleted
+          and len(FakeMessage.outbox) == _out_before2632 + 1
+          and FakeMessage.outbox[-1][0] == B.OWNER_ID
+          and "forcejoin" in FakeMessage.outbox[-1][1],
+          str(FakeMessage.outbox[-1] if len(FakeMessage.outbox) > _out_before2632 else None))
+    _gclient2632.get_chat_member = _old_gcm2632
+    # fjcheck button: wrong user -> alert
+    _warn_obj2632 = FakeMessage("warn", uid=111, name="Tester", chat_id=-100123, ctype="group")
+    _warn_obj2632.deleted = []
+
+    async def _wdel2632():
+        _warn_obj2632.deleted.append(_warn_obj2632.id)
+        return True
+    _warn_obj2632.delete = _wdel2632
+    _q2632 = FakeCallbackQuery("fjcheck:111", uid=222, message=_warn_obj2632)
+    await B.force_join_check_callback(_gclient2632, _q2632)
+    check("x2632 fjcheck wrong user", _q2632.answers[-1][0] == "Ye button tumhare liye nahi hai 🙂"
+          and _q2632.answers[-1][1] is True and not _warn_obj2632.deleted, str(_q2632.answers))
+    # right user, not joined -> alert, warn stays
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    B._FJ_CACHE.clear()
+    _q2632 = FakeCallbackQuery("fjcheck:111", uid=111, message=_warn_obj2632)
+    await B.force_join_check_callback(_gclient2632, _q2632)
+    check("x2632 fjcheck not joined yet", "join nahi hua" in _q2632.answers[-1][0]
+          and not _warn_obj2632.deleted, str(_q2632.answers))
+    # right user, joined -> warn deleted + success alert
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    _q2632 = FakeCallbackQuery("fjcheck:111", uid=111, message=_warn_obj2632)
+    await B.force_join_check_callback(_gclient2632, _q2632)
+    check("x2632 fjcheck joined deletes warn", bool(_warn_obj2632.deleted)
+          and "Ho gaya" in _q2632.answers[-1][0], str(_q2632.answers))
+    B.is_chat_admin = _real_isadmin2632
+
+    # (x2) /joining command
+    _real_isadmin2632b = B.is_chat_admin
+    B.is_chat_admin = _fake_isadmin2632
+    B._FJ_CACHE.clear()
+    # non-admin cannot toggle
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining on", uid=111, chat_id=-100123, ctype="group"))
+    check("x2632 joining non-admin refused", "Sirf admins" in FakeMessage.outbox[-1][1],
+          FakeMessage.outbox[-1][1])
+    # on with no channel -> refused
+    B.DATA["force_join"]["channel"] = 0
+    _admins2632.add((-100123, 111))
+    B._FJ_ADMIN_CACHE.clear()
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining on", uid=111, chat_id=-100123, ctype="group"))
+    check("x2632 joining on without channel refused", "Pehle Owner Panel" in FakeMessage.outbox[-1][1],
+          FakeMessage.outbox[-1][1])
+    # on with a channel -> ON
+    B.DATA["force_join"] = {"channel": -100999, "username": "testchan",
+                            "title": "Test Channel", "invite": ""}
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining on", uid=111, chat_id=-100123, ctype="group"))
+    check("x2632 joining on", B._chat_data(-100123).get("force_join") is True
+          and "ON ✅" in FakeMessage.outbox[-1][1], FakeMessage.outbox[-1][1])
+    # status (no arg) shows channel + ON
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining", uid=111, chat_id=-100123, ctype="group"))
+    check("x2632 joining status", "ON ✅" in FakeMessage.outbox[-1][1]
+          and "testchan" in FakeMessage.outbox[-1][1], FakeMessage.outbox[-1][1])
+    # off
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining off", uid=111, chat_id=-100123, ctype="group"))
+    check("x2632 joining off", B._chat_data(-100123).get("force_join") is False
+          and "OFF ❌" in FakeMessage.outbox[-1][1], FakeMessage.outbox[-1][1])
+    # DM -> group-only
+    await B.cmd_joining(_gclient2632, FakeMessage("/joining on", uid=111, chat_id=111, ctype="private"))
+    check("x2632 joining DM refused", "group me chalti hai" in FakeMessage.outbox[-1][1],
+          FakeMessage.outbox[-1][1])
+    _admins2632.discard((-100123, 111))
+    B.is_chat_admin = _real_isadmin2632b
+
+    # (x3) Owner Panel: fj screen, add channel, delete channel
+    B.DATA["force_join"] = {"channel": 0, "username": "", "title": "", "invite": ""}
+    check("x2632 fj text no channel", "set nahi hai" in B._fj_text(), B._fj_text())
+    B.DATA["force_join"] = {"channel": -100999, "username": "testchan",
+                            "title": "Test Channel", "invite": ""}
+    check("x2632 fj text shows channel", "testchan" in B._fj_text(), B._fj_text())
+    _q2632 = FakeCallbackQuery("own:fjdel", uid=B.OWNER_ID,
+                               message=FakeMessage("panel", uid=B.OWNER_ID, chat_id=B.OWNER_ID, ctype="private"))
+    B._chat_data(-100123)["force_join"] = True
+    await B.owner_callbacks(_gclient2632, _q2632)
+    check("x2632 panel fjdel clears channel + gates",
+          B.DATA["force_join"].get("channel") in (0, None)
+          and B._chat_data(-100123).get("force_join") is False, B._fj_text())
+    _q2632 = FakeCallbackQuery("own:fjchan", uid=B.OWNER_ID,
+                               message=FakeMessage("panel", uid=B.OWNER_ID, chat_id=B.OWNER_ID, ctype="private"))
+    await B.owner_callbacks(_gclient2632, _q2632)
+    check("x2632 panel fjchan sets pending", B.OWNER_PENDING.get(B.OWNER_ID) == "fjchan",
+          str(B.OWNER_PENDING.get(B.OWNER_ID)))
+    _real_getchat2632 = B.app.get_chat
+
+    async def _fake_getchat2632(chat_id):
+        class _Ch:
+            pass
+        c = _Ch()
+        c.type = B.ChatType.CHANNEL
+        c.id = -100999
+        c.username = "testchan"
+        c.title = "Test Channel"
+        return c
+    B.app.get_chat = _fake_getchat2632
+    await B.handle_owner_pending(FakeMessage("https://t.me/testchan", uid=B.OWNER_ID, chat_id=B.OWNER_ID, ctype="private"))
+    check("x2632 pending fjchan sets channel (t.me link)",
+          B.DATA["force_join"].get("channel") == -100999
+          and B.DATA["force_join"].get("username") == "testchan"
+          and "set ho gaya" in FakeMessage.outbox[-1][1], FakeMessage.outbox[-1][1])
+    B.OWNER_PENDING[B.OWNER_ID] = "fjchan"
+
+    async def _fake_getchat_group2632(chat_id):
+        class _Ch:
+            pass
+        c = _Ch()
+        c.type = B.ChatType.GROUP
+        c.id = -100777
+        c.username = "somegroup"
+        c.title = "Some Group"
+        return c
+    B.app.get_chat = _fake_getchat_group2632
+    await B.handle_owner_pending(FakeMessage("@somegroup", uid=B.OWNER_ID, chat_id=B.OWNER_ID, ctype="private"))
+    check("x2632 pending fjchan rejects group", "channel nahi hai" in FakeMessage.outbox[-1][1]
+          and B.DATA["force_join"].get("channel") == -100999, FakeMessage.outbox[-1][1])
+    B.OWNER_PENDING[B.OWNER_ID] = "fjchan"
+
+    async def _fake_getchat_fail2632(chat_id):
+        raise ValueError("not found")
+    B.app.get_chat = _fake_getchat_fail2632
+    await B.handle_owner_pending(FakeMessage("@nope", uid=B.OWNER_ID, chat_id=B.OWNER_ID, ctype="private"))
+    check("x2632 pending fjchan not found", "nahi mila" in FakeMessage.outbox[-1][1]
+          and B.DATA["force_join"].get("channel") == -100999, FakeMessage.outbox[-1][1])
+    B.app.get_chat = _real_getchat2632
+
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
