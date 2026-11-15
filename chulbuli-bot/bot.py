@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.21"
+VERSION = "2.6.22"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4442,9 +4442,14 @@ def resolve_track(query: str) -> dict:
         return _track_from_info(_yt_extract(f"ytsearch1:{q}"), q, "youtube")
     except MusicError as exc:
         yt_err = str(exc)  # kept: raised again only if SoundCloud also fails
+    # v2.6.22: log the YouTube reason — before this, the fallback fired
+    # silently, so a live "why did YouTube fail?" (e.g. Motu Patlu title
+    # song, 2026-11-15) was unanswerable from the Railway logs.
+    print(f"[chulbuli] music: youtube search failed ({yt_err}), trying SoundCloud")
     try:
         return _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
     except MusicError:
+        print(f"[chulbuli] music: soundcloud also failed, keeping youtube error ({yt_err})")
         raise MusicError(yt_err)
 
 
@@ -5247,6 +5252,10 @@ async def _music_play_next(chat_id: int) -> None:
             # "waha na mile ya error ho to us ko use kare"). Voice-call
             # errors (no VC, assistant down) are NOT retried — a
             # different song can't fix those.
+            # v2.6.22: log the download reason (same silent-fallback
+            # problem as the search path — the live reason must be in
+            # the logs for the next diagnosis).
+            print(f"[chulbuli] music: youtube download failed ({reason}), trying SoundCloud")
             sc = _music_sc_fallback(nxt)
             if sc is not None:
                 sc["by"] = nxt.get("by", "")
