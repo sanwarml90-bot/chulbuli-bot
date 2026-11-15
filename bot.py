@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.28"
+VERSION = "2.6.29"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4801,10 +4801,21 @@ def _music_download_sync(track: dict) -> str:
     for why the native container cannot be played directly.
     GroupCallFile (pytgcalls 2.1.0) plays local files only, so /play must
     download before streaming. Retries (v2.6.28, kustmusic shape): up to
-    3 attempts, alternating client sets, 0.5s then 1s backoff, stopping
-    at once on a permanent error (_is_youtube_permanent) — YouTube's
-    player verdicts are flaky per request on server IPs, so the SAME
-    download is retried instead of only switching clients once.
+    3 attempts, 0.5s then 1s backoff, stopping at once on a permanent
+    error (_is_youtube_permanent) — YouTube's player verdicts are flaky
+    per request on server IPs, so the SAME download is retried instead
+    of only switching clients once. Third attempt (v2.6.29, Sanji's
+    video idea): the `android` client WITHOUT cookies — the web/mweb
+    clients give no formats on server IPs, but android still serves
+    format 18 (MP4 video with audio) with no cookies and no JS solver
+    (verified from this VM 2026-11-15: Humdum + Motu Patlu both return
+    formats incl. 18 via android, while web/web_embedded/ios/tv all
+    fail). With cookies set, yt-dlp SILENTLY drops android
+    (SUPPORTS_COOKIES=False), so this attempt runs with the cookiefile
+    REMOVED — that is why it is last, not first. Format 18 is the video
+    Sanji asked to download; the existing pipeline then transcodes it
+    to raw PCM for playback (and to MP3 for the send) — video download,
+    MP3, play.
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -4842,18 +4853,25 @@ def _music_download_sync(track: dict) -> str:
             print("[chulbuli] music: ffprobe missing — keeping native audio, no mp3 extract")
     info = None
     last = None
-    # kustmusic shape (v2.6.28): 3 attempts, alternating client sets,
-    # 0.5s then 1s backoff. The player verdict flips per request on
-    # server IPs, so the SAME download is retried — the old code only
-    # retried once, and only on a "blocked" marker, so a first-attempt
-    # "This video is unavailable" never saw the second client set.
+    # v2.6.29: the three download attempts — (clients, use cookies).
+    # Attempt 3 is Sanji's video idea: android, no cookies, format 18.
+    _dl_attempts = (
+        (list(_YT_CLIENT_SETS[0]), True),
+        (list(_YT_CLIENT_SETS[1]), True),
+        (["android"], False),
+    )
     _dl_delays = (0.5, 1.0)
-    for attempt in range(3):
+    for attempt, (clients, use_cookies) in enumerate(_dl_attempts):
         if attempt:
             time.sleep(_dl_delays[attempt - 1])
             print(f"[chulbuli] music: download attempt {attempt + 1}/3 after {str(last)[:80]}")
-        clients = _YT_CLIENT_SETS[attempt % len(_YT_CLIENT_SETS)]
-        opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        if use_cookies:
+            _yt_add_cookies(opts)
+        else:
+            # android does not support cookies — yt-dlp would silently
+            # drop it from the list if the cookiefile stayed in opts.
+            opts.pop("cookiefile", None)
         try:
             with _yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
