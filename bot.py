@@ -78,17 +78,6 @@ try:
 except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: yt-dlp import failed: {exc!r}")
     _yt_dlp = None
-# v2.6.25: YouTube search via py-yt-search (AnonXMusic/YukkiMusicBot
-# pattern) — VideosSearch talks to the Innertube SEARCH endpoint only, so
-# a search never touches the player API and cannot die with "Requested
-# format is not available" or a player bot-check. Optional: when the
-# library is missing, _yt_search_videos returns None and callers fall
-# back to the yt-dlp ytsearch path — the bot never crashes on this import.
-try:
-    from py_yt import VideosSearch as _VideosSearch
-except Exception as exc:  # noqa: BLE001
-    print(f"[chulbuli] music: py-yt-search import failed: {exc!r}")
-    _VideosSearch = None
 try:
     from pytgcalls import GroupCallFactory as _GroupCallFactory
 except Exception as exc:  # noqa: BLE001
@@ -100,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.25"
+VERSION = "2.6.26"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4271,10 +4260,11 @@ def _music_similar_pick(chat_id: int) -> dict | None:
     is forgotten (except the current song) and the first other result is
     taken instead of ending playback. None when nothing new is found.
     Runs via asyncio.to_thread (blocking yt-dlp search). The YouTube leg
-    stays on _yt_extract (v2.6.25 client sets: web_embedded first) — a
-    VideosSearch switch here would need a fresh event loop inside the
-    worker thread; the /play path (resolve_track) already takes that
-    route, and the SoundCloud leg still covers a failed YouTube search.
+    uses extract_flat (v2.6.26) — entries come back shallow (no player
+    re-extraction), so their watch URL is in "url" and webpage_url is
+    None; the pick compares webpage_url-or-url and fills webpage_url from
+    url before building the track. The SoundCloud leg stays non-flat (it
+    needs the full info; its search never touches the YouTube player).
     """
     if _yt_dlp is None:
         return None
@@ -4292,19 +4282,19 @@ def _music_similar_pick(chat_id: int) -> dict | None:
     for src, source in ((f"ytsearch5:{title}", "youtube"),
                         (f"scsearch5:{title}", "soundcloud")):
         try:
-            info = _yt_extract(src)
+            info = _yt_extract(src, flat=(source == "youtube"))
         except MusicError:
             continue
         entries = [e for e in ((info or {}).get("entries") or []) if e]
         picked = None
         for entry in entries:
-            url = entry.get("webpage_url") or ""
+            url = entry.get("webpage_url") or entry.get("url") or ""
             if url and url != cur_url and url not in seen:
                 picked = entry
                 break
         if picked is None and entries:
             for entry in entries:
-                url = entry.get("webpage_url") or ""
+                url = entry.get("webpage_url") or entry.get("url") or ""
                 if url and url != cur_url:
                     picked = entry
                     break
@@ -4314,6 +4304,9 @@ def _music_similar_pick(chat_id: int) -> dict | None:
                     seen.append(cur_url)
         if picked is None:
             continue
+        picked = dict(picked)
+        if not picked.get("webpage_url"):
+            picked["webpage_url"] = picked.get("url") or title
         try:
             track = _track_from_info(picked, title, source)
         except MusicError:
@@ -4465,7 +4458,7 @@ def _yt_add_cookies(opts: dict) -> dict:
 _YT_CLIENT_SETS = (["web_embedded", "tv_samsung", "web"], ["mweb", "tv", "web"])
 
 
-def _yt_extract(src: str):
+def _yt_extract(src: str, flat: bool = False):
     """extract_info with anti-bot player clients + one retry on YouTube errors.
 
     First attempt uses yt-dlp's cookie-compatible clients
@@ -4478,19 +4471,22 @@ def _yt_extract(src: str):
     on Railway's IP (blocked 2026-11-13 09:24/09:26/09:40 on two different
     songs). Raises MusicError (never a raw yt-dlp error) so the /play
     handler can always reply honestly instead of going silent.
-    v2.6.24: no "format" is requested here — this helper is search-only,
-    and asking for one makes yt-dlp select a format for the top result;
-    on Railway's IP the player response has no formats, so the SEARCH
-    itself died with "Requested format is not available" (Motu Patlu,
-    2026-11-15) even though the search page found the video. Format
-    selection happens at download time in _music_download_sync.
-    Verified against installed yt-dlp 2026.10.26: `extractor_args` is a valid
-    YoutubeDL param ({"youtube": {"player_client": [...]}}), and
-    android/ios/web/tv are valid Innertube client names.
+    flat=True (search ONLY, v2.6.26) adds extract_flat: the search result
+    entries are returned as-is — yt-dlp does NOT re-extract each entry as
+    a full video, so the search cannot die with "Requested format is not
+    available" or a player bot-check (the v2.6.24 lesson: even with no
+    format requested, yt-dlp selects its DEFAULT format for a fully
+    extracted video, and Railway's player response has no formats). A
+    flat YouTube entry carries id/title/duration(seconds)/url (the watch
+    URL) but webpage_url is None — callers must fill it from url (see
+    resolve_track / _music_similar_pick). Direct links and SoundCloud
+    searches stay non-flat (they need the full info / audio URL).
     """
     # No "format" here (v2.6.24) — see the docstring above.
     base = {"quiet": True, "noplaylist": True, "no_warnings": True,
             "skip_download": True}
+    if flat:
+        base["extract_flat"] = True
     _yt_add_cookies(base)
     client_sets = _YT_CLIENT_SETS
     last = None
@@ -4533,79 +4529,30 @@ def _track_from_info(info, q: str, source: str) -> dict:
             "source": source, "by": "", "by_id": 0}
 
 
-def _duration_to_seconds(raw) -> int:
-    """'2:39' / '1:02:03' / '95' / None / 'LIVE' -> seconds (0 when unparseable).
-
-    VideosSearch returns durations as "M:SS" strings (or "LIVE"/None for
-    livestreams); the track dict wants plain seconds.
-    """
-    if raw is None:
-        return 0
-    text = str(raw).strip()
-    if not text:
-        return 0
-    try:
-        nums = [int(p) for p in text.split(":")]
-    except ValueError:
-        return 0
-    total = 0
-    for n in nums:
-        total = total * 60 + n
-    return total
-
-
-async def _yt_search_videos(query: str, limit: int = 1):
-    """YouTube search via py-yt-search -> list of track-shaped dicts, or None.
-
-    Talks to the Innertube SEARCH endpoint only (VideosSearch.next) — no
-    player request, no format selection — so a search CANNOT die with
-    "Requested format is not available" or a player bot-check (v2.6.25;
-    GitHub comparison: AnonXMusic + YukkiMusicBot both search this way,
-    yt-dlp is only used for downloads). Returns None when the library is
-    missing, the search fails, or nothing is found — callers then fall
-    back to the yt-dlp ytsearch path. Each dict carries title/url/
-    webpage_url/duration (seconds)/id, so _track_from_info and the
-    similar-pick logic can use it exactly like a yt-dlp entry.
-    """
-    if _VideosSearch is None:
-        return None
-    try:
-        search = _VideosSearch(query, limit=limit)
-        result = await search.next()
-        items = (result or {}).get("result") or []
-    except Exception:  # noqa: BLE001
-        return None
-    out = []
-    for item in items:
-        vid = (item or {}).get("id") or ""
-        if not vid:
-            continue
-        link = item.get("link") or f"https://www.youtube.com/watch?v={vid}"
-        out.append({"title": item.get("title") or query, "url": link,
-                    "webpage_url": link,
-                    "duration": _duration_to_seconds(item.get("duration")),
-                    "id": vid})
-    return out or None
-
-
 async def resolve_track(query: str) -> dict:
     """YouTube search (or direct link) -> track dict, SoundCloud fallback.
 
-    YouTube first (direct link or search). The search goes through
-    VideosSearch (v2.6.25) — Innertube search endpoint only, no player
-    request — and falls back to the old yt-dlp ytsearch1 path only when
-    the library is missing or the search fails/returns nothing. If the
-    YouTube search fails for ANY reason — bot-check ("Sign in to confirm
-    you're not a bot", live on Railway's IP since 2026-11-12), not found,
-    no audio, any other extraction error (v2.6.21, Sanji: "pahle youtube
-    par search kre, waha na mile ya error ho to us ko use kare") — fall
-    back to SoundCloud (scsearch1), no login needed, verified live
-    2026-11-13 ("Tum Hi Ho Meri Ashiqui Ashiqui 2 2013" found via
-    scsearch1 from this VM). If SoundCloud also fails, the ORIGINAL
-    YouTube error is raised (never re-labeled as blocked). Cookies
-    (v2.5.1, YTDLP_COOKIES) stay the primary YouTube fix when set. A
-    direct link is never re-searched on SoundCloud; a direct SoundCloud
-    link also works. Raises MusicError.
+    YouTube first (direct link or search). The search uses extract_flat
+    (v2.6.26): yt-dlp returns the search entries as-is, without
+    re-extracting each one as a full video — so the search cannot die
+    with "Requested format is not available" or a player bot-check (the
+    v2.6.24/v2.6.25 lessons). A flat YouTube entry has webpage_url None,
+    so its watch URL is filled in from url before _track_from_info. If
+    the YouTube search fails for ANY reason — bot-check ("Sign in to
+    confirm you're not a bot", live on Railway's IP since 2026-11-12),
+    not found, no audio, any other extraction error (v2.6.21, Sanji:
+    "pahle youtube par search kre, waha na mile ya error ho to us ko use
+    kare") — fall back to SoundCloud (scsearch1), no login needed,
+    verified live 2026-11-13 ("Tum Hi Ho Meri Ashiqui Ashiqui 2 2013"
+    found via scsearch1 from this VM). If SoundCloud also fails, the
+    ORIGINAL YouTube error is raised (never re-labeled as blocked).
+    Cookies (v2.5.1, YTDLP_COOKIES) stay the primary YouTube fix when
+    set. A direct link is never re-searched on SoundCloud; a direct
+    SoundCloud link also works. Raises MusicError.
+    (v2.6.25 tried py-yt-search VideosSearch for this — dropped in
+    v2.6.26: 0.8.2 needs Python >=3.10 (bot runs 3.9 for voice) and 0.6.2
+    does not import on 3.9 at all (`str | None` annotations in extras.py).
+    extract_flat does the same job with yt-dlp alone, no new dependency.)
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -4616,17 +4563,24 @@ async def resolve_track(query: str) -> dict:
         source = "soundcloud" if "soundcloud.com" in q else "youtube"
         return _track_from_info(_yt_extract(q), q, source)
     yt_err = None
-    entries = await _yt_search_videos(q, 1)
-    if entries:
-        try:
-            return _track_from_info(entries[0], q, "youtube")
-        except MusicError as exc:
-            yt_err = str(exc)
-    if yt_err is None:
-        try:
-            return _track_from_info(_yt_extract(f"ytsearch1:{q}"), q, "youtube")
-        except MusicError as exc:
-            yt_err = str(exc)
+    try:
+        info = _yt_extract(f"ytsearch1:{q}", flat=True)
+        # A flat search returns a playlist of shallow entries; a bare
+        # video dict is also accepted (that is what _track_from_info
+        # expects — and what older callers got). A flat entry has
+        # webpage_url None, so fill it from url (the watch URL) before
+        # _track_from_info, which uses webpage_url for the track url.
+        if isinstance(info, dict) and "entries" in info:
+            entries = [e for e in (info.get("entries") or []) if e]
+            if not entries:
+                raise MusicError("not found")
+            info = dict(entries[0])
+        if isinstance(info, dict) and not info.get("webpage_url"):
+            info = dict(info)
+            info["webpage_url"] = info.get("url") or q
+        return _track_from_info(info, q, "youtube")
+    except MusicError as exc:
+        yt_err = str(exc)
     # v2.6.22: log the YouTube reason — before this, the fallback fired
     # silently, so a live "why did YouTube fail?" (e.g. Motu Patlu title
     # song, 2026-11-15) was unanswerable from the Railway logs.
