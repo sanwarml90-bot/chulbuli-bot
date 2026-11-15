@@ -6526,7 +6526,9 @@ async def main():
             return m
 
         async def delete_messages(self, chat_id, message_ids, **kwargs):
-            self.deleted_msgs.append((chat_id, list(message_ids)))
+            # Pyrogram accepts an int or a list; normalize like it does.
+            ids = message_ids if isinstance(message_ids, list) else [message_ids]
+            self.deleted_msgs.append((chat_id, ids))
             return True
 
     _real_isadmin2632 = B.is_chat_admin
@@ -6600,12 +6602,17 @@ async def main():
           and _warn_btns2632[0][0].url == "https://t.me/testchan"
           and _warn_btns2632[1][0].callback_data == "fjcheck:111",
           str(_warn2632[1] if _warn2632 else None))
-    # same user again within 5 min -> delete again, but NO second warn
+    # v2.6.34: same user again -> delete again AND a fresh warn (old warn
+    # deleted first) — no 5-min throttle any more
     _sent_before2632 = len(_gclient2632.sent)
+    _del_before2632 = len(_gclient2632.deleted_msgs)
     _m2632 = _gate_msg2632()
     _stopped2632 = await _gate2632(_m2632)
-    check("x2632 warn throttled", _stopped2632 is True and bool(_m2632.deleted)
-          and len(_gclient2632.sent) == _sent_before2632, f"sent={len(_gclient2632.sent)}")
+    check("x2632 warn every time (old warn deleted, new warn sent)",
+          _stopped2632 is True and bool(_m2632.deleted)
+          and len(_gclient2632.sent) == _sent_before2632 + 1
+          and len(_gclient2632.deleted_msgs) == _del_before2632 + 1,
+          f"sent={len(_gclient2632.sent)} del={len(_gclient2632.deleted_msgs)}")
     # cached joined -> still passes even if the status flips (cache proves)
     _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
     # reuse the joined cache entry from the earlier case by re-seeding it
@@ -6840,6 +6847,46 @@ async def main():
     await B._fj_is_joined(_gclient2632, -100999, 111)
     check("y2633 botapi result cached", len(_botapi_calls2633) == 1, str(len(_botapi_calls2633)))
     B._botapi_call_sync = _real_botapi2633
+
+    # (z) v2.6.34 — asymmetric membership cache TTL (negative = 60s)
+    _real_botapi2634 = B._botapi_call_sync
+    _botapi_calls2634 = []
+    _botapi_status2634 = "left"
+
+    def _fake_botapi2634(method, params):
+        _botapi_calls2634.append((method, params))
+        return {"ok": True, "result": {"status": _botapi_status2634}}
+
+    B._botapi_call_sync = _fake_botapi2634
+    B._FJ_CACHE.clear()
+    # fresh "left" is cached; an immediate re-check uses the cache (no call)
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    _calls2634 = len(_botapi_calls2634)
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    check("z2634 negative result cached briefly", len(_botapi_calls2634) == _calls2634,
+          str(len(_botapi_calls2634)))
+    # ...but a "left" entry 61 s old is re-checked (user may have joined)
+    B._FJ_CACHE[(-100999, 111)] = (False, time.time() - 61)
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    check("z2634 negative entry older than 60s is re-checked",
+          len(_botapi_calls2634) == _calls2634 + 1, str(len(_botapi_calls2634)))
+    # a "left" entry that is now "member" flips to joined on that re-check
+    _botapi_status2634 = "member"
+    B._FJ_CACHE[(-100999, 111)] = (False, time.time() - 61)
+    check("z2634 stale negative flips to joined after user joins",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is True)
+    # a "member" entry 61 s old is NOT re-checked (still inside 15 min)
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time() - 61)
+    _calls2634 = len(_botapi_calls2634)
+    check("z2634 positive entry 61s old still cached",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is True
+          and len(_botapi_calls2634) == _calls2634, str(len(_botapi_calls2634)))
+    # ...but a "member" entry 901 s old is re-checked
+    B._FJ_CACHE[(-100999, 111)] = (True, time.time() - 901)
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    check("z2634 positive entry older than 15 min is re-checked",
+          len(_botapi_calls2634) == _calls2634 + 1, str(len(_botapi_calls2634)))
+    B._botapi_call_sync = _real_botapi2634
 
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

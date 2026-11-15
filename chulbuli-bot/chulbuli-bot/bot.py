@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.33"
+VERSION = "2.6.34"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -11738,10 +11738,15 @@ async def handle_owner_pending(message: Message) -> bool:
 # admin status + channel membership dono 15 min ke liye RAM me cache hote hain.
 # ---------------------------------------------------------------------------
 _FJ_CACHE: dict = {}        # (channel_id, uid) -> (joined, ts)
-_FJ_CACHE_TTL = 900         # 15 min
+_FJ_CACHE_TTL = 900         # 15 min for a JOINED result
+_FJ_CACHE_TTL_NEG = 60      # 1 min for a NOT-JOINED result (v2.6.34: a user
+                            # who joins right after being blocked must not
+                            # stay blocked for 15 min on stale cache)
 _FJ_ADMIN_CACHE: dict = {}  # (chat_id, uid) -> (is_admin, ts)
 _FJ_WARNS: dict = {}        # (chat_id, uid) -> (warn_msg_id, ts)
-_FJ_WARN_TTL = 300          # 5 min — ek user ko itni der me ek hi warn
+# No warn throttle since v2.6.34 (owner order): EVERY blocked message gets a
+# fresh warn (old warn deleted first) so the Join/check button is always
+# there when the user looks.
 _FJ_NOTIFY_AT: dict = {}    # "check"/"delete" -> last owner-DM ts (1h throttle)
 
 _FJ_JOINED_STATUSES = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
@@ -11780,8 +11785,10 @@ async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = Fa
     now = time.time()
     if not fresh:
         hit = _FJ_CACHE.get(key)
-        if hit is not None and now - hit[1] < _FJ_CACHE_TTL:
-            return hit[0]
+        if hit is not None:
+            ttl = _FJ_CACHE_TTL if hit[0] else _FJ_CACHE_TTL_NEG
+            if now - hit[1] < ttl:
+                return hit[0]
     joined = await _fj_botapi_is_joined(channel, uid)
     if joined is None:
         try:
@@ -11884,8 +11891,8 @@ async def force_join_gate(client: Client, message: Message):
     key = (message.chat.id, uid)
     now = time.time()
     prev = _FJ_WARNS.get(key)
-    if prev is not None and now - prev[1] < _FJ_WARN_TTL:
-        raise StopPropagation
+    # v2.6.34: NO throttle — every blocked message re-sends the warn (the
+    # old one is deleted first, so there is never more than one in the chat).
     if prev is not None:
         try:
             await client.delete_messages(message.chat.id, prev[0])
