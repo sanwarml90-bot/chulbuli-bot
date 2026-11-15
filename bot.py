@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.27"
+VERSION = "2.6.28"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4408,6 +4408,25 @@ def _is_youtube_blocked(msg: str) -> bool:
     return any(m in low for m in _YT_BLOCKED_MARKERS)
 
 
+# Permanent YouTube download failures — retrying cannot help, so the
+# kustmusic-style retry loop (v2.6.28) stops at once on these. DELIBERATELY
+# NARROWER than kustmusic's list: "video unavailable" / "this video is
+# not available" and "sign in to confirm" are NOT here — on this bot's
+# stack those verdicts FLIP between clients/IPs (the same video fails
+# on one client and plays on another, and the client retry has fixed
+# sign-in errors before), so they are retried, not given up on.
+_YT_PERMANENT_MARKERS = (
+    "private video", "has been removed", "copyright", "members-only",
+    "age-restricted", "confirm your age", "not made this video available",
+)
+
+
+def _is_youtube_permanent(msg: str) -> bool:
+    """True when a download error means the video can never play."""
+    low = (msg or "").lower()
+    return any(m in low for m in _YT_PERMANENT_MARKERS)
+
+
 _YT_COOKIE_FILE = os.path.join(tempfile.gettempdir(), "chulbuli-yt-cookies.txt")
 
 
@@ -4772,16 +4791,20 @@ def _music_download_sync(track: dict) -> str:
     """Blocking yt-dlp audio download -> local file path. Raises MusicError.
 
     Same cookie-compatible player clients as _yt_extract (_YT_CLIENT_SETS),
-    so the YouTube bot-check workaround applies to the download too (one
-    retry with the mweb/tv/web clients on a YouTube block). The download
-    format prefers an Opus audio-only stream (AnonXMusic's spec —
-    bestaudio/best can fall back to an MP4 video container, the v2.5.4
-    screech cause) with bestaudio/best as the safety tail. The download
-    is then transcoded to raw PCM (s16le, 48 kHz, stereo) with the
-    bundled ffmpeg before it is handed to GroupCallFile — see
-    _music_transcode_to_raw for why the native container cannot be played
-    directly. GroupCallFile (pytgcalls 2.1.0) plays local files only, so
-    /play must download before streaming.
+    so the YouTube bot-check workaround applies to the download too. The
+    download format is kustmusic's (v2.6.28): bestaudio[ext=webm] with a
+    bestaudio/best tail — NO [acodec=opus] filter, so a video whose
+    player response only carries a combined (mp4/aac) stream still
+    downloads instead of dying on format selection. The download is then
+    transcoded to raw PCM (s16le, 48 kHz, stereo) with the bundled ffmpeg
+    before it is handed to GroupCallFile — see _music_transcode_to_raw
+    for why the native container cannot be played directly.
+    GroupCallFile (pytgcalls 2.1.0) plays local files only, so /play must
+    download before streaming. Retries (v2.6.28, kustmusic shape): up to
+    3 attempts, alternating client sets, 0.5s then 1s backoff, stopping
+    at once on a permanent error (_is_youtube_permanent) — YouTube's
+    player verdicts are flaky per request on server IPs, so the SAME
+    download is retried instead of only switching clients once.
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -4798,7 +4821,7 @@ def _music_download_sync(track: dict) -> str:
     # the download-leg fix for the v2.6.26 live failure ("This video is
     # unavailable" on Railway, 08:34:55 IST).
     opts = {"quiet": True, "noplaylist": True,
-            "format": "bestaudio[ext=webm][acodec=opus]/bestaudio/best",
+            "format": "bestaudio[ext=webm]/bestaudio/best",
             "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
             "remote_components": ["ejs:github"],
             "extractor_args": {"youtube": {"player_client": list(_YT_CLIENT_SETS[0])}}}
@@ -4819,7 +4842,17 @@ def _music_download_sync(track: dict) -> str:
             print("[chulbuli] music: ffprobe missing — keeping native audio, no mp3 extract")
     info = None
     last = None
-    for attempt, clients in enumerate(_YT_CLIENT_SETS):
+    # kustmusic shape (v2.6.28): 3 attempts, alternating client sets,
+    # 0.5s then 1s backoff. The player verdict flips per request on
+    # server IPs, so the SAME download is retried — the old code only
+    # retried once, and only on a "blocked" marker, so a first-attempt
+    # "This video is unavailable" never saw the second client set.
+    _dl_delays = (0.5, 1.0)
+    for attempt in range(3):
+        if attempt:
+            time.sleep(_dl_delays[attempt - 1])
+            print(f"[chulbuli] music: download attempt {attempt + 1}/3 after {str(last)[:80]}")
+        clients = _YT_CLIENT_SETS[attempt % len(_YT_CLIENT_SETS)]
         opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
         try:
             with _yt_dlp.YoutubeDL(opts) as ydl:
@@ -4828,9 +4861,8 @@ def _music_download_sync(track: dict) -> str:
             break
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if attempt == 0 and _is_youtube_blocked(str(exc)):
-                continue  # retry once with the alternate player clients
-            break
+            if _is_youtube_permanent(str(exc)):
+                break
     if last is not None:
         msg = str(last)
         if _is_youtube_blocked(msg):
