@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.22"
+VERSION = "2.6.23"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -915,7 +915,7 @@ HELP_TEXT = """💕 **Chulbuli — Help**
 /ping — bot ki speed check karo
 /playlist — teri playlist dikhao, koi bhi gaana chunke bajao
 /playlist <number> — playlist ka gaana bajao
-/autoplay — autoplay ON/OFF (queue khatam hote hi playlist se agla gaana)
+/autoplay — autoplay ON/OFF (queue khatam hote hi playlist se agla gaana, playlist khaali ho to usi jaisa gaana)
 
 **💬 Mujhse baat karo**
 Mujhe tag karo ya "chulbuli" likho — main jawab dungi!
@@ -984,14 +984,17 @@ def _cmd_error_text(e: dict) -> str:
     return f"/{e['cmd']} • {ts} • {e['err']}"
 
 
-def record_command_error(cmd: str, exc: BaseException, message=None) -> dict:
+def record_command_error(cmd: str, exc: BaseException, message=None,
+                         note: str = "", uid=None, cid=None) -> dict:
     """Record a command failure for the owner panel + owner DM."""
     entry = {
         "cmd": (cmd or "?").lstrip("/"),
-        "err": f"{type(exc).__name__}: {exc}"[:200],
+        "err": (f"{type(exc).__name__}: {exc}" + (f" — {note}" if note else ""))[:200],
         "ts": int(time.time()),
-        "uid": (message.from_user.id if message is not None and getattr(message, "from_user", None) else None),
-        "cid": (message.chat.id if message is not None and getattr(message, "chat", None) else None),
+        "uid": (uid if uid is not None else
+                (message.from_user.id if message is not None and getattr(message, "from_user", None) else None)),
+        "cid": (cid if cid is not None else
+                (message.chat.id if message is not None and getattr(message, "chat", None) else None)),
     }
     _CMD_ERRORS.append(entry)
     del _CMD_ERRORS[:-_CMD_ERRORS_MAX]
@@ -4240,6 +4243,78 @@ def _music_autoplay_pick(chat_id: int) -> dict | None:
     return track
 
 
+def _music_similar_pick(chat_id: int) -> dict | None:
+    """Pick a song SIMILAR to the just-played one (v2.6.23, Sanji:
+    autoplay ON ho to jo song chal raha ho us jese songs automatically
+    chale, ek khatam hote hi dusra).
+
+    Used only when the queue is empty and the requester's playlist has
+    nothing next — the usual case, since songs only join the playlist via
+    the player card's add button, so a fresh user has an empty playlist
+    and autoplay used to just stop. Searches YouTube for the current
+    title (5 results) and takes the first result that is NOT the current
+    track and NOT recently auto-played in this chat; any YouTube failure
+    falls back to the same SoundCloud search (v2.6.21 rule). The per-chat
+    seen list (last 10 URLs, RAM-only) stops the same two songs
+    ping-ponging; when everything found was already played, the history
+    is forgotten (except the current song) and the first other result is
+    taken instead of ending playback. None when nothing new is found.
+    Runs via asyncio.to_thread (blocking yt-dlp search).
+    """
+    if _yt_dlp is None:
+        return None
+    st = music_state(chat_id)
+    cur = st.get("current") or {}
+    title = (cur.get("title") or "").strip()
+    if not title:
+        return None
+    cur_url = cur.get("url") or ""
+    seen = st.setdefault("autoplay_seen", [])
+    if cur_url and cur_url not in seen:
+        seen.append(cur_url)
+    while len(seen) > 10:
+        seen.pop(0)
+    for src, source in ((f"ytsearch5:{title}", "youtube"),
+                        (f"scsearch5:{title}", "soundcloud")):
+        try:
+            info = _yt_extract(src)
+        except MusicError:
+            continue
+        entries = [e for e in ((info or {}).get("entries") or []) if e]
+        picked = None
+        for entry in entries:
+            url = entry.get("webpage_url") or ""
+            if url and url != cur_url and url not in seen:
+                picked = entry
+                break
+        if picked is None and entries:
+            for entry in entries:
+                url = entry.get("webpage_url") or ""
+                if url and url != cur_url:
+                    picked = entry
+                    break
+            if picked is not None:
+                seen.clear()
+                if cur_url:
+                    seen.append(cur_url)
+        if picked is None:
+            continue
+        try:
+            track = _track_from_info(picked, title, source)
+        except MusicError:
+            continue
+        track["by"] = cur.get("by", "")
+        track["by_id"] = cur.get("by_id", 0)
+        track["autoplay"] = True
+        url = track.get("url") or ""
+        if url and url not in seen:
+            seen.append(url)
+        while len(seen) > 10:
+            seen.pop(0)
+        return track
+    return None
+
+
 async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
     """Queue a resolved track and start playback if idle.
 
@@ -4255,10 +4330,16 @@ async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
             f"🎵 **{track['title']}** mil gaya! par voice assistant abhi connect nahi hai, "
             "isliye baja nahi sakti 🙂 assistant aate hi /play se bajega",
         )
+        entry = record_command_error("play", MusicError("voice assistant unavailable"), message,
+                                     note=f"track: {(track.get('title') or '')[:60]}")
+        await _notify_command_error(entry)
         return
     if not await _music_ensure_assistant():
         await _music_clear_search_msg(chat_id)
         await safe_reply(message, "🎵 voice assistant start nahi ho paya — thodi der me /play dobara try karo 🙂")
+        entry = record_command_error("play", MusicError("assistant start failed"), message,
+                                     note=f"track: {(track.get('title') or '')[:60]}")
+        await _notify_command_error(entry)
         return
     pos = music_queue_add(chat_id, track)
     if st.get("playing") and st.get("current"):
@@ -5224,11 +5305,20 @@ async def _music_edit_player(chat_id: int, text: str | None = None) -> None:
 async def _music_play_next(chat_id: int) -> None:
     """Play the next queued track; when the queue is empty, autoplay the
     next song from the requester's playlist (when autoplay is ON for this
-    chat); when there is nothing to autoplay, leave the call."""
+    chat); when the playlist has nothing next, play a SIMILAR song
+    (v2.6.23); when there is nothing to play, leave the call."""
     st = music_state(chat_id)
     nxt = music_queue_next(chat_id)
     if nxt is None and st.get("autoplay", True):
         nxt = _music_autoplay_pick(chat_id)
+        if nxt is not None:
+            print(f"[chulbuli] music: autoplay next (playlist): {nxt.get('title')}")
+        else:
+            # Playlist khaali / current song playlist me nahi — usi jaisa
+            # gaana dhundho (blocking search, worker thread me).
+            nxt = await asyncio.to_thread(_music_similar_pick, chat_id)
+            if nxt is not None:
+                print(f"[chulbuli] music: autoplay next (similar): {nxt.get('title')}")
     if nxt is None:
         st["current"] = None
         st["playing"] = False
@@ -5274,6 +5364,13 @@ async def _music_play_next(chat_id: int) -> None:
         st["current"] = None
         st["playing"] = False
         await _music_leave(chat_id)
+        # v2.6.23 (Sanji: "jab bhi koi error aaye to owner ke DM me
+        # bataye") — the group got the friendly line above; the owner
+        # also gets the real error + which command/track it came from
+        # (throttled to 1 DM per command per 2 min, like @guarded).
+        entry = record_command_error("play", exc, note=f"track: {(nxt.get('title') or '')[:60]}",
+                                     uid=nxt.get("by_id") or None, cid=chat_id)
+        await _notify_command_error(entry)
         text = ("🎵 youtube ne block kar diya (bot-check) — ye gaana baj nahi paya 🙂"
                 if reason == "youtube_blocked"
                 else f"🎵 ye gaana baj nahi paya: {reason} 🙂")
@@ -5367,7 +5464,7 @@ async def cmd_music(client: Client, message: Message):
         st["autoplay"] = not st.get("autoplay", True)
         await safe_reply(
             message,
-            "🔁 autoplay ON kar diya 🙂 queue khatam hote hi bajane wale ki playlist se agla gaana bajega"
+            "🔁 autoplay ON kar diya 🙂 queue khatam hote hi playlist se agla gaana bajega, playlist khaali ho to usi jaisa gaana"
             if st["autoplay"]
             else "🔁 autoplay OFF kar diya 🙂 queue khatam hote hi music band ho jayega")
         return
@@ -5425,11 +5522,18 @@ async def cmd_music(client: Client, message: Message):
                 "thodi der me dobara try karo, ya koi aur gaana try karo")
         else:
             await safe_reply(message, "wo gaana nahi mila — koi aur naam try karo 🙂")
+        # v2.6.23 (Sanji: "jab bhi koi error aaye to owner ke DM me
+        # bataye") — group ko friendly line mil gayi; owner ko asli
+        # error + query bhi DM me (throttled, like @guarded).
+        entry = record_command_error("play", exc, message, note=f"query: {query[:60]}")
+        await _notify_command_error(entry)
         return
     except Exception as exc:  # noqa: BLE001 - /play must NEVER go silent
         print(f"[chulbuli] /play resolve failed: {exc!r}")
         await _music_clear_search_msg(message.chat.id)
         await safe_reply(message, "🎵 gaana dhundhte waqt error aaya — thodi der me dobara try karo 🙂")
+        entry = record_command_error("play", exc, message, note=f"query: {query[:60]}")
+        await _notify_command_error(entry)
         return
     track["by"] = display_name(message.from_user)
     track["by_id"] = message.from_user.id
