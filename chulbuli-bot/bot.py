@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.23"
+VERSION = "2.6.24"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4388,7 +4388,8 @@ def music_player_markup(chat_id=None) -> InlineKeyboardMarkup:
 # YouTube bot-block markers (lowercased substring match on the yt-dlp error).
 # Live evidence: "Sign in to confirm you're not a bot" (2026-11-12 21:25:46,
 # 21:26:06) and "The page needs to be reloaded." (21:39:51, 21:40:01, 21:40:31).
-_YT_BLOCKED_MARKERS = ("not a bot", "sign in to confirm", "needs to be reloaded")
+_YT_BLOCKED_MARKERS = ("not a bot", "sign in to confirm", "needs to be reloaded",
+                       "requested format is not available")
 
 
 def _is_youtube_blocked(msg: str) -> bool:
@@ -4447,12 +4448,19 @@ def _yt_extract(src: str):
     09:40 on two different songs). Raises MusicError (never a raw yt-dlp
     error) so the /play handler can always reply honestly instead of
     going silent.
+    v2.6.24: no "format" is requested here — this helper is search-only,
+    and asking for one makes yt-dlp select a format for the top result;
+    on Railway's IP the player response has no formats, so the SEARCH
+    itself died with "Requested format is not available" (Motu Patlu,
+    2026-11-15) even though the search page found the video. Format
+    selection happens at download time in _music_download_sync.
     Verified against installed yt-dlp 2026.10.26: `extractor_args` is a valid
     YoutubeDL param ({"youtube": {"player_client": [...]}}), and
     android/ios/web/tv are valid Innertube client names.
     """
-    base = {"quiet": True, "noplaylist": True, "format": "bestaudio/best",
-            "no_warnings": True, "skip_download": True}
+    # No "format" here (v2.6.24) — see the docstring above.
+    base = {"quiet": True, "noplaylist": True, "no_warnings": True,
+            "skip_download": True}
     _yt_add_cookies(base)
     client_sets = (["android", "ios", "web"], ["tv", "web"])
     last = None
@@ -4528,10 +4536,16 @@ def resolve_track(query: str) -> dict:
     # song, 2026-11-15) was unanswerable from the Railway logs.
     print(f"[chulbuli] music: youtube search failed ({yt_err}), trying SoundCloud")
     try:
-        return _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
+        track = _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
     except MusicError:
         print(f"[chulbuli] music: soundcloud also failed, keeping youtube error ({yt_err})")
         raise MusicError(yt_err)
+    # v2.6.24: carry the YouTube failure on the track so the caller can
+    # tell the owner (the user still hears the song via SoundCloud, but
+    # the owner should know YouTube failed and why — Sanji's order).
+    track["fallback_from"] = "youtube"
+    track["fallback_reason"] = yt_err
+    return track
 
 
 def _music_sc_fallback(track: dict) -> dict | None:
@@ -5357,6 +5371,14 @@ async def _music_play_next(chat_id: int) -> None:
                 except MusicError:
                     sc = None
                 else:
+                    # v2.6.24 (Sanji: "jab bhi koi error aaye to owner ke DM
+                    # me bataye") — the group still hears the song, but the
+                    # owner should know the YouTube download failed and why.
+                    entry = record_command_error(
+                        "play", MusicError(f"youtube download failed ({reason}), played from soundcloud"),
+                        note=f"track: {(nxt.get('title') or '')[:60]}",
+                        uid=nxt.get("by_id") or None, cid=chat_id)
+                    await _notify_command_error(entry)
                     await _music_send_player(chat_id)
                     await _music_send_mp3(chat_id, sc,
                                           music_state(chat_id).get("file"))
@@ -5535,6 +5557,14 @@ async def cmd_music(client: Client, message: Message):
         entry = record_command_error("play", exc, message, note=f"query: {query[:60]}")
         await _notify_command_error(entry)
         return
+    if track.get("fallback_reason"):
+        # v2.6.24 (Sanji: "jab bhi koi error aaye to owner ke DM me
+        # bataye") — the user still hears the song (SoundCloud), but the
+        # owner should know YouTube failed and why.
+        entry = record_command_error(
+            "play", MusicError(f"youtube failed, played from soundcloud: {track['fallback_reason']}"),
+            message, note=f"query: {query[:60]}")
+        await _notify_command_error(entry)
     track["by"] = display_name(message.from_user)
     track["by_id"] = message.from_user.id
     await _music_enqueue_track(message.chat.id, track, message)
