@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.20"
+VERSION = "2.6.21"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4262,7 +4262,7 @@ async def _music_enqueue_track(chat_id: int, track: dict, message) -> None:
         return
     pos = music_queue_add(chat_id, track)
     if st.get("playing") and st.get("current"):
-        _sc_note = " (SoundCloud se 🙂 youtube block kar raha hai)" if track.get("source") == "soundcloud" else ""
+        _sc_note = " (SoundCloud se 🙂)" if track.get("source") == "soundcloud" else ""
         await _music_clear_search_msg(chat_id)
         await safe_reply(message, f"🎵 queue me add kar diya (#{pos}): **{track['title']}**{_sc_note} 🙂")
         return
@@ -4417,15 +4417,18 @@ def _track_from_info(info, q: str, source: str) -> dict:
 def resolve_track(query: str) -> dict:
     """YouTube search (or direct link) -> track dict, SoundCloud fallback.
 
-    YouTube first (direct link or ytsearch1). If YouTube blocks the
-    search with its bot-check ("Sign in to confirm you're not a bot" —
-    live on Railway's IP since 2026-11-12, on two different songs),
-    fall back to SoundCloud (scsearch1) — no login needed, verified
-    live 2026-11-13 ("Tum Hi Ho Meri Ashiqui Ashiqui 2 2013" found
-    via scsearch1 from this VM). Cookies (v2.5.1, YTDLP_COOKIES) stay
-    the primary YouTube fix when set; the fallback only fires when
-    YouTube is actually blocked. A direct SoundCloud link also works.
-    Raises MusicError.
+    YouTube first (direct link or ytsearch1). If the YouTube search fails
+    for ANY reason — bot-check ("Sign in to confirm you're not a bot",
+    live on Railway's IP since 2026-11-12), not found, no audio, any
+    other extraction error (v2.6.21, Sanji: "pahle youtube par search
+    kre, waha na mile ya error ho to us ko use kare") — fall back to
+    SoundCloud (scsearch1), no login needed, verified live 2026-11-13
+    ("Tum Hi Ho Meri Ashiqui Ashiqui 2 2013" found via scsearch1 from
+    this VM). If SoundCloud also fails, the ORIGINAL YouTube error is
+    raised (never re-labeled as blocked). Cookies (v2.5.1,
+    YTDLP_COOKIES) stay the primary YouTube fix when set. A direct
+    link is never re-searched on SoundCloud; a direct SoundCloud link
+    also works. Raises MusicError.
     """
     if _yt_dlp is None:
         raise MusicError("search unavailable")
@@ -4438,21 +4441,20 @@ def resolve_track(query: str) -> dict:
     try:
         return _track_from_info(_yt_extract(f"ytsearch1:{q}"), q, "youtube")
     except MusicError as exc:
-        if str(exc) != "youtube_blocked":
-            raise
+        yt_err = str(exc)  # kept: raised again only if SoundCloud also fails
     try:
         return _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
     except MusicError:
-        raise MusicError("youtube_blocked")
+        raise MusicError(yt_err)
 
 
 def _music_sc_fallback(track: dict) -> dict | None:
-    """SoundCloud re-resolve for a YouTube-BLOCKED DOWNLOAD (v2.5.6).
+    """SoundCloud re-resolve for a YouTube download that FAILED (v2.5.6,
+    widened v2.6.21: any download error, not only the bot-check).
 
-    resolve_track already falls back to SoundCloud when the SEARCH is
-    blocked — but when the search succeeds (via the retry clients) and
-    the DOWNLOAD is blocked, _music_play_next used to give up with the
-    "youtube ne block kar diya" error. This re-searches SoundCloud by
+    resolve_track already falls back to SoundCloud when the SEARCH
+    fails — but when the search succeeds and the DOWNLOAD fails,
+    _music_play_next used to give up. This re-searches SoundCloud by
     the track's title so the song still plays. None when SoundCloud
     also fails (caller keeps the original error).
     """
@@ -5235,9 +5237,16 @@ async def _music_play_next(chat_id: int) -> None:
     try:
         await _music_stream_track(chat_id, nxt)
     except MusicError as exc:
-        if str(exc) == "youtube_blocked" and (nxt.get("source") or "youtube") == "youtube":
-            # Download blocked even though the search worked — try the
-            # same song from SoundCloud once before giving up (v2.5.6).
+        reason = str(exc)
+        if ((nxt.get("source") or "youtube") == "youtube"
+                and (reason == "youtube_blocked" or reason == "no audio"
+                     or reason.startswith("download failed"))):
+            # YouTube download failed — blocked OR any other error — try
+            # the same song from SoundCloud once before giving up
+            # (v2.5.6 was blocked-only; widened v2.6.21 per Sanji:
+            # "waha na mile ya error ho to us ko use kare"). Voice-call
+            # errors (no VC, assistant down) are NOT retried — a
+            # different song can't fix those.
             sc = _music_sc_fallback(nxt)
             if sc is not None:
                 sc["by"] = nxt.get("by", "")
@@ -5256,7 +5265,6 @@ async def _music_play_next(chat_id: int) -> None:
         st["current"] = None
         st["playing"] = False
         await _music_leave(chat_id)
-        reason = str(exc)
         text = ("🎵 youtube ne block kar diya (bot-check) — ye gaana baj nahi paya 🙂"
                 if reason == "youtube_blocked"
                 else f"🎵 ye gaana baj nahi paya: {reason} 🙂")
