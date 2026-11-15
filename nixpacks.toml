@@ -1,0 +1,7 @@
+# v2.6.27: the YouTube JS-challenge solver needs a JS runtime.
+# yt-dlp's remote_components ejs:github (see bot.py) runs with Deno by
+# default (yt-dlp's js_runtimes default is {"deno": {}}). This adds Deno
+# to the Nixpacks setup phase; the Python provider (python 3.9 via
+# NIXPACKS_PYTHON_VERSION) still runs as before.
+[phases.setup]
+nixPkgs = ["deno"]

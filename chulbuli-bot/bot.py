@@ -89,7 +89,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.26"
+VERSION = "2.6.27"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4086,11 +4086,13 @@ def print_startup_diagnostics() -> None:
     Called once from __main__ right after the starting line.
     """
     ffmpeg = music_ffmpeg_setup()
+    import shutil
     print(f"[chulbuli] python: {sys.version.split()[0]} ({sys.platform})")
     print(f"[chulbuli] voice: pytgcalls={_GroupCallFactory is not None} "
           f"session={'set' if ASSISTANT_SESSION else 'MISSING'} "
           f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'} "
-          f"yt_cookies={'yes' if _yt_cookie_file() else 'no'}")
+          f"yt_cookies={'yes' if _yt_cookie_file() else 'no'} "
+          f"deno={'yes' if shutil.which('deno') else 'no'}")
 
 
 def fmt_duration(sec: int) -> str:
@@ -4483,8 +4485,13 @@ def _yt_extract(src: str, flat: bool = False):
     searches stay non-flat (they need the full info / audio URL).
     """
     # No "format" here (v2.6.24) — see the docstring above.
+    # v2.6.27: remote_components ejs:github — yt-dlp fetches YouTube's
+    # JS-challenge solver and runs it with Deno (see _music_download_sync;
+    # AnonXMusic ships the same pair). Without it the player returns no
+    # formats at all on these IPs (Motu Patlu, 2026-11-15 — verified from
+    # this VM: same extraction FAILS without EJS, SUCCEEDS with it).
     base = {"quiet": True, "noplaylist": True, "no_warnings": True,
-            "skip_download": True}
+            "skip_download": True, "remote_components": ["ejs:github"]}
     if flat:
         base["extract_flat"] = True
     _yt_add_cookies(base)
@@ -4783,9 +4790,17 @@ def _music_download_sync(track: dict) -> str:
         raise MusicError("no audio")
     os.makedirs(_MUSIC_TMPDIR, exist_ok=True)
     stem = f"{int(time.time())}-{random.randint(1000, 9999)}"
+    # v2.6.27: remote_components ejs:github — the YouTube JS-challenge
+    # solver (AnonXMusic pattern; Deno is installed via nixpacks.toml).
+    # Verified live from this VM 2026-11-15: the SAME video/download that
+    # fails with "Requested format is not available" without EJS extracts
+    # fine (audio 249/250/140/251) with EJS + Deno — no cookies. This is
+    # the download-leg fix for the v2.6.26 live failure ("This video is
+    # unavailable" on Railway, 08:34:55 IST).
     opts = {"quiet": True, "noplaylist": True,
             "format": "bestaudio[ext=webm][acodec=opus]/bestaudio/best",
             "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
+            "remote_components": ["ejs:github"],
             "extractor_args": {"youtube": {"player_client": list(_YT_CLIENT_SETS[0])}}}
     _yt_add_cookies(opts)
     if music_ffmpeg_setup():
@@ -5437,6 +5452,13 @@ async def _music_play_next(chat_id: int) -> None:
                     await _music_send_mp3(chat_id, sc,
                                           music_state(chat_id).get("file"))
                     return
+            # v2.6.27: the SC retry's failure was silent (live 08:34:55 —
+            # "trying SoundCloud" then nothing, no SC line at all — the
+            # owner DM only carried the YouTube error). Log it so the
+            # next diagnosis can tell "SC found nothing" apart from
+            # "SC was never tried".
+            if sc is None:
+                print("[chulbuli] music: soundcloud retry found nothing")
         st["current"] = None
         st["playing"] = False
         await _music_leave(chat_id)
