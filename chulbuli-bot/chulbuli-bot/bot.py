@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.35"
+VERSION = "2.6.36"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -11744,6 +11744,8 @@ _FJ_CACHE_TTL = 900         # 15 min — only JOINED results are cached (v2.6.35
                             # re-checks live on every message, so a user who
                             # just joined is unblocked on their very next
                             # message (one Bot API call, ~0.2 s — no delay).
+_FJ_LAST_STATUS: dict = {}  # (channel, uid) -> last getChatMember status str
+                            # (for the blocked-message log line, v2.6.36)
 _FJ_ADMIN_CACHE: dict = {}  # (chat_id, uid) -> (is_admin, ts)
 _FJ_WARNS: dict = {}        # (chat_id, uid) -> (warn_msg_id, ts)
 # No warn throttle since v2.6.34 (owner order): EVERY blocked message gets a
@@ -11776,7 +11778,9 @@ async def _fj_botapi_is_joined(channel: int, uid: int) -> bool | None:
     if not result.get("ok"):
         print(f"[chulbuli] force-join: Bot API getChatMember not ok: {result.get('description')}")
         return None
-    return (result.get("result") or {}).get("status") in _FJ_JOINED_STATUSES_API
+    status = (result.get("result") or {}).get("status")
+    _FJ_LAST_STATUS[(channel, uid)] = status
+    return status in _FJ_JOINED_STATUSES_API
 
 
 async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = False) -> bool | None:
@@ -11792,7 +11796,19 @@ async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = Fa
         if hit is not None and hit[0] and now - hit[1] < _FJ_CACHE_TTL:
             return hit[0]
     joined = await _fj_botapi_is_joined(channel, uid)
-    if joined is None:
+    if joined is False:
+        # v2.6.36 — "joined but says unjoined" fix: a "left" verdict from ONE
+        # method is confirmed with the other method before blocking. If
+        # MTProto says the user IS a member, the user is joined (the Bot API
+        # answer was wrong/stale). Only if both agree is the user blocked.
+        try:
+            member = await client.get_chat_member(channel, uid)
+            if member.status in _FJ_JOINED_STATUSES:
+                joined = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] force-join: MTProto confirm failed: {exc!r}")
+    elif joined is None:
+        # Bot API failed entirely — MTProto is the primary check.
         try:
             member = await client.get_chat_member(channel, uid)
             joined = member.status in _FJ_JOINED_STATUSES
@@ -11889,6 +11905,10 @@ async def force_join_gate(client: Client, message: Message):
     if joined:
         return
     # Not joined: the message goes, a warn goes, and nothing else runs.
+    # Log the verdict (uid + channel + Bot API status) so a "joined but says
+    # unjoined" report can be checked against the real check result.
+    print(f"[chulbuli] force-join: blocked uid {uid} in chat {message.chat.id} "
+          f"(channel {channel}, botapi status {_FJ_LAST_STATUS.get((channel, uid))})")
     try:
         await message.delete()
     except Exception as exc:  # noqa: BLE001

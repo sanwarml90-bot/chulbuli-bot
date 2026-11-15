@@ -6787,12 +6787,14 @@ async def main():
     B._FJ_CACHE.clear()
     B._FJ_ADMIN_CACHE.clear()
     B._FJ_WARNS.clear()
-    # Bot API says left -> gate blocks even though the MTProto fake says MEMBER
-    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    # Bot API says left + MTProto fake says LEFT -> gate blocks (both agree;
+    # v2.6.36: a lone Bot API "left" is now confirmed by MTProto, so the
+    # override case — MTProto MEMBER — is covered in block (aa) instead)
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
     _botapi_status2633 = "left"
     B._FJ_CACHE.clear()
     _m2633 = _gate_msg2632()
-    check("y2633 botapi left blocks (mtproto member ignored)",
+    check("y2633 botapi left blocks (both agree not joined)",
           await _gate2632(_m2633) is True and bool(_m2633.deleted)
           and _botapi_calls2633[-1] == ("getChatMember", {"chat_id": -100999, "user_id": 111}),
           str(_botapi_calls2633[-1:]))
@@ -6862,6 +6864,7 @@ async def main():
         return {"ok": True, "result": {"status": _botapi_status2635}}
 
     B._botapi_call_sync = _fake_botapi2635
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
     B._FJ_CACHE.clear()
     # a "left" result is NEVER cached: an immediate re-check calls the API again
     await B._fj_is_joined(_gclient2632, -100999, 111)
@@ -6920,6 +6923,60 @@ async def main():
     check("z2635 update for another channel is ignored",
           (-100999, 111) in B._FJ_CACHE)
     B._botapi_call_sync = _real_botapi2635
+
+    # (aa) v2.6.36 — a "not joined" verdict is confirmed with a second
+    # method before blocking (fixes "joined but says unjoined")
+    _real_botapi2636 = B._botapi_call_sync
+    _botapi_calls2636 = []
+    _botapi_status2636 = "left"
+
+    def _fake_botapi2636(method, params):
+        _botapi_calls2636.append((method, params))
+        return {"ok": True, "result": {"status": _botapi_status2636}}
+
+    _mt_calls2636 = []
+    _orig_get2636 = _gclient2632.get_chat_member
+
+    async def _counting_get2636(chat_id, user_id):
+        _mt_calls2636.append((chat_id, user_id))
+        return await _orig_get2636(chat_id, user_id)
+
+    _gclient2632.get_chat_member = _counting_get2636
+    B._botapi_call_sync = _fake_botapi2636
+    B._FJ_CACHE.clear()
+    # Bot API "left" + MTProto MEMBER -> joined (confirm overrides false "left")
+    _botapi_status2636 = "left"
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    check("aa2636 botapi left + mtproto member is joined",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is True)
+    # ...and the gate lets that user through (end-to-end)
+    B._FJ_CACHE.clear()
+    _m2636 = _gate_msg2632()
+    check("aa2636 gate passes a user the botapi wrongly called left",
+          await _gate2632(_m2636) is False and not _m2636.deleted, str(_m2636.deleted))
+    # Bot API "left" + MTProto LEFT -> still not joined (both agree)
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    B._FJ_CACHE.clear()
+    check("aa2636 botapi left + mtproto left is not joined",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is False)
+    # Bot API "left" + MTProto raises -> Bot API verdict kept (False)
+    async def _boom_get2636(chat_id, user_id):
+        raise RuntimeError("peer not cached")
+    _gclient2632.get_chat_member = _boom_get2636
+    B._FJ_CACHE.clear()
+    check("aa2636 botapi left + mtproto down keeps not-joined",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is False)
+    _gclient2632.get_chat_member = _counting_get2636
+    # Bot API "member" -> joined, MTProto NOT called (no confirm needed)
+    _botapi_status2636 = "member"
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    _mt_calls2636.clear()
+    B._FJ_CACHE.clear()
+    check("aa2636 botapi member needs no mtproto confirm",
+          await B._fj_is_joined(_gclient2632, -100999, 111) is True
+          and len(_mt_calls2636) == 0, str(len(_mt_calls2636)))
+    _gclient2632.get_chat_member = _orig_get2636
+    B._botapi_call_sync = _real_botapi2636
 
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
