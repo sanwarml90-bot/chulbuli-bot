@@ -5309,7 +5309,7 @@ async def main():
     await B.cmd_atag(FakeApp(), FakeMessage("/atag hello", uid=333, name="Ravi", chat_id=-100123))
     check("v2619 atag non-admin blocked", any("Sirf admins" in t for _, t in FakeMessage.outbox))
     B.is_chat_admin = _real_isadmin2619
-    # (g) /utag — RECENT enumeration, batches of 7, bots skipped, count honest
+    # (g) /utag — RECENT enumeration, batches of 15, bots skipped, count honest
     _users2619 = [FakeChatMember(FakeUser(1000 + i, f"User{i}"), "member") for i in range(9)]
     _bot2619 = FakeUser(9999, "SomeBot")
     _bot2619.is_bot = True
@@ -5317,7 +5317,7 @@ async def main():
     FakeMessage.outbox.clear()
     await B.cmd_utag(FakeApp(), FakeMessage("/utag attention", uid=7966027018, name="Sanji", chat_id=-100123))
     _tagmsgs2619 = [t for _, t in FakeMessage.outbox if t.startswith("📣 attention")]
-    check("v2619 utag batches 7+2", len(_tagmsgs2619) == 2, f"got {len(_tagmsgs2619)}")
+    check("v2637 utag batches 15 (9 in one)", len(_tagmsgs2619) == 1, f"got {len(_tagmsgs2619)}")
     check("v2619 utag counts 9", any("9 members ko tag kar diya" in t for _, t in FakeMessage.outbox))
     check("v2619 utag skips bots", not any("SomeBot" in t for _, t in FakeMessage.outbox))
     # (h) /utag with nobody to tag says so honestly (old code went silent)
@@ -6977,6 +6977,193 @@ async def main():
           and len(_mt_calls2636) == 0, str(len(_mt_calls2636)))
     _gclient2632.get_chat_member = _orig_get2636
     B._botapi_call_sync = _real_botapi2636
+
+    # (ab) v2.6.37 — honest mod errors: admin targets, missing rights,
+    # real failure reasons, tag FloodWait handling
+    _status_ab = {}   # uid -> B.ChatMemberStatus (enum); absent -> ADMINISTRATOR
+    _privs_ab = {}    # uid -> B.ChatPrivileges | None; absent -> full (FakeApp.bot_privileges)
+    _raise_member_ab = set()
+
+    async def _get_member_ab(self, chat_id, user_id):
+        if user_id in _raise_member_ab:
+            raise RuntimeError("get_chat_member boom")
+        st = _status_ab.get(user_id, B.ChatMemberStatus.ADMINISTRATOR)
+        pv = _privs_ab.get(user_id, FakeApp.bot_privileges)
+        return FakeChatMember(FakeUser(user_id, f"U{user_id}"), st, privileges=pv)
+
+    _real_get_member_ab = FakeApp.get_chat_member
+    FakeApp.get_chat_member = _get_member_ab
+    _real_is_admin_ab = B.is_chat_admin
+
+    async def _is_admin_ab(client, chat_id, user_id):
+        if user_id == B.OWNER_ID:
+            return True
+        return _status_ab.get(user_id, B.ChatMemberStatus.ADMINISTRATOR) in (
+            B.ChatMemberStatus.ADMINISTRATOR, B.ChatMemberStatus.OWNER)
+
+    B.is_chat_admin = _is_admin_ab
+    _no_privs_ab = B.ChatPrivileges(
+        can_manage_chat=False, can_delete_messages=False, can_manage_video_chats=False,
+        can_restrict_members=False, can_promote_members=False, can_change_info=False,
+        can_post_messages=False, can_edit_messages=False, can_invite_users=False,
+        can_pin_messages=False, is_anonymous=False)
+    _client_ab = FakeApp()
+
+    # _admin_has_right matrix
+    check("ab2637 owner always has rights",
+          await B._admin_has_right(_client_ab, -100123, B.OWNER_ID, "can_restrict_members") is True)
+    _status_ab[500] = B.ChatMemberStatus.OWNER
+    check("ab2637 creator has rights",
+          await B._admin_has_right(_client_ab, -100123, 500, "can_restrict_members") is True)
+    check("ab2637 admin with right",
+          await B._admin_has_right(_client_ab, -100123, 111, "can_restrict_members") is True)
+    _privs_ab[112] = _no_privs_ab
+    check("ab2637 admin without right",
+          await B._admin_has_right(_client_ab, -100123, 112, "can_restrict_members") is False)
+    _status_ab[113] = B.ChatMemberStatus.MEMBER
+    check("ab2637 member has no right",
+          await B._admin_has_right(_client_ab, -100123, 113, "can_restrict_members") is None)
+    _raise_member_ab.add(114)
+    check("ab2637 lookup failure is None",
+          await B._admin_has_right(_client_ab, -100123, 114, "can_restrict_members") is None)
+    _raise_member_ab.discard(114)
+
+    # warn on an ADMIN target is refused before any warn is counted
+    _chat_ab = B.DATA["chats"].setdefault("-100123", {"title": "", "msgs": {}, "warns": {}})
+    _chat_ab.setdefault("warns", {}).clear()
+    _status_ab[222] = B.ChatMemberStatus.ADMINISTRATOR
+    FakeMessage.outbox.clear()
+    await B.cmd_warn(_client_ab, FakeMessage("/warn", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=222, name="Prince")))
+    check("ab2637 warn on admin refused",
+          any("admin hai" in t and "warn nahi kar sakte" in t for _, t in FakeMessage.outbox))
+    check("ab2637 warn on admin not counted",
+          _chat_ab["warns"].get("222", 0) == 0, str(_chat_ab["warns"]))
+    # warn on a normal user counts
+    _status_ab[333] = B.ChatMemberStatus.MEMBER
+    FakeMessage.outbox.clear()
+    await B.cmd_warn(_client_ab, FakeMessage("/warn", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 warn on member counts",
+          any("warn 1/3" in t for _, t in FakeMessage.outbox)
+          and _chat_ab["warns"].get("333") == 1, str(_chat_ab["warns"]))
+
+    # mute by an admin WITHOUT the restrict right is refused honestly
+    _restrict_fail_ab = [None]
+    _real_restrict_ab = FakeApp.restrict_chat_member
+
+    async def _restrict_ab(self, chat_id, user_id, permissions=None, **kwargs):
+        if _restrict_fail_ab[0] is not None:
+            raise _restrict_fail_ab[0]
+        FakeApp.calls.append(("restrict", chat_id, user_id))
+        return True
+
+    FakeApp.restrict_chat_member = _restrict_ab
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=112, name="NoRight", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute without right refused",
+          any("Tumhare pass mute karne ki permission nahi hai" in t for _, t in FakeMessage.outbox)
+          and ("restrict", -100123, 333) not in FakeApp.calls)
+    # mute by an admin WITH the right works
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute with right works",
+          ("restrict", -100123, 333) in FakeApp.calls
+          and any("mute ho gaya" in t for _, t in FakeMessage.outbox))
+
+    class UserAdminInvalid(Exception):
+        pass
+
+    class ChatAdminRequired(Exception):
+        pass
+
+    # mute failure reasons are honest, not "mujhe admin banao"
+    _restrict_fail_ab[0] = UserAdminInvalid("user is admin")
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute target-admin says so",
+          any("admin hai" in t and "admin ko mute nahi kar sakte" in t for _, t in FakeMessage.outbox))
+    _restrict_fail_ab[0] = ChatAdminRequired("bot not admin")
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute bot-not-admin says so",
+          any("mujhe group me admin banao" in t for _, t in FakeMessage.outbox))
+    _restrict_fail_ab[0] = FloodWait(5)
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute floodwait says so",
+          any("Telegram ne thoda rukne ko bola (5 sec)" in t for _, t in FakeMessage.outbox))
+    _restrict_fail_ab[0] = RuntimeError("weird-boom")
+    FakeMessage.outbox.clear()
+    await B.cmd_mute(_client_ab, FakeMessage("/mute", uid=111, name="Admin", chat_id=-100123,
+                                             reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 mute unknown error recorded honestly",
+          any("nahi ho paya (RuntimeError)" in t for _, t in FakeMessage.outbox))
+    _restrict_fail_ab[0] = None
+    FakeApp.restrict_chat_member = _real_restrict_ab
+    # ban by an admin without the right is refused honestly
+    _ban_fail_ab = [None]
+    _real_ban_ab = FakeApp.ban_chat_member
+
+    async def _ban_ab(self, chat_id, user_id, **kwargs):
+        if _ban_fail_ab[0] is not None:
+            raise _ban_fail_ab[0]
+        FakeApp.calls.append(("ban", chat_id, user_id))
+        return True
+
+    FakeApp.ban_chat_member = _ban_ab
+    FakeApp.calls.clear()
+    FakeMessage.outbox.clear()
+    await B.cmd_ban(_client_ab, FakeMessage("/ban", uid=112, name="NoRight", chat_id=-100123,
+                                            reply_to=FakeMessage("bad", uid=333, name="Ravi")))
+    check("ab2637 ban without right refused",
+          any("Tumhare pass ban karne ki permission nahi hai" in t for _, t in FakeMessage.outbox)
+          and ("ban", -100123, 333) not in FakeApp.calls)
+    FakeApp.ban_chat_member = _real_ban_ab
+
+    # /utag: a FloodWait mid-run waits and continues instead of dying with
+    # "mujhe admin banao" (the live bug: 20-30 tags, then the error)
+    _send_calls_ab = []
+    _orig_send_ab = FakeApp.send_message
+
+    async def _send_ab(self, chat_id, text, **kwargs):
+        _send_calls_ab.append(text)
+        if len(_send_calls_ab) == 1:
+            raise FloodWait(1)
+        return await _orig_send_ab(self, chat_id, text, **kwargs)
+
+    FakeApp.send_message = _send_ab
+    FakeApp.members_override = [
+        FakeChatMember(FakeUser(2000 + i, f"M{i}"), "member") for i in range(20)]
+    FakeMessage.outbox.clear()
+    await B.cmd_utag(_client_ab, FakeMessage("/utag hello", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("ab2637 utag floodwait resumes and finishes",
+          any("20 members ko tag kar diya" in t for _, t in FakeMessage.outbox)
+          and not any("admin banao" in t for _, t in FakeMessage.outbox))
+    FakeApp.send_message = _orig_send_ab
+    # /utag with nobody to tag: bot-not-admin blames admin rights, bot-admin
+    # says plainly that nobody was found
+    FakeApp.members_override = []
+    _privs_ab[8405203833] = None
+    FakeMessage.outbox.clear()
+    await B.cmd_utag(_client_ab, FakeMessage("/utag hi", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("ab2637 utag zero + bot not admin blames admin",
+          any("koi member nahi mila" in t and "admin banao" in t for _, t in FakeMessage.outbox))
+    _privs_ab[8405203833] = FakeApp.bot_privileges
+    FakeMessage.outbox.clear()
+    await B.cmd_utag(_client_ab, FakeMessage("/utag hi", uid=7966027018, name="Sanji", chat_id=-100123))
+    check("ab2637 utag zero + bot admin says nobody found",
+          any("koi member nahi mila" in t and "admin banao" not in t for _, t in FakeMessage.outbox))
+    FakeApp.members_override = None
+    FakeApp.get_chat_member = _real_get_member_ab
+    B.is_chat_admin = _real_is_admin_ab
 
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

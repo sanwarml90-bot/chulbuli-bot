@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.36"
+VERSION = "2.6.37"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -921,6 +921,90 @@ async def is_chat_admin(client: Client, chat_id: int, user_id: int) -> bool:
         return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
     except Exception:  # noqa: BLE001
         return False
+
+
+# --- v2.6.37: honest mod errors ---
+# Every mod command used to reply "X nahi kar payi — mujhe admin banao 🙂"
+# for ANY failure, even when the bot WAS admin and the real cause was the
+# target being an admin, the invoker lacking that right, or Telegram's
+# flood limit. These helpers name the real cause instead.
+
+_RIGHT_LABELS = {
+    "can_restrict_members": "restrict members",
+    "can_delete_messages": "delete messages",
+    "can_promote_members": "add new admins",
+    "can_pin_messages": "pin messages",
+    "can_invite_users": "invite users",
+    "can_change_info": "change info",
+}
+
+
+async def _admin_has_right(client, chat_id: int, user_id: int, right: str):
+    """Does this group admin hold one specific right?
+    True = yes, False = admin but lacks it, None = not an admin / unknown.
+    The bot owner always passes."""
+    if user_id == OWNER_ID:
+        return True
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if member.status == ChatMemberStatus.OWNER:
+        return True
+    if member.status != ChatMemberStatus.ADMINISTRATOR:
+        return None
+    priv = getattr(member, "privileges", None)
+    if priv is None:
+        return False
+    return bool(getattr(priv, right, False))
+
+
+async def _require_right(client, message, right: str, action_label: str) -> bool:
+    """Gate a mod command on one specific admin right. Replies honestly
+    when the invoker is an admin who lacks it. True = proceed."""
+    has = await _admin_has_right(client, message.chat.id, message.from_user.id, right)
+    if has is False:
+        await safe_reply(
+            message,
+            f"❌ Tumhare pass {action_label} karne ki permission nahi hai — group owner se '{_RIGHT_LABELS.get(right, right)}' ka right lo 🙂")
+        return False
+    return True
+
+
+async def _target_is_admin(client, chat_id: int, target_id: int) -> bool:
+    """True when the target is a group admin/owner (or the bot owner) —
+    such users cannot be warned/muted/banned/kicked."""
+    return await is_chat_admin(client, chat_id, target_id)
+
+
+def _mod_fail_reason(exc, action: str, target_name: str = ""):
+    """Honest one-line reason for a failed mod action.
+    Returns (text, record_it) — only unknown errors are recorded for the owner."""
+    if isinstance(exc, FloodWait):
+        secs = getattr(exc, "value", 0) or 0
+        return (f"⏳ Telegram ne thoda rukne ko bola ({secs} sec) — "
+                f"thodi der baad dobara try karo 🙂", False)
+    name = type(exc).__name__
+    if name in ("UserAdminInvalid", "ChatAdminInvalid"):
+        who = f"{target_name} " if target_name else ""
+        return (f"❌ {who}admin hai — admin ko {action} nahi kar sakte 🙂", False)
+    if name == "ChatAdminRequired":
+        return (f"❌ {action} nahi kar payi — mujhe group me admin banao 🙂", False)
+    if name == "RightForbidden":
+        return (f"❌ {action} nahi kar payi — mere pass uska right nahi hai, admin se right do 🙂", False)
+    if name == "UserNotParticipant":
+        return (f"❌ {target_name or 'Ye user'} group me nahi hai 🙂", False)
+    if name == "PeerIdInvalid":
+        return ("❌ Ye user mujhe nahi mila — pehle usse group me message karne ko kaho 🙂", False)
+    return (f"❌ {action} nahi ho paya ({name}) — owner ko bata diya 🙂", True)
+
+
+async def _mod_fail(message, cmd: str, exc, action: str, target_name: str = ""):
+    """Reply honestly for a failed mod action; record only unknown errors."""
+    reason, record = _mod_fail_reason(exc, action, target_name)
+    if record:
+        record_command_error(cmd, exc, message)
+    await safe_reply(message, reason)
 
 
 def games_on() -> bool:
@@ -3544,9 +3628,14 @@ async def cmd_warn(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins warn kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "warn"):
+        return
     target = _target_user(message)
     if not target or target.is_bot:
         await safe_reply(message, "Kisko warn karna hai? Uske message pe reply karke /warn likho 🙂")
+        return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko warn nahi kar sakte 🙂")
         return
     chat = DATA["chats"].setdefault(str(message.chat.id), {"title": "", "msgs": {}, "warns": {}})
     warns = chat.setdefault("warns", {})
@@ -3558,8 +3647,11 @@ async def cmd_warn(client: Client, message: Message):
         try:
             await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions())
             await safe_reply(message, f"⚠️ {display_name(target)} ko 3 warns mil gaye — mute kar diya! /unmute se kholo 🙂")
-        except Exception:  # noqa: BLE001
-            await safe_reply(message, f"⚠️ {display_name(target)} ko 3 warns mil gaye! (Mute nahi kar payi — mujhe admin banao 🙂)")
+        except Exception as exc:  # noqa: BLE001
+            reason, record = _mod_fail_reason(exc, "mute", display_name(target))
+            if record:
+                record_command_error("warn", exc, message)
+            await safe_reply(message, f"⚠️ {display_name(target)} ko 3 warns mil gaye! {reason}")
     else:
         await safe_reply(message, f"⚠️ {display_name(target)} ko warn {n}/3 — sudhar jao 🙂")
 
@@ -3592,15 +3684,20 @@ async def cmd_mute(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins mute kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "mute"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko mute karna hai? Reply karke /mute likho 🙂")
         return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko mute nahi kar sakte 🙂")
+        return
     try:
         await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions())
         await safe_reply(message, f"🔇 {display_name(target)} mute ho gaya! /unmute se kholo 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Mute nahi kar payi — mujhe admin banao (restrict permission ke saath) 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "mute", exc, "mute", display_name(target))
 
 
 @app.on_message(filters.command(["unmute"]))
@@ -3612,6 +3709,8 @@ async def cmd_unmute(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins unmute kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "unmute"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko unmute karna hai? Reply karke /unmute likho 🙂")
@@ -3622,8 +3721,8 @@ async def cmd_unmute(client: Client, message: Message):
             ChatPermissions(can_send_messages=True, can_send_media_messages=True,
                             can_send_other_messages=True, can_add_web_page_previews=True))
         await safe_reply(message, f"🔊 {display_name(target)} unmute ho gaya! 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Unmute nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "unmute", exc, "unmute", display_name(target))
 
 
 @app.on_message(filters.command(["ban"]))
@@ -3635,15 +3734,20 @@ async def cmd_ban(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins ban kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "ban"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko ban karna hai? Reply karke /ban likho 🙂")
         return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko ban nahi kar sakte 🙂")
+        return
     try:
         await client.ban_chat_member(message.chat.id, target.id)
         await safe_reply(message, f"🔨 {display_name(target)} ban ho gaya!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Ban nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "ban", exc, "ban", display_name(target))
 
 
 @app.on_message(filters.command(["unban"]))
@@ -3655,6 +3759,8 @@ async def cmd_unban(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins unban kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "unban"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko unban karna hai? Reply karke /unban likho 🙂")
@@ -3662,8 +3768,8 @@ async def cmd_unban(client: Client, message: Message):
     try:
         await client.unban_chat_member(message.chat.id, target.id)
         await safe_reply(message, f"✅ {display_name(target)} unban ho gaya! 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Unban nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "unban", exc, "unban", display_name(target))
 
 
 @app.on_message(filters.command(["kick"]))
@@ -3675,16 +3781,21 @@ async def cmd_kick(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins kick kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "kick"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko kick karna hai? Reply karke /kick likho 🙂")
+        return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko kick nahi kar sakte 🙂")
         return
     try:
         await client.ban_chat_member(message.chat.id, target.id)
         await client.unban_chat_member(message.chat.id, target.id)
         await safe_reply(message, f"👢 {display_name(target)} kick ho gaya!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Kick nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "kick", exc, "kick", display_name(target))
 
 
 @app.on_message(filters.command(["pin"]))
@@ -3696,6 +3807,8 @@ async def cmd_pin(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins pin kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_pin_messages", "pin"):
+        return
     target = message.reply_to_message
     if not target:
         await safe_reply(message, "Kisko pin karna hai? Message pe reply karke /pin likho 🙂")
@@ -3703,8 +3816,8 @@ async def cmd_pin(client: Client, message: Message):
     try:
         await client.pin_chat_message(message.chat.id, target.id)
         await safe_reply(message, "📌 Pin kar diya!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Pin nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "pin", exc, "pin")
 
 
 @app.on_message(filters.command(["unpin"]))
@@ -3716,11 +3829,13 @@ async def cmd_unpin(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins unpin kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_pin_messages", "unpin"):
+        return
     try:
         await client.unpin_chat_message(message.chat.id)
         await safe_reply(message, "📌 Unpin kar diya!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Unpin nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "unpin", exc, "unpin")
 
 
 @app.on_message(filters.command(["purge"]))
@@ -3731,6 +3846,8 @@ async def cmd_purge(client: Client, message: Message):
         return
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins purge kar sakte hain 🙂")
+        return
+    if not await _require_right(client, message, "can_delete_messages", "purge"):
         return
     target = message.reply_to_message
     if not target:
@@ -3743,8 +3860,8 @@ async def cmd_purge(client: Client, message: Message):
             await client.delete_messages(message.chat.id, ids[i:i + 100])
             deleted += len(ids[i:i + 100])
         await safe_reply(message, f"🧹 {deleted} messages delete kar diye!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Purge nahi kar payi — mujhe admin banao (delete permission) 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "purge", exc, "purge")
 
 
 def _parse_duration(text: str) -> int | None:
@@ -3775,14 +3892,16 @@ async def cmd_del(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins delete kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_delete_messages", "delete"):
+        return
     target = message.reply_to_message
     if not target:
         await safe_reply(message, "Kisko delete karna hai? Message pe reply karke /del likho 🙂")
         return
     try:
         await client.delete_messages(message.chat.id, [target.id, message.id])
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Delete nahi kar payi — mujhe admin banao (delete permission) 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "del", exc, "delete")
 
 
 @app.on_message(filters.command(["tmute"]))
@@ -3794,9 +3913,14 @@ async def cmd_tmute(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins mute kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "mute"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko mute karna hai? Reply karke /tmute 10m likho 🙂")
+        return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko mute nahi kar sakte 🙂")
         return
     arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
     secs = _parse_duration(arg)
@@ -3807,8 +3931,8 @@ async def cmd_tmute(client: Client, message: Message):
         until = datetime.now(timezone.utc) + timedelta(seconds=secs)
         await client.restrict_chat_member(message.chat.id, target.id, ChatPermissions(), until_date=until)
         await safe_reply(message, f"🔇 {display_name(target)} {_fmt_dur(secs)} ke liye mute ho gaya! 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Mute nahi kar payi — mujhe admin banao (restrict permission ke saath) 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "tmute", exc, "mute", display_name(target))
 
 
 @app.on_message(filters.command(["tban"]))
@@ -3820,9 +3944,14 @@ async def cmd_tban(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins ban kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "ban"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko ban karna hai? Reply karke /tban 1h likho 🙂")
+        return
+    if await _target_is_admin(client, message.chat.id, target.id):
+        await safe_reply(message, f"❌ {display_name(target)} admin hai — admin ko ban nahi kar sakte 🙂")
         return
     arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
     secs = _parse_duration(arg)
@@ -3833,8 +3962,8 @@ async def cmd_tban(client: Client, message: Message):
         until = datetime.now(timezone.utc) + timedelta(seconds=secs)
         await client.ban_chat_member(message.chat.id, target.id, until_date=until)
         await safe_reply(message, f"🔨 {display_name(target)} {_fmt_dur(secs)} ke liye ban ho gaya!")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Ban nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "tban", exc, "ban", display_name(target))
 
 
 @app.on_message(filters.command(["lock"]))
@@ -3846,11 +3975,13 @@ async def cmd_lock(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins lock kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "lock"):
+        return
     try:
         await client.set_chat_permissions(message.chat.id, ChatPermissions())
         await safe_reply(message, "🔒 Group lock ho gaya — ab sirf admins message bhej sakte hain. /unlock se kholo 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Lock nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "lock", exc, "lock")
 
 
 @app.on_message(filters.command(["unlock"]))
@@ -3862,6 +3993,8 @@ async def cmd_unlock(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins unlock kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_restrict_members", "unlock"):
+        return
     try:
         await client.set_chat_permissions(
             message.chat.id,
@@ -3870,8 +4003,8 @@ async def cmd_unlock(client: Client, message: Message):
                             can_add_web_page_previews=True, can_change_info=True,
                             can_invite_users=True, can_pin_messages=True))
         await safe_reply(message, "🔓 Group unlock ho gaya — sab message bhej sakte hain 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Unlock nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "unlock", exc, "unlock")
 
 
 @app.on_message(filters.command(["slowmode"]))
@@ -3882,6 +4015,8 @@ async def cmd_slowmode(client: Client, message: Message):
         return
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins slow mode set kar sakte hain 🙂")
+        return
+    if not await _require_right(client, message, "can_restrict_members", "slow mode set"):
         return
     arg = (message.command or [None, None])[1] if len(message.command or []) > 1 else ""
     if arg.lower() in ("off", "0"):
@@ -3900,8 +4035,8 @@ async def cmd_slowmode(client: Client, message: Message):
             await safe_reply(message, f"🐢 Slow mode ON — har message ke beech {secs} second ka gap 🙂")
         else:
             await safe_reply(message, "🐢 Slow mode OFF kar diya 🙂")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Slow mode set nahi kar payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "slowmode", exc, "slow mode set")
 
 
 @app.on_message(filters.command(["zombies"]))
@@ -3912,6 +4047,8 @@ async def cmd_zombies(client: Client, message: Message):
         return
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins zombies nikaal sakte hain 🙂")
+        return
+    if not await _require_right(client, message, "can_restrict_members", "zombies nikaalna"):
         return
     try:
         removed = 0
@@ -3928,8 +4065,7 @@ async def cmd_zombies(client: Client, message: Message):
         else:
             await safe_reply(message, "🧟 Koi deleted account nahi mila 🙂")
     except Exception as exc:  # noqa: BLE001
-        record_command_error("zombies", exc, message)
-        await safe_reply(message, "Zombies check nahi kar payi — mujhe admin banao 🙂")
+        await _mod_fail(message, "zombies", exc, "zombies check")
 
 
 @app.on_message(filters.command(["link"]))
@@ -3941,11 +4077,13 @@ async def cmd_link(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins link nikaal sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_invite_users", "link nikaalna"):
+        return
     try:
         link = await client.export_chat_invite_link(message.chat.id)
         await safe_reply(message, f"🔗 Group link: {link}")
-    except Exception:  # noqa: BLE001
-        await safe_reply(message, "Link nahi nikaal payi — mujhe admin banao 🙂")
+    except Exception as exc:  # noqa: BLE001
+        await _mod_fail(message, "link", exc, "link nikaalna")
 
 
 @app.on_message(filters.command(["ginfo"]))
@@ -3974,8 +4112,7 @@ async def cmd_staff(client: Client, message: Message):
             lines.append(f"• {display_name(member.user)} — {status}")
         await safe_reply(message, "\n".join(lines))
     except Exception as exc:  # noqa: BLE001
-        record_command_error("staff", exc, message)
-        await safe_reply(message, "Staff list nahi nikaal payi 🙂")
+        await _mod_fail(message, "staff", exc, "staff list nikaalna")
 
 
 # ---------------------------------------------------------------------------
@@ -4063,6 +4200,25 @@ async def cmd_blacklist_remove(client: Client, message: Message):
 # ---------------------------------------------------------------------------
 # Tagger — one implementation (UserTagger)
 # ---------------------------------------------------------------------------
+async def _tag_send_batch(chat_id: int, text: str, batch: list[str]) -> bool:
+    """Send one tag batch. Telegram caps bots at ~20 messages/minute per
+    group — with 15 mentions per batch and a 3s gap we stay under it, but a
+    FloodWait can still land: on a short one, wait and retry once; on a
+    long one, give up honestly instead of blaming admin rights (v2.6.37).
+    Returns False only when Telegram blocks us hard."""
+    for attempt in (0, 1):
+        try:
+            await app.send_message(chat_id, f"📣 {text}\n" + " ".join(batch))
+            return True
+        except FloodWait as e:
+            secs = getattr(e, "value", 0) or 0
+            if secs > 60 or attempt == 1:
+                print(f"[chulbuli] tag batch flood-blocked ({secs}s) — stopping")
+                return False
+            await asyncio.sleep(secs)
+    return False
+
+
 @app.on_message(filters.command(["utag"]))
 @guarded
 async def cmd_utag(client: Client, message: Message):
@@ -4088,21 +4244,26 @@ async def cmd_utag(client: Client, message: Message):
                 continue
             batch.append(f"[{display_name(member.user)}](tg://user?id={member.user.id})")
             count += 1
-            if len(batch) >= 7:
-                await app.send_message(message.chat.id, f"📣 {text}\n" + " ".join(batch))
+            if len(batch) >= 15:
+                if not await _tag_send_batch(message.chat.id, text, batch):
+                    await safe_reply(message, "⏳ Telegram ne tagging rok di (flood limit) — thodi der baad /utag dobara try karo 🙂")
+                    break
                 batch = []
-                await asyncio.sleep(1)
+                await asyncio.sleep(3)
         if batch and TAG_JOBS.get(message.chat.id, {}).get("active"):
-            await app.send_message(message.chat.id, f"📣 {text}\n" + " ".join(batch))
+            await _tag_send_batch(message.chat.id, text, batch)
         # Honest ending: the old code said "Tagging shuru" and then went
         # silent when the member list came back empty — now it says so.
         if count == 0:
-            await safe_reply(message, "koi member nahi mila — mujhe group me admin banao, tab tag kar paungi 🙂")
+            bot_privs = await _bot_privileges(client, message.chat.id)
+            if bot_privs is None:
+                await safe_reply(message, "koi member nahi mila — mujhe group me admin banao, tab tag kar paungi 🙂")
+            else:
+                await safe_reply(message, "koi member nahi mila 🙂")
         elif TAG_JOBS.get(message.chat.id, {}).get("active"):
             await safe_reply(message, f"✅ {count} members ko tag kar diya 🙂")
     except Exception as exc:  # noqa: BLE001
-        record_command_error("utag", exc, message)
-        await safe_reply(message, "Tagging me error aaya — mujhe admin banao 🙂")
+        await _mod_fail(message, "utag", exc, "tagging")
     TAG_JOBS[message.chat.id] = {"active": False}
 
 
@@ -4125,8 +4286,7 @@ async def cmd_atag(client: Client, message: Message):
         else:
             await safe_reply(message, "Koi admin nahi mila 🙂")
     except Exception as exc:  # noqa: BLE001
-        record_command_error("atag", exc, message)
-        await safe_reply(message, "Tag nahi kar payi 🙂")
+        await _mod_fail(message, "atag", exc, "tag")
 
 
 @app.on_message(filters.command(["reload"]))
@@ -10085,6 +10245,8 @@ async def cmd_promote(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins promote kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_promote_members", "promote"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko promote karna hai? Reply karke /promote likho 🙂")
@@ -10101,7 +10263,7 @@ async def cmd_promote(client: Client, message: Message):
         await safe_reply(message, f"⬆️ {display_name(target)} admin ban gaya! 🎉")
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] promote failed: {exc!r}")
-        await safe_reply(message, "Promote nahi kar payi — mujhe admin banao (promote permission ke saath) 🙂")
+        await _mod_fail(message, "promote", exc, "promote", display_name(target))
 
 
 @app.on_message(filters.command(["demote"]))
@@ -10113,6 +10275,8 @@ async def cmd_demote(client: Client, message: Message):
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins demote kar sakte hain 🙂")
         return
+    if not await _require_right(client, message, "can_promote_members", "demote"):
+        return
     target = _target_user(message)
     if not target:
         await safe_reply(message, "Kisko demote karna hai? Reply karke /demote likho 🙂")
@@ -10123,7 +10287,7 @@ async def cmd_demote(client: Client, message: Message):
         await safe_reply(message, f"⬇️ {display_name(target)} admin se hata diya 🙂")
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] demote failed: {exc!r}")
-        await safe_reply(message, "Demote nahi kar payi — mujhe admin banao 🙂")
+        await _mod_fail(message, "demote", exc, "demote", display_name(target))
 
 
 @app.on_message(filters.command(["title"]))
@@ -10134,6 +10298,8 @@ async def cmd_title(client: Client, message: Message):
         return
     if not await is_chat_admin(client, message.chat.id, message.from_user.id):
         await safe_reply(message, "Sirf admins title de sakte hain 🙂")
+        return
+    if not await _require_right(client, message, "can_promote_members", "title dena"):
         return
     target = _target_user(message)
     title = " ".join(message.command[1:]) if len(message.command) > 1 else ""
@@ -10147,7 +10313,7 @@ async def cmd_title(client: Client, message: Message):
         await safe_reply(message, f"🎖️ {display_name(target)} ka title: **{title[:16]}** 🙂")
     except Exception as exc:  # noqa: BLE001
         print(f"[chulbuli] title failed: {exc!r}")
-        await safe_reply(message, "Title nahi de payi — pehle /promote se admin banao 🙂")
+        await _mod_fail(message, "title", exc, "title dena", display_name(target))
 
 
 # --- Nova admin: sudo / auth system + wordgrid reveal/check ---
