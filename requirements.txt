@@ -13,5 +13,12 @@ pytgcalls==2.1.0; python_version < "3.10"
 # v2.6.25: YouTube search via py-yt-search (VideosSearch) — the Innertube
 # search endpoint only, so a search never touches the player API (the
 # "Requested format is not available" / youtube_blocked search failures).
-# AnonXMusic uses this exact package (py-yt-search 0.8.2).
-py-yt-search==0.8.2
+# AnonXMusic uses this exact package. PINNED 0.6.2 (not 0.8.2): 0.7.2+
+# requires Python >=3.10, but the bot runs on Python 3.9 (pytgcalls voice
+# needs it) — the 0.8.2 pin broke the Railway build on 2026-11-15. 0.6.2
+# is the newest 3.9-compatible stable (requires_python >=3.8); its
+# VideosSearch API (async next(), result dict with id/title/duration/
+# link) is identical to 0.8.2 — verified with a live search from this
+# VM. (0.6.2 + the sandbox proxy: httpx chokes on a bracketed [::1] in
+# NO_PROXY — a VM-only quirk, Railway has no such env var.)
+py-yt-search==0.6.2
