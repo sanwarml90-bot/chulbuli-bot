@@ -9,3 +9,15 @@
 # be listed here too, exactly as the provider would install it.
 [phases.setup]
 nixPkgs = ["python39", "deno"]
+
+# v2.6.30: yt-dlp runs as a STANDALONE BINARY (the bot stays on Python
+# 3.9 for pytgcalls voice, and yt-dlp >= 2025.10.15 needs Python >= 3.10,
+# so the bot cannot import it as a library). The binary is the official
+# yt-dlp_linux release (2026.10.26, embeds its own Python 3.12+),
+# pinned — "latest" is deliberately NOT used, so a build never silently
+# changes version. It lands in the app dir next to bot.py, where
+# bot.py's _ytdlp_bin() finds it. A custom phase runs after the
+# provider's install phase (dependsOn); it replaces nothing.
+[phases.fetch-ytdlp]
+dependsOn = ["install"]
+cmds = ["curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_linux -o yt-dlp", "chmod +x yt-dlp"]

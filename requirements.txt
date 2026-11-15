@@ -1,7 +1,6 @@
 pyrogram==2.0.106
 tgcrypto
 chess==1.11.2
-yt-dlp
 imageio-ffmpeg
 # Voice streaming uses pytgcalls 2.1.0's GroupCallFactory (there is NO
 # `PyTgCalls` class in any released pytgcalls — 2.1.0 is the latest on
@@ -16,3 +15,8 @@ pytgcalls==2.1.0; python_version < "3.10"
 # does not import on 3.9 at all (`str | None` annotations in extras.py).
 # extract_flat returns search entries as-is (no player re-extraction),
 # which is the same structural fix with yt-dlp alone.
+# v2.6.30: yt-dlp is NO LONGER a pip dependency — it runs as the
+# standalone yt-dlp_linux binary (2026.10.26), fetched at build time by
+# nixpacks.toml (phase fetch-ytdlp). The bot stays on Python 3.9 for
+# voice; the binary embeds its own Python 3.12+, which is what finally
+# makes the EJS solver real on Railway.

@@ -66,18 +66,142 @@ except Exception:  # noqa: BLE001
     _chess = None
 
 # Music deps — all optional/guarded: the bot must keep running (and keep
-# passing tests) when the voice stack is not installed. yt-dlp gives the
-# YouTube search/resolve layer; pytgcalls 2.1.0 is the voice layer — its
-# real API is GroupCallFactory (no 3.x-style voice class exists in any
-# released pytgcalls; 2.1.0 is the latest on PyPI, proven by the v2.3.3
-# logs + the wheel source). Its native dep `tgcalls` ships Linux wheels
-# only for Python <= 3.9, so on modern Python the import is usually absent
-# — the module then degrades honestly.
-try:
-    import yt_dlp as _yt_dlp
-except Exception as exc:  # noqa: BLE001
-    print(f"[chulbuli] music: yt-dlp import failed: {exc!r}")
-    _yt_dlp = None
+# passing tests) when the voice stack is not installed. pytgcalls 2.1.0
+# is the voice layer — its real API is GroupCallFactory (no 3.x-style
+# voice class exists in any released pytgcalls; 2.1.0 is the latest on
+# PyPI, proven by the v2.3.3 logs + the wheel source). Its native dep
+# `tgcalls` ships Linux wheels only for Python <= 3.9, so on modern
+# Python the import is usually absent — the module then degrades
+# honestly.
+#
+# yt-dlp runs as a STANDALONE BINARY here (v2.6.30), not as a library.
+# The bot must stay on Python 3.9 for pytgcalls voice, but yt-dlp
+# >= 2025.10.15 needs Python >= 3.10 (and the EJS solver with it) — so
+# the bot cannot import the new yt-dlp at all. The binary is the official
+# standalone yt-dlp_linux (2026.10.26, embeds its own Python 3.12+),
+# fetched at build time into the app dir by nixpacks.toml (phase
+# fetch-ytdlp). _CliYtDlp below is a drop-in for the library's YoutubeDL
+# interface that _yt_extract / _music_download_sync already use, so the
+# whole music layer — and every test that stubs B._yt_dlp with a fake
+# YoutubeDL — works unchanged; only the transport changed (library call
+# -> subprocess). The CLI prints the search JSON with --dump-single-json;
+# for downloads the filepath comes from the outtmpl stem scan, because
+# --dump-json prints the info BEFORE the download finishes (verified on
+# this VM 2026-11-15: requested_downloads came back empty while the
+# file itself downloaded fine).
+def _ytdlp_bin() -> str:
+    """Path of the standalone yt-dlp binary: $YTDLP_BIN, else the file
+    next to bot.py (where the build phase puts it), else 'yt-dlp' on PATH."""
+    env = os.environ.get("YTDLP_BIN") or ""
+    if env:
+        return env
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt-dlp")
+    if os.path.isfile(here):
+        return here
+    return "yt-dlp"
+
+
+def _ytdlp_bin_ok() -> bool:
+    import shutil
+    path = _ytdlp_bin()
+    if os.path.isfile(path) or shutil.which(path) is not None:
+        return True
+    # a `yt-dlp` console script next to the running interpreter (a venv)
+    # counts too — this is what the test suite sees, where PATH does not
+    # include the venv bin.
+    return os.path.isfile(os.path.join(os.path.dirname(sys.executable), "yt-dlp"))
+
+
+def _yt_cli_last_error(stderr: str) -> str:
+    """Last 'ERROR: ...' line from yt-dlp stderr (kustmusic's lastErrorLine)."""
+    lines = (stderr or "").strip().split("\n")
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith("ERROR:"):
+            return line[len("ERROR:"):].strip()[:200]
+    return "yt-dlp failed"
+
+
+class _CliYoutubeDL:
+    """YoutubeDL-compatible wrapper around the standalone yt-dlp binary."""
+
+    def __init__(self, opts: dict):
+        self.opts = dict(opts or {})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def _args(self, download: bool) -> list:
+        opts = self.opts
+        args = ["--no-warnings", "--no-playlist", "--ignore-config",
+                "--no-check-certificate"]
+        if opts.get("skip_download") or not download:
+            args.append("--skip-download")
+        if opts.get("extract_flat"):
+            args.append("--flat-playlist")
+        if opts.get("format"):
+            args += ["-f", str(opts["format"])]
+        if opts.get("outtmpl"):
+            args += ["-o", str(opts["outtmpl"])]
+        for comp in opts.get("remote_components") or []:
+            args += ["--remote-components", str(comp)]
+        for section, kv in (opts.get("extractor_args") or {}).items():
+            for key, value in (kv or {}).items():
+                if isinstance(value, (list, tuple)):
+                    value = ",".join(str(v) for v in value)
+                args += ["--extractor-args", f"{section}:{key}={value}"]
+        if opts.get("cookiefile"):
+            args += ["--cookies", str(opts["cookiefile"])]
+        if not download:
+            args.append("--dump-single-json")
+        return args
+
+    def extract_info(self, src: str, download: bool = False):
+        import subprocess
+        cmd = [_ytdlp_bin()] + self._args(download) + ["--", src]
+        timeout = 300 if download else 30
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout)
+        except FileNotFoundError:
+            raise MusicError("search unavailable")
+        except subprocess.TimeoutExpired:
+            raise Exception("yt-dlp timed out")
+        if proc.returncode != 0:
+            raise Exception(_yt_cli_last_error(proc.stderr))
+        if not download:
+            try:
+                return json.loads(proc.stdout)
+            except Exception:  # noqa: BLE001
+                raise Exception("yt-dlp: unreadable search result")
+        tmpl = str(self.opts.get("outtmpl") or "")
+        stem = os.path.basename(tmpl).split(".%(ext)s")[0] if ".%(ext)s" in tmpl else ""
+        found = None
+        if stem:
+            directory = os.path.dirname(tmpl) or "."
+            try:
+                names = os.listdir(directory)
+            except Exception:  # noqa: BLE001
+                names = []
+            for name in names:
+                if name.startswith(stem + "."):
+                    cand = os.path.join(directory, name)
+                    if os.path.isfile(cand):
+                        found = cand
+                        break
+        return {"requested_downloads": ([{"filepath": found}] if found else [])}
+
+
+class _CliYtDlp:
+    """Namespace with the one library entry point the music layer uses."""
+
+    YoutubeDL = _CliYoutubeDL
+
+
+_yt_dlp = _CliYtDlp
 try:
     from pytgcalls import GroupCallFactory as _GroupCallFactory
 except Exception as exc:  # noqa: BLE001
@@ -89,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.29"
+VERSION = "2.6.30"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4038,7 +4162,7 @@ _ASSISTANT_LOCK = asyncio.Lock()
 
 
 def music_search_available() -> bool:
-    return _yt_dlp is not None
+    return _ytdlp_bin_ok()
 
 
 def music_voice_available() -> bool:
@@ -4090,7 +4214,7 @@ def print_startup_diagnostics() -> None:
     print(f"[chulbuli] python: {sys.version.split()[0]} ({sys.platform})")
     print(f"[chulbuli] voice: pytgcalls={_GroupCallFactory is not None} "
           f"session={'set' if ASSISTANT_SESSION else 'MISSING'} "
-          f"yt_dlp={_yt_dlp is not None} ffmpeg={'yes' if ffmpeg else 'no'} "
+          f"yt_dlp={_ytdlp_bin_ok()} ffmpeg={'yes' if ffmpeg else 'no'} "
           f"yt_cookies={'yes' if _yt_cookie_file() else 'no'} "
           f"deno={'yes' if shutil.which('deno') else 'no'}")
 
@@ -4509,6 +4633,10 @@ def _yt_extract(src: str, flat: bool = False):
     # AnonXMusic ships the same pair). Without it the player returns no
     # formats at all on these IPs (Motu Patlu, 2026-11-15 — verified from
     # this VM: same extraction FAILS without EJS, SUCCEEDS with it).
+    # v2.6.30: the transport is the STANDALONE yt-dlp binary (2026.10.26,
+    # _CliYtDlp) — this is what makes EJS real on Railway at last: the
+    # old 3.9 library predated remote_components entirely, so EJS never
+    # ran there (0 ejs lines in 3h of logs, 2026-11-15).
     base = {"quiet": True, "noplaylist": True, "no_warnings": True,
             "skip_download": True, "remote_components": ["ejs:github"]}
     if flat:
@@ -4831,6 +4959,11 @@ def _music_download_sync(track: dict) -> str:
     # fine (audio 249/250/140/251) with EJS + Deno — no cookies. This is
     # the download-leg fix for the v2.6.26 live failure ("This video is
     # unavailable" on Railway, 08:34:55 IST).
+    # v2.6.30: the transport is the standalone yt-dlp binary (_CliYtDlp)
+    # — the download args above are translated to CLI flags by the shim,
+    # and the filepath now comes from the outtmpl stem scan (the CLI's
+    # --dump-json prints pre-download JSON, so requested_downloads is
+    # empty there — verified on the VM).
     opts = {"quiet": True, "noplaylist": True,
             "format": "bestaudio[ext=webm]/bestaudio/best",
             "no_warnings": True, "outtmpl": os.path.join(_MUSIC_TMPDIR, stem + ".%(ext)s"),
@@ -4864,7 +4997,8 @@ def _music_download_sync(track: dict) -> str:
     for attempt, (clients, use_cookies) in enumerate(_dl_attempts):
         if attempt:
             time.sleep(_dl_delays[attempt - 1])
-            print(f"[chulbuli] music: download attempt {attempt + 1}/3 after {str(last)[:80]}")
+            print(f"[chulbuli] music: download attempt {attempt + 1}/3 "
+                  f"({','.join(clients)}) after {str(last)[:80]}")
         opts["extractor_args"] = {"youtube": {"player_client": clients}}
         if use_cookies:
             _yt_add_cookies(opts)
