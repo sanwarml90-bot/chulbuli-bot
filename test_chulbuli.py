@@ -6763,6 +6763,84 @@ async def main():
           and B.DATA["force_join"].get("channel") == -100999, FakeMessage.outbox[-1][1])
     B.app.get_chat = _real_getchat2632
 
+    # (y) v2.6.33 — membership check via the Bot API (MTProto get_chat_member
+    # fails for a channel the bot never saw: peer not in the MTProto cache)
+    _real_botapi2633 = B._botapi_call_sync
+    _botapi_calls2633 = []
+    _botapi_status2633 = "left"
+
+    def _fake_botapi2633(method, params):
+        _botapi_calls2633.append((method, params))
+        if method != "getChatMember":
+            raise RuntimeError("unexpected method")
+        return {"ok": True, "result": {"status": _botapi_status2633}}
+
+    B._botapi_call_sync = _fake_botapi2633
+    B._chat_data(-100123)["force_join"] = True
+    B._FJ_CACHE.clear()
+    B._FJ_ADMIN_CACHE.clear()
+    B._FJ_WARNS.clear()
+    # Bot API says left -> gate blocks even though the MTProto fake says MEMBER
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    _botapi_status2633 = "left"
+    B._FJ_CACHE.clear()
+    _m2633 = _gate_msg2632()
+    check("y2633 botapi left blocks (mtproto member ignored)",
+          await _gate2632(_m2633) is True and bool(_m2633.deleted)
+          and _botapi_calls2633[-1] == ("getChatMember", {"chat_id": -100999, "user_id": 111}),
+          str(_botapi_calls2633[-1:]))
+    # Bot API says member -> passes even though MTProto fake says LEFT
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    _botapi_status2633 = "member"
+    B._FJ_CACHE.clear()
+    _m2633 = _gate_msg2632()
+    check("y2633 botapi member passes (mtproto left ignored)",
+          await _gate2632(_m2633) is False and not _m2633.deleted, str(_m2633.deleted))
+    # status mapping through the Bot API helper directly
+    _botapi_status2633 = "restricted"
+    check("y2633 botapi restricted is joined",
+          await B._fj_botapi_is_joined(-100999, 111) is True)
+    _botapi_status2633 = "kicked"
+    check("y2633 botapi kicked is not joined",
+          await B._fj_botapi_is_joined(-100999, 111) is False)
+    _botapi_status2633 = "creator"
+    check("y2633 botapi creator is joined",
+          await B._fj_botapi_is_joined(-100999, 111) is True)
+    # Bot API raises -> fallback to MTProto fake
+    def _fake_botapi_boom2633(method, params):
+        _botapi_calls2633.append((method, params))
+        raise RuntimeError("BOT_TOKEN env var not set")
+    B._botapi_call_sync = _fake_botapi_boom2633
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    B._FJ_CACHE.clear()
+    _m2633 = _gate_msg2632()
+    check("y2633 botapi down falls back to mtproto (member passes)",
+          await _gate2632(_m2633) is False and not _m2633.deleted, str(_m2633.deleted))
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.LEFT
+    B._FJ_CACHE.clear()
+    _m2633 = _gate_msg2632()
+    check("y2633 botapi down falls back to mtproto (left blocks)",
+          await _gate2632(_m2633) is True and bool(_m2633.deleted), str(_m2633.deleted))
+    # Bot API ok:false -> fallback too
+    def _fake_botapi_notok2633(method, params):
+        _botapi_calls2633.append((method, params))
+        return {"ok": False, "description": "Bad Request: chat not found"}
+    B._botapi_call_sync = _fake_botapi_notok2633
+    _gclient2632.statuses[(-100999, 111)] = B.ChatMemberStatus.MEMBER
+    B._FJ_CACHE.clear()
+    _m2633 = _gate_msg2632()
+    check("y2633 botapi not-ok falls back to mtproto",
+          await _gate2632(_m2633) is False and not _m2633.deleted, str(_m2633.deleted))
+    # cache: a second identical check does NOT call the Bot API again
+    B._botapi_call_sync = _fake_botapi2633
+    _botapi_status2633 = "left"
+    _botapi_calls2633.clear()
+    B._FJ_CACHE.clear()
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    await B._fj_is_joined(_gclient2632, -100999, 111)
+    check("y2633 botapi result cached", len(_botapi_calls2633) == 1, str(len(_botapi_calls2633)))
+    B._botapi_call_sync = _real_botapi2633
+
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.32"
+VERSION = "2.6.33"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -11746,6 +11746,52 @@ _FJ_NOTIFY_AT: dict = {}    # "check"/"delete" -> last owner-DM ts (1h throttle)
 
 _FJ_JOINED_STATUSES = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
                        ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
+# Same set, as the plain strings the Bot API returns (Pyrogram's enum is
+# NOT a str-enum, so "member" in _FJ_JOINED_STATUSES is False — v2.6.33).
+_FJ_JOINED_STATUSES_API = ("member", "administrator", "creator", "restricted")
+
+
+async def _fj_botapi_is_joined(channel: int, uid: int) -> bool | None:
+    """Membership via the Bot API (getChatMember) — the reliable path.
+
+    v2.6.33 root cause: Pyrogram's MTProto get_chat_member needs the channel
+    peer (with access hash) in the client's in-memory peer cache; a channel
+    the bot has never seen in an update is not there, so the call raises
+    (same family as the old "Peer id invalid" startup error) and the gate
+    fail-opens — the user sees NOTHING. The Bot API needs no peer cache and
+    answers "left" for a non-member (verified live for @sanjibomberbak)."""
+    try:
+        result = await asyncio.to_thread(
+            _botapi_call_sync, "getChatMember", {"chat_id": channel, "user_id": uid})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[chulbuli] force-join: Bot API getChatMember failed: {exc!r}")
+        return None
+    if not result.get("ok"):
+        print(f"[chulbuli] force-join: Bot API getChatMember not ok: {result.get('description')}")
+        return None
+    return (result.get("result") or {}).get("status") in _FJ_JOINED_STATUSES_API
+
+
+async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = False) -> bool | None:
+    """True = channel joined, False = not joined, None = check failed (fail-open:
+    message delete nahi hoga, owner ko throttled DM jayega). Bot API first;
+    MTProto only as a fallback (it works for chats already in the peer cache)."""
+    key = (channel, uid)
+    now = time.time()
+    if not fresh:
+        hit = _FJ_CACHE.get(key)
+        if hit is not None and now - hit[1] < _FJ_CACHE_TTL:
+            return hit[0]
+    joined = await _fj_botapi_is_joined(channel, uid)
+    if joined is None:
+        try:
+            member = await client.get_chat_member(channel, uid)
+            joined = member.status in _FJ_JOINED_STATUSES
+        except Exception as exc:  # noqa: BLE001
+            print(f"[chulbuli] force-join: MTProto get_chat_member failed: {exc!r}")
+            return None
+    _FJ_CACHE[key] = (joined, now)
+    return joined
 
 
 async def _fj_is_admin(client: Client, chat_id: int, uid: int) -> bool:
@@ -11759,24 +11805,6 @@ async def _fj_is_admin(client: Client, chat_id: int, uid: int) -> bool:
     admin = await is_chat_admin(client, chat_id, uid)
     _FJ_ADMIN_CACHE[key] = (admin, now)
     return admin
-
-
-async def _fj_is_joined(client: Client, channel: int, uid: int, fresh: bool = False) -> bool | None:
-    """True = channel joined, False = not joined, None = check failed (fail-open:
-    message delete nahi hoga, owner ko throttled DM jayega)."""
-    key = (channel, uid)
-    now = time.time()
-    if not fresh:
-        hit = _FJ_CACHE.get(key)
-        if hit is not None and now - hit[1] < _FJ_CACHE_TTL:
-            return hit[0]
-    try:
-        member = await client.get_chat_member(channel, uid)
-        joined = member.status in _FJ_JOINED_STATUSES
-    except Exception:  # noqa: BLE001
-        return None
-    _FJ_CACHE[key] = (joined, now)
-    return joined
 
 
 def _fj_channel_link() -> str:
