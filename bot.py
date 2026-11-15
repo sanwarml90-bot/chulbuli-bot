@@ -213,7 +213,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[chulbuli] music: imageio-ffmpeg import failed: {exc!r}")
     _imageio_ffmpeg = None
 
-VERSION = "2.6.30"
+VERSION = "2.6.31"
 
 # Telegram Mini App (Web App) — the game hub (v2.4.0). Served from GitHub
 # Pages: https://sanwarml90-bot.github.io/chulbuli-bot/webapp/
@@ -4732,7 +4732,12 @@ async def resolve_track(query: str) -> dict:
         if isinstance(info, dict) and not info.get("webpage_url"):
             info = dict(info)
             info["webpage_url"] = info.get("url") or q
-        return _track_from_info(info, q, "youtube")
+        _track = _track_from_info(info, q, "youtube")
+        # v2.6.31: keep the user's original query on the track — the
+        # download-failure SoundCloud fallback needs it (the full YouTube
+        # title almost never exists on SoundCloud; the short query does).
+        _track["query"] = q
+        return _track
     except MusicError as exc:
         yt_err = str(exc)
     # v2.6.22: log the YouTube reason — before this, the fallback fired
@@ -4749,7 +4754,25 @@ async def resolve_track(query: str) -> dict:
     # the owner should know YouTube failed and why — Sanji's order).
     track["fallback_from"] = "youtube"
     track["fallback_reason"] = yt_err
+    track["query"] = q  # v2.6.31: see the YouTube branch above
     return track
+
+
+def _sc_clean_title(title: str) -> str:
+    """Shorten a YouTube video title for a SoundCloud search: drop the
+    " | ..." channel/compilation suffix and bracketed/dashed tags such as
+    (Official Video), - Official, Lyrics, HD, 4K. "Motu Patlu Ka Twins
+    Carnival Mein Dhamaka | Motu Patlu Compilation | Cartoons For Kids"
+    -> "Motu Patlu Ka Twins Carnival Mein Dhamaka". Year parens like
+    (1973) are kept (they carry no tag word)."""
+    t = (title or "").strip()
+    t = t.split("|")[0].strip()
+    t = re.sub(r"\((?:official[^)]*|lyrics?|video|audio|hd|4k|full\s*video|song)\)",
+               "", t, flags=re.I)
+    t = re.sub(r"\s*[-–—]\s*(?:official[^ ]*|lyrics?|video|audio|hd|4k)$",
+               "", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip(" -–—")
+    return t[:80]
 
 
 def _music_sc_fallback(track: dict) -> dict | None:
@@ -4761,16 +4784,32 @@ def _music_sc_fallback(track: dict) -> dict | None:
     _music_play_next used to give up. This re-searches SoundCloud by
     the track's title so the song still plays. None when SoundCloud
     also fails (caller keeps the original error).
-    """
+
+    v2.6.31: try the full title, then a cleaned title, then the user's
+    original query (track["query"], stored by resolve_track) — the full
+    YouTube title almost never exists on SoundCloud, but the short
+    query often does: "Motu Patlu Ka Twins Carnival Mein Dhamaka |
+    Motu Patlu Compilation | Cartoons For Kids" found nothing, while
+    "motu patlu" finds the Title Song (verified from this VM
+    2026-11-15). First hit wins; the winning query is logged."""
     if _yt_dlp is None:
         return None
     title = ((track or {}).get("title") or "").strip()
     if not title:
         return None
-    try:
-        return _track_from_info(_yt_extract(f"scsearch1:{title}"), title, "soundcloud")
-    except Exception:  # noqa: BLE001
-        return None
+    queries = []
+    for cand in (title, _sc_clean_title(title),
+                 ((track or {}).get("query") or "").strip()):
+        if cand and cand not in queries:
+            queries.append(cand)
+    for q in queries:
+        try:
+            found = _track_from_info(_yt_extract(f"scsearch1:{q}"), q, "soundcloud")
+        except Exception:  # noqa: BLE001
+            continue
+        print(f"[chulbuli] music: soundcloud found via '{q[:60]}'")
+        return found
+    return None
 
 
 def _music_make_client():
@@ -5016,6 +5055,11 @@ def _music_download_sync(track: dict) -> str:
             if _is_youtube_permanent(str(exc)):
                 break
     if last is not None:
+        # v2.6.31: log the FINAL attempt's error, not only the ones quoted
+        # when the next retry starts — the 11:30 Motu Patlu log could not
+        # show attempt 3's (android) error because nothing printed it.
+        print(f"[chulbuli] music: download failed after {attempt + 1}/3 attempts "
+              f"({','.join(clients)}), last error: {str(last)[:80]}")
         msg = str(last)
         if _is_youtube_blocked(msg):
             raise MusicError("youtube_blocked")
